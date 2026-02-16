@@ -2,9 +2,17 @@
 # FULL STABLE VERSION – TIMER & SHUFFLE FIXED
 # All Edit buttons now open real menus
 
+import asyncio
 import uuid
 import sqlite3
 import os
+import secrets
+import time
+
+from telegram.ext import ApplicationHandlerStop
+from telegram import InputMediaPhoto
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -36,7 +44,67 @@ OWNER_USER_ID = 6254422846
 BOT_USERNAME = "EucresiaBot"
 DB_FILE = os.path.join(os.getcwd(), "quizbot.db")
 QUESTIONS_PER_PAGE = 10
+QUIZ_FOLDERS_PER_PAGE = 5
+PLACEHOLDER_IMAGE_URL = "https://via.placeholder.com/1x1.png"
+PLACEHOLDER_IMAGE_FILE_ID = "AgACAgUAAxkBAAId1GmNwdjStLkxKCsKAodhZXjm9Fc5AAKJDGsbhHpxVPfj2MXOcpF3AQADAgADeQADOgQ"
 
+## =========================
+## HELPERS
+## =========================
+
+async def send_tracked_message(update, context, text, **kwargs):
+    msg = await update.effective_chat.send_message(text=text, **kwargs)
+
+    # Store message ID
+    context.user_data.setdefault("chat_messages", []).append(msg.message_id)
+
+    return msg
+
+def track_bot_message(context, message_id):
+    context.user_data.setdefault("bot_messages", set()).add(message_id)
+
+# =========================
+# NAME FORMATTER IN QUIZ LEADERBOARD
+# =========================
+def format_user_name(user):
+    """
+    Format name as: Lastname, Firstname
+    Example: Cayleen Astrid Gorgonio -> Gorgonio, Cayleen
+    """
+    if not user:
+        return "Unknown"
+
+    first = (user.first_name or "").strip()
+    last = (user.last_name or "").strip()
+
+    # Take only the FIRST word of first name
+    first_word = first.split()[0] if first else ""
+
+    if last and first_word:
+        return f"{last}, {first_word}"
+    elif first_word:
+        return first_word
+    elif last:
+        return last
+    else:
+        return "Unknown"
+
+# =========================
+# LEADERBOARD KEY HELPER
+# =========================
+def make_leaderboard_key(quiz_id: str, token: str) -> str:
+    """
+    Unique identifier for ONE posted quiz instance.
+    Format: <quiz_id>:<token>
+    """
+    return f"{quiz_id}:{token}"
+
+# =========================
+# GLOBAL "QUIZ IS ACTIVE" CHECKER
+# =========================
+def is_quiz_active(context):
+    return "play" in context.user_data
+    
 # =========================
 # GROUP QUIZ STATE (IN-MEMORY)
 # =========================
@@ -75,6 +143,29 @@ CREATE TABLE IF NOT EXISTS leaderboard (
 conn.commit()
 
 cur.execute("""
+CREATE TABLE IF NOT EXISTS question_bank (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    folder_id INTEGER,
+    question TEXT,
+    image_file_id TEXT,
+    options TEXT,
+    correct INTEGER,
+    explanation TEXT
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS quiz_question_links (
+    quiz_id TEXT,
+    question_id INTEGER,
+    position INTEGER,
+    PRIMARY KEY (quiz_id, question_id)
+)
+""")
+
+conn.commit()
+
+cur.execute("""
 CREATE TABLE IF NOT EXISTS quizzes (
     quiz_id TEXT PRIMARY KEY,
     owner_id INTEGER,
@@ -97,18 +188,24 @@ CREATE TABLE IF NOT EXISTS folders (
 conn.commit()
 
 cur.execute("""
-CREATE TABLE IF NOT EXISTS questions (
+CREATE TABLE IF NOT EXISTS question_bank_folders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    quiz_id TEXT,
-    question TEXT,
-    image_file_id TEXT,
-    options TEXT,
-    correct INTEGER,
-    explanation TEXT
+    owner_id INTEGER,
+    name TEXT,
+    UNIQUE(owner_id, name)
 )
 """)
 
+cur.execute("""
+CREATE TABLE IF NOT EXISTS quiz_post_tokens (
+    token TEXT PRIMARY KEY,
+    quiz_id TEXT,
+    owner_id INTEGER,
+    created_at INTEGER
+)
+""")
 conn.commit()
+
 # ===== RUN ONCE: ADD FOLDER COLUMN IF MISSING =====
 
 # =========================
@@ -139,52 +236,104 @@ def ensure_default_folder():
 # 🟢 GROUP QUIZ POST DETECTION
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    chat_type = update.effective_chat.type
+    chat = update.effective_chat
+    chat_type = chat.type
 
-# 🎮 PLAY MODE (deep link)
+    # 🔥 Track /start message itself
+    if update.message:
+        context.user_data.setdefault("chat_messages", []).append(update.message.message_id)
+
+    # 🎮 PLAY MODE (deep link from group post)
     if context.args and context.args[0].startswith("PLAY_"):
-        quiz_id = context.args[0].replace("PLAY_", "")
+        try:
+            _, quiz_id, token = context.args[0].split("_", 2)
+        except ValueError:
+            msg = await update.message.reply_text("❌ Invalid quiz link.")
+            context.user_data.setdefault("chat_messages", []).append(msg.message_id)
+            return
 
+        # 🔑 Build leaderboard key
+        leaderboard_key = make_leaderboard_key(quiz_id, token)
+
+        # 🔍 Verify leaderboard exists
+        lb_info = GROUP_LB_MESSAGES.get(leaderboard_key)
+        if not lb_info:
+            msg = await update.message.reply_text("❌ This quiz link is no longer valid.")
+            context.user_data.setdefault("chat_messages", []).append(msg.message_id)
+            return
+
+        # 🔒 Reset user state completely
         context.user_data.clear()
-        context.user_data["play_quiz_id"] = quiz_id
-        context.user_data["group_chat_id"] = update.effective_chat.id
+        context.user_data["chat_messages"] = []
 
-        await update.message.reply_text(
+        # 🔥 Track /start again after clear
+        if update.message:
+            context.user_data["chat_messages"].append(update.message.message_id)
+
+        # =========================
+        # BIND PLAYER → LEADERBOARD
+        # =========================
+        context.user_data["play_quiz_id"] = quiz_id
+        context.user_data["play_token"] = token
+        context.user_data["leaderboard_key"] = leaderboard_key
+        context.user_data["group_chat_id"] = lb_info["chat_id"]
+
+        msg = await update.message.reply_text(
             "🎮 Quiz ready!\n\nPress the button below to start.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("▶️ Start Quiz", callback_data="PLAY_START")]
             ])
         )
+
+        context.user_data["chat_messages"].append(msg.message_id)
         return
 
     # ❌ Block /start inside groups & channels
     if chat_type in ("group", "supergroup", "channel"):
         return
 
-    # ❌ Block /start inside groups
-    if chat_type in ("group", "supergroup"):
-        return
-
     # 🔒 Private chat but NOT owner
     if user_id != OWNER_USER_ID:
-        await update.message.reply_text(
+        msg = await update.message.reply_text(
             "👋 Hi!\n\nPlease open a quiz from a group to start answering.\nYou don’t have access to the admin panel."
         )
+        context.user_data.setdefault("chat_messages", []).append(msg.message_id)
         return
 
     # ✅ OWNER — show admin home
+    # 🔒 HARD RESET: entering admin mode must clear play state
+    context.user_data.clear()
+    context.user_data["chat_messages"] = []
+
+    # 🔥 Track /start again after reset
+    if update.message:
+        context.user_data["chat_messages"].append(update.message.message_id)
+
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📂 Quiz Folder", callback_data="HOME_MY_QUIZZES"),
             InlineKeyboardButton("➕ Create a new Quiz", callback_data="HOME_CREATE"),
+        ],
+        [
+            InlineKeyboardButton("🗄 Database", callback_data="HOME_DATABASE"),
+            InlineKeyboardButton("❓ Create a Question", callback_data="HOME_CREATE_QUESTION"),
+        ],
+        [
+            InlineKeyboardButton("👥 Manage Subscribers", callback_data="HOME_MANAGE_SUBSCRIBERS"),
         ]
     ])
 
-    await update.message.reply_text(
-        "🧠 **Welcome to Quiz Bot (Admin Panel)**\n\nChoose an option:",
+    msg = await update.message.reply_text(
+        "🧠 **Welcome to Quiz Bot (Admin Panel)**\n\nPlease choose an option:",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
+
+    # 🔥 Track admin panel message
+    context.user_data["chat_messages"].append(msg.message_id)
+
+    # (Optional — keep if you still use this elsewhere)
+    track_bot_message(context, msg.message_id)
 
 # =========================
 # CREATE QUIZ
@@ -223,85 +372,251 @@ async def create_quiz(update_or_message, context: ContextTypes.DEFAULT_TYPE):
 # TEXT HANDLER
 # =========================
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    
-    # ================= EDIT QUESTION IMAGE =================
+
+    # ================= EDIT QUESTION IMAGE (QUESTION BANK) =================
     if context.user_data.get("edit_q_field") == "IMAGE":
         photo = update.message.photo[-1]
         file_id = photo.file_id
 
-        qid = context.user_data["active_question_id"]
+        qid = context.user_data.get("active_question_id")
+        if not qid:
+            await update.message.reply_text("❌ No question selected.")
+            return
 
+        # 🔑 UPDATE QUESTION BANK (SOURCE OF TRUTH)
         cur.execute(
-            "UPDATE questions SET image_file_id=? WHERE id=?",
+            "UPDATE question_bank SET image_file_id=? WHERE id=?",
             (file_id, qid)
         )
         conn.commit()
 
         context.user_data.pop("edit_q_field", None)
 
-        await update.message.reply_text("✅ Image updated.")
-        await show_questions_from_message(update.message, context)
+        # ✅ Confirmation message
+        confirm_msg = await update.message.reply_text("✅ Image updated.")
+
+        await asyncio.sleep(2)
+
+        chat_id = update.effective_chat.id
+
+        # 🧹 Delete confirmation
+        try:
+            await confirm_msg.delete()
+        except:
+            pass
+
+        # 🧹 Delete user image
+        try:
+            await update.message.delete()
+        except:
+            pass
+
+        # 🧹 Delete image edit menu
+        menu_id = context.user_data.pop("edit_image_menu_msg_id", None)
+        if menu_id:
+            try:
+                await context.bot.delete_message(chat_id, menu_id)
+            except:
+                pass
+
+        # 🧹 Delete image prompt
+        prompt_id = context.user_data.pop("edit_image_prompt_msg_id", None)
+        if prompt_id:
+            try:
+                await context.bot.delete_message(chat_id, prompt_id)
+            except:
+                pass
+
+        # 🔄 Rebuild preview safely (handles media type correctly)
+        await rebuild_question_preview(chat_id, context)
+
         return
 
+    # ================= NEW QUESTION IMAGE STEP =================
     q_state = context.user_data.get("add_q_state")
 
-    # Only accept photos during image step
     if q_state != "NEW_Q_IMAGE":
         return
 
-    photo = update.message.photo[-1]  # highest resolution
+    photo = update.message.photo[-1]
     file_id = photo.file_id
 
-    # Save image file_id
     context.user_data["new_question"]["image"] = file_id
-
-    # Move to option 1
     context.user_data["add_q_state"] = "NEW_Q_OPTION_1"
 
     await update.message.reply_text("➡️ Send option 1:")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    # Track user message
+    context.user_data.setdefault("chat_messages", []).append(update.message.message_id)
+
+
+    # ================= DATABASE TEXT FLOW (HARD ISOLATION) =================
     state = context.user_data.get("state")
     text = update.message.text.strip()
+
+    if state == "DB_ADD_FOLDER":
+        folder = text.strip()
+
+        # ❌ Empty name
+        if not folder:
+            await update.message.reply_text("❌ Folder name cannot be empty.")
+            return
+
+        # Normalize name (capitalization only for display)
+        normalized = folder.strip()
+
+        # ❌ Default is reserved
+        if normalized.lower() == "default":
+            await update.message.reply_text("❌ 'Default Folder' already exists.")
+            return
+
+        # ❌ Check duplicate (case-insensitive)
+        cur.execute(
+            """
+            SELECT 1
+            FROM question_bank_folders
+            WHERE owner_id=?
+              AND LOWER(name) = LOWER(?)
+            """,
+            (OWNER_USER_ID, normalized)
+        )
+        if cur.fetchone():
+            await update.message.reply_text("❌ Folder already exists.")
+            return
+
+        # ✅ Create folder
+        cur.execute(
+            "INSERT INTO question_bank_folders (owner_id, name) VALUES (?, ?)",
+            (OWNER_USER_ID, normalized)
+        )
+        conn.commit()
+
+        # 🔑 EXIT DB MODE IMMEDIATELY
+        context.user_data.pop("state", None)
+
+        await update.message.reply_text(
+            f"📁 Database folder **{normalized}** created.",
+            parse_mode="Markdown"
+        )
+
+        await show_database_menu(update.message, context)
+        return
 
     # ================= ADD QUESTION FLOW =================
     q_state = context.user_data.get("add_q_state")
 
     # ================= EDIT QUESTION EXPLANATION =================
     if context.user_data.get("edit_q_field") == "EXPLANATION":
-        qid = context.user_data["active_question_id"]
+        qid = context.user_data.get("active_question_id")
+        if not qid:
+            return
 
+        new_text = update.message.text.strip()
+        chat_id = update.effective_chat.id
+
+        # Update DB
         cur.execute(
-            "UPDATE questions SET explanation=? WHERE id=?",
-            (text, qid)
+            "UPDATE question_bank SET explanation=? WHERE id=?",
+            (new_text, qid)
         )
         conn.commit()
 
+        # Delete prompt
+        prompt_id = context.user_data.pop("edit_expl_prompt_id", None)
+        if prompt_id:
+            try:
+                await context.bot.delete_message(chat_id, prompt_id)
+            except:
+                pass
+    
+        # Exit edit mode
         context.user_data.pop("edit_q_field", None)
 
-        await update.message.reply_text("✅ Explanation updated.")
-        await show_questions_from_message(update.message, context)
+        # Confirmation
+        confirm = await update.message.reply_text("✅ Explanation added.")
+
+        await asyncio.sleep(2)
+
+        try:
+            await confirm.delete()
+            await update.message.delete()
+        except:
+            pass
+
+        # Rebuild preview
+        await rebuild_question_preview(chat_id, context)
+
         return
 
     # ================= EDIT QUESTION TEXT =================
     edit_field = context.user_data.get("edit_q_field")
 
     if edit_field == "TEXT":
-        qid = context.user_data["active_question_id"]
+        qid = context.user_data.get("active_question_id")
+        if not qid:
+            await update.message.reply_text("❌ No question selected.")
+            return
 
+        # 🔑 Update DB
         cur.execute(
-            "UPDATE questions SET question=? WHERE id=?",
+            "UPDATE question_bank SET question=? WHERE id=?",
             (text, qid)
         )
         conn.commit()
 
         context.user_data.pop("edit_q_field", None)
 
-        await update.message.reply_text("✅ Question text updated.")
-        await show_questions_from_message(update.message, context)
+        # =========================
+        # STEP 1 — Confirmation
+        # =========================
+        confirm_msg = await update.message.reply_text("✅ Question text updated.")
+
+        await asyncio.sleep(2)
+
+        chat_id = update.effective_chat.id
+
+        # =========================
+        # STEP 2 — Cleanup
+        # =========================
+
+        # Delete confirmation
+        try:
+            await confirm_msg.delete()
+        except:
+            pass
+
+        # Delete user's typed message
+        try:
+            await update.message.delete()
+        except:
+            pass
+
+        # Delete "Send new question text" prompt
+        prompt_id = context.user_data.pop("edit_text_prompt_id", None)
+        if prompt_id:
+            try:
+                await context.bot.delete_message(chat_id, prompt_id)
+            except:
+                pass
+
+        # =========================
+        # STEP 3 — Replace preview safely
+        # =========================
+        preview_id = context.user_data.get("question_preview_msg_id")
+        chat_id = update.effective_chat.id
+
+        if preview_id:
+            await update_question_preview_in_place(
+                chat_id,
+                preview_id,
+                context
+            )
+
         return
 
-    # 📝 Question text
+    # 📝 Question text (NEW QUESTION — DO NOT CHANGE)
     if q_state == "NEW_Q_TEXT":
         context.user_data["new_question"]["text"] = text
         context.user_data["add_q_state"] = "NEW_Q_IMAGE"
@@ -316,30 +631,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-       # ================= OPTIONS FLOW =================
+    # ================= OPTIONS FLOW (NEW QUESTION — DO NOT CHANGE) =================
 
-    # ➡️ Option 1
     if q_state == "NEW_Q_OPTION_1":
         context.user_data["new_question"]["options"].append(text)
         context.user_data["add_q_state"] = "NEW_Q_OPTION_2"
         await update.message.reply_text("➡️ Send option 2:")
         return
 
-    # ➡️ Option 2
     if q_state == "NEW_Q_OPTION_2":
         context.user_data["new_question"]["options"].append(text)
         context.user_data["add_q_state"] = "NEW_Q_OPTION_3"
         await update.message.reply_text("➡️ Send option 3:")
         return
 
-    # ➡️ Option 3
     if q_state == "NEW_Q_OPTION_3":
         context.user_data["new_question"]["options"].append(text)
         context.user_data["add_q_state"] = "NEW_Q_OPTION_4"
         await update.message.reply_text("➡️ Send option 4:")
         return
 
-    # ➡️ Option 4
     if q_state == "NEW_Q_OPTION_4":
         context.user_data["new_question"]["options"].append(text)
         context.user_data["add_q_state"] = "NEW_Q_CORRECT"
@@ -361,31 +672,45 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ================= EDIT QUESTION OPTIONS =================
     if context.user_data.get("edit_q_field") == "OPTIONS":
-        opts = context.user_data["edit_options"]
-        opts.append(text)
 
-        if len(opts) < 4:
-            await update.message.reply_text(f"➡️ Send NEW option {len(opts) + 1}:")
+        new_text = update.message.text.strip()
+        context.user_data["edit_options"].append(new_text)
+
+        flow_msgs = context.user_data.get("edit_options_flow_msgs", [])
+        flow_msgs.append(update.message.message_id)
+
+        count = len(context.user_data["edit_options"])
+
+        if count < 4:
+            next_msg = await update.message.reply_text(
+                f"➡️ Send NEW option {count + 1}:"
+            )
+            flow_msgs.append(next_msg.message_id)
             return
 
-        # We now have 4 options
-        qid = context.user_data["active_question_id"]
-        options_text = "||".join(opts)
+        # =========================
+        # AFTER OPTION 4
+        # =========================
+        context.user_data["edit_q_field"] = "OPTIONS_CORRECT"
 
-        cur.execute(
-            "UPDATE questions SET options=? WHERE id=?",
-            (options_text, qid)
+        new_opts = context.user_data["edit_options"]
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"1️⃣ {new_opts[0]}", callback_data="EDIT_OPT_CORRECT_0")],
+            [InlineKeyboardButton(f"2️⃣ {new_opts[1]}", callback_data="EDIT_OPT_CORRECT_1")],
+            [InlineKeyboardButton(f"3️⃣ {new_opts[2]}", callback_data="EDIT_OPT_CORRECT_2")],
+            [InlineKeyboardButton(f"4️⃣ {new_opts[3]}", callback_data="EDIT_OPT_CORRECT_3")],
+        ])
+
+        msg = await update.message.reply_text(
+            "✅ Choose the NEW correct answer:",
+            reply_markup=keyboard
         )
-        conn.commit()
 
-        context.user_data.pop("edit_q_field", None)
-        context.user_data.pop("edit_options", None)
-
-        await update.message.reply_text("✅ Options updated.")
-        await show_questions_from_message(update.message, context)
+        flow_msgs.append(msg.message_id)
         return
 
-    # ================= EXPLANATION =================
+    # ================= EXPLANATION (NEW QUESTION — DO NOT CHANGE) =================
     if q_state == "NEW_Q_EXPLANATION":
         context.user_data["new_question"]["explanation"] = text
         await save_new_question(update.message, context)
@@ -412,7 +737,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (OWNER_USER_ID, folder)
         )
 
-        quiz_id = context.user_data["active_quiz_id"]
+        quiz_id = context.user_data.get("active_quiz_id")
+        if not quiz_id:
+            return
         cur.execute(
             "UPDATE quizzes SET folder=? WHERE quiz_id=? AND owner_id=?",
             (folder, quiz_id, OWNER_USER_ID)
@@ -514,30 +841,143 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Quiz created.")
      
         # 🚀 AUTO-OPEN QUIZ ACTION MENU
-        await show_quiz_action_menu(update.message, context)
+        overview_id = context.user_data.get("quiz_overview_msg_id")
+
+        if overview_id:
+            await show_quiz_action_menu_by_id(
+                chat_id=update.effective_chat.id,
+                message_id=overview_id,
+                context=context
+            )
+
         return
 
     # ================= EDIT TITLE =================
     if state == "EDIT_TITLE":
-        quiz_id = context.user_data["active_quiz_id"]
-        cur.execute("UPDATE quizzes SET title=? WHERE quiz_id=?", (text, quiz_id))
+        quiz_id = context.user_data.get("active_quiz_id")
+        if not quiz_id:
+            return
+
+        # 🔑 Store user message ID (new title)
+        user_msg_id = update.message.message_id
+
+        # Update title
+        cur.execute(
+            "UPDATE quizzes SET title=? WHERE quiz_id=?",
+            (text, quiz_id)
+        )
         conn.commit()
+
         context.user_data["state"] = None
-        await update.message.reply_text("✅ Title updated.")
-        await show_quiz_action_menu(update.message, context)
+
+        # 🔔 Temporary confirmation
+        confirm_msg = await update.message.reply_text("✅ Title updated.")
+
+        # =========================
+        # 🧹 CLEANUP UI MESSAGES
+        # =========================
+        prompt_id = context.user_data.pop("edit_title_prompt_id", None)
+
+        # Delete "Send new title" message
+        if prompt_id:
+            try:
+                await context.bot.delete_message(update.effective_chat.id, prompt_id)
+            except:
+                pass
+
+        # Delete user's typed title
+        try:
+            await context.bot.delete_message(update.effective_chat.id, user_msg_id)
+        except:
+            pass
+
+        # Delete "Title updated" message
+        try:
+            await confirm_msg.delete()
+        except:
+            pass
+
+        # ✅ Show updated quiz overview ONLY
+        overview_id = context.user_data.get("quiz_overview_msg_id")
+        if overview_id:
+            await show_quiz_action_menu_by_id(
+                chat_id=update.effective_chat.id,
+                message_id=overview_id,
+                context=context
+            )
+
         return
 
     # ================= EDIT DESCRIPTION =================
     if state == "EDIT_DESC":
-        quiz_id = context.user_data["active_quiz_id"]
+        quiz_id = context.user_data.get("active_quiz_id")
+        if not quiz_id:
+            return
+
+        # 🔑 Store user message ID (new description)
+        user_msg_id = update.message.message_id
+
+        # Update description
         if text.upper() == "CLEAR":
-            cur.execute("UPDATE quizzes SET description=NULL WHERE quiz_id=?", (quiz_id,))
+            cur.execute(
+                "UPDATE quizzes SET description=NULL WHERE quiz_id=?",
+                (quiz_id,)
+            )
         else:
-            cur.execute("UPDATE quizzes SET description=? WHERE quiz_id=?", (text, quiz_id))
+            cur.execute(
+                "UPDATE quizzes SET description=? WHERE quiz_id=?",
+                (text, quiz_id)
+            )
         conn.commit()
+
+        # Exit edit state
         context.user_data["state"] = None
-        await update.message.reply_text("✅ Description updated.")
-        await show_quiz_action_menu(update.message, context)
+
+        # 🔔 Temporary confirmation
+        confirm_msg = await update.message.reply_text("✅ Description updated.")
+
+        # =========================
+        # 🧹 CLEANUP UI MESSAGES
+        # =========================
+        prompt_id = context.user_data.pop("edit_desc_prompt_id", None)
+
+        # Delete "Send new Quiz description" prompt
+        if prompt_id:
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=prompt_id
+                )
+            except:
+                pass
+
+        # Delete user's typed description
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=user_msg_id
+            )
+        except:
+            pass
+
+        # Delete "Description updated" confirmation
+        try:
+            await confirm_msg.delete()
+        except:
+            pass
+
+        # =========================
+        # ✅ REFRESH QUIZ OVERVIEW (SAFE & CORRECT)
+        # =========================
+        overview_id = context.user_data.get("quiz_overview_msg_id")
+
+        if overview_id:
+            await show_quiz_action_menu_by_id(
+                chat_id=update.effective_chat.id,
+                message_id=overview_id,
+                context=context
+            )
+
         return
 
 # =========================
@@ -554,6 +994,9 @@ async def delete_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Save delete request
     context.user_data["confirm_delete"] = ("QUESTION", qid)
+
+    # 🔑 IMPORTANT: mark this as a DATABASE delete
+    context.user_data["delete_scope"] = "DATABASE"
 
     keyboard = InlineKeyboardMarkup([
         [
@@ -591,36 +1034,48 @@ async def delete_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def show_quiz_folders(message, context):
+    # Pagination state
+    page = context.user_data.get("quiz_folder_page", 0)
+    PER_PAGE = 5  # folders per page (excluding Default)
+
+    # Load all folders
     cur.execute("""
         SELECT name
         FROM folders
         WHERE owner_id=?
     """, (OWNER_USER_ID,))
-
     rows = [row[0] for row in cur.fetchall()]
 
     # 🔑 Separate Default folder
     default_folder = "Default"
     other_folders = sorted([f for f in rows if f != default_folder])
 
+    total = len(other_folders)
+    pages = (total - 1) // PER_PAGE + 1 if total else 1
+    page = max(0, min(page, pages - 1))
+
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+    page_items = other_folders[start:end]
+
     keyboard = []
 
-    # 📁 DEFAULT FOLDER (ALWAYS ON TOP)
+    # 📁 DEFAULT FOLDER (ALWAYS ON TOP, NOT PAGINATED)
     cur.execute(
         "SELECT COUNT(*) FROM quizzes WHERE owner_id=? AND folder=?",
         (OWNER_USER_ID, default_folder)
     )
-    count = cur.fetchone()[0]
+    default_count = cur.fetchone()[0]
 
     keyboard.append([
         InlineKeyboardButton(
-            f"📁 Default Folder ({count})",
+            f"📁 Default Folder ({default_count})",
             callback_data=f"OPEN_FOLDER|{default_folder}"
         )
     ])
 
-    # 📁 OTHER FOLDERS (ALPHABETICAL)
-    for folder in other_folders:
+    # 📁 PAGINATED OTHER FOLDERS
+    for folder in page_items:
         cur.execute(
             "SELECT COUNT(*) FROM quizzes WHERE owner_id=? AND folder=?",
             (OWNER_USER_ID, folder)
@@ -629,19 +1084,284 @@ async def show_quiz_folders(message, context):
 
         keyboard.append([
             InlineKeyboardButton(
-                 f"📁 {folder} ({count})",
+                f"📁 {folder} ({count})",
                 callback_data=f"OPEN_FOLDER|{folder}"
             )
         ])
 
+    # ◀ ▶ Pagination controls (only if needed)
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(
+                InlineKeyboardButton("◀ Prev", callback_data="QUIZ_FOLDER_PREV")
+            )
+        nav.append(
+            InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QUIZ_FOLDER_NOP")
+        )
+        if page < pages - 1:
+            nav.append(
+                InlineKeyboardButton("Next ▶", callback_data="QUIZ_FOLDER_NEXT")
+            )
+        keyboard.append(nav)
+
+    # Bottom actions
     keyboard.append([
         InlineKeyboardButton("➕ Add Folder", callback_data="ADD_FOLDER"),
         InlineKeyboardButton("🏠 Home", callback_data="GO_HOME")
     ])
 
-    await message.reply_text(
-        "📂 Your quiz folders:",
+    await message.edit_text(
+        "📂 Quiz Folder",
         reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def show_database_menu(message, context):
+    """
+    Database menu.
+    UI behaves like Quiz Folder but logic is fully independent.
+    """
+
+    # 🔑 Load database folders (EXCLUDING Default)
+    cur.execute(
+        """
+        SELECT id, name
+        FROM question_bank_folders
+        WHERE owner_id=?
+          AND name != 'Default'
+        ORDER BY name COLLATE NOCASE
+        """,
+        (OWNER_USER_ID,)
+    )
+    folders = cur.fetchall()
+
+    # Pagination
+    PER_PAGE = 5
+    page = context.user_data.get("db_page", 0)
+
+    total = len(folders)
+    pages = (total - 1) // PER_PAGE + 1 if total else 1
+    page = max(0, min(page, pages - 1))
+
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+    page_items = folders[start:end]
+
+    keyboard = []
+
+    # 📁 DEFAULT FOLDER — ALWAYS FIRST
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM question_bank qb
+        JOIN question_bank_folders f ON f.id = qb.folder_id
+        WHERE f.owner_id=? AND f.name='Default'
+        """,
+        (OWNER_USER_ID,)
+    )
+    default_count = cur.fetchone()[0]
+
+    keyboard.append([
+        InlineKeyboardButton(
+            f"📁 Default Folder ({default_count})",
+            callback_data="DB_OPEN|Default"
+        )
+    ])
+
+    # 📁 User-created database folders
+    for folder_id, folder_name in page_items:
+        cur.execute(
+            "SELECT COUNT(*) FROM question_bank WHERE folder_id=?",
+            (folder_id,)
+        )
+        count = cur.fetchone()[0]
+
+        keyboard.append([
+            InlineKeyboardButton(
+                f"📁 {folder_name} ({count})",
+                callback_data=f"DB_OPEN|{folder_name}"
+            )
+        ])
+
+    # ◀ ▶ Pagination
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data="DB_PREV"))
+        nav.append(
+            InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="DB_NOP")
+        )
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data="DB_NEXT"))
+        keyboard.append(nav)
+
+    # 🔘 Bottom actions
+    keyboard.append([
+        InlineKeyboardButton("➕ Add Folder", callback_data="DB_ADD"),
+        InlineKeyboardButton("🏠 Home", callback_data="GO_HOME"),
+    ])
+
+    await message.edit_text(
+        "🗄 Database:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    folder_name = query.data.split("|", 1)[1]
+
+    # Get folder_id
+    cur.execute(
+        """
+        SELECT id
+        FROM question_bank_folders
+        WHERE owner_id=? AND name=?
+        """,
+        (OWNER_USER_ID, folder_name)
+    )
+    row = cur.fetchone()
+
+    if not row:
+        await query.message.reply_text("❌ Folder not found.")
+        return
+
+    folder_id = row[0]
+
+    # Load questions in this folder
+    cur.execute(
+        """
+        SELECT id, question
+        FROM question_bank
+        WHERE folder_id=?
+        ORDER BY question COLLATE NOCASE
+        """,
+        (folder_id,)
+    )
+    rows = cur.fetchall()
+
+    if not rows:
+        await query.message.reply_text(
+            f"📁 **{folder_name}**\n\n_No questions in this folder yet._",
+            parse_mode="Markdown"
+        )
+        return
+
+    keyboard = []
+
+    for qid, text in rows:
+        keyboard.append([
+            InlineKeyboardButton(
+                text[:50],
+                callback_data=f"Q_{qid}"
+            )
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
+    ])
+
+    await query.message.edit_text(
+        f"📁 **{folder_name}**\n\nSelect a question:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def qb_pick_folder_menu(message, context):
+    """
+    Question Bank folder picker (used when adding questions to a quiz)
+    """
+
+    # Reset selection state
+    context.user_data["qb_selected"] = set()
+    context.user_data.setdefault("qb_folder_page", 0)
+
+    page = context.user_data["qb_folder_page"]
+    PER_PAGE = 5
+
+    cur.execute(
+        """
+        SELECT name
+        FROM question_bank_folders
+        WHERE owner_id=?
+        """,
+        (OWNER_USER_ID,)
+    )
+    rows = [row[0] for row in cur.fetchall()]
+
+    # 🔑 Pin Default folder to top
+    default_folder = "Default"
+    other_folders = sorted(
+        [f for f in rows if f != default_folder],
+        key=str.lower
+    )
+
+    folders = [default_folder] + other_folders if default_folder in rows else other_folders
+
+    total = len(folders)
+    pages = (total - 1) // PER_PAGE + 1 if total else 1
+    page = max(0, min(page, pages - 1))
+
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+    page_items = folders[start:end]
+
+    keyboard = []
+
+    # 📁 Folder buttons
+    for folder in page_items:
+        # 🔑 Get folder_id
+        cur.execute(
+            """
+            SELECT id
+            FROM question_bank_folders
+            WHERE owner_id=? AND name=?
+            """,
+            (OWNER_USER_ID, folder)
+        )
+        row = cur.fetchone()
+        if not row:
+            continue
+
+        folder_id = row[0]
+
+        # 🔢 Count questions inside this folder
+        cur.execute(
+            "SELECT COUNT(*) FROM question_bank WHERE folder_id=?",
+            (folder_id,)
+        )
+        count = cur.fetchone()[0]
+
+        keyboard.append([
+            InlineKeyboardButton(
+                f"📁 {folder} ({count})",
+                callback_data=f"QB_OPEN_FOLDER|{folder}"
+            )
+        ])
+
+    # ◀ ▶ Pagination
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data="QB_FOLDER_PREV"))
+        nav.append(
+            InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QB_FOLDER_NOP")
+        )
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data="QB_FOLDER_NEXT"))
+        keyboard.append(nav)
+
+    # ⬅️ Back
+    keyboard.append([
+        InlineKeyboardButton("⬅️ Back", callback_data="EDIT_QUESTIONS")
+    ])
+
+    await message.edit_text(
+        "📚 **Question Bank**\n\nSelect a folder:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
     )
 
 # =========================
@@ -689,8 +1409,8 @@ async def show_quizzes_in_folder(message, context, folder):
     # 🧰 Folder actions (ONE ROW)
     if folder != "Default":
         keyboard.append([
-            InlineKeyboardButton("✏️ Rename Folder", callback_data=f"RENAME_FOLDER|{folder}"),
-            InlineKeyboardButton("🗑 Delete Folder", callback_data=f"DELETE_FOLDER|{folder}"),
+            InlineKeyboardButton("✏️ Rename", callback_data=f"RENAME_FOLDER|{folder}"),
+            InlineKeyboardButton("🗑 Delete", callback_data=f"DELETE_FOLDER|{folder}"),
             InlineKeyboardButton("⬅️ Back", callback_data="BACK_TO_FOLDERS")
         ])
     else:
@@ -700,7 +1420,7 @@ async def show_quizzes_in_folder(message, context, folder):
 
     title = "All Quizzes" if folder == "Default" else folder
 
-    await message.reply_text(
+    await message.edit_text(
         f"📁 {title}",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -806,7 +1526,9 @@ async def move_quiz_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    quiz_id = context.user_data["active_quiz_id"]
+    quiz_id = context.user_data.get("active_quiz_id")
+    if not quiz_id:
+        return
 
     cur.execute("""
         SELECT name
@@ -833,7 +1555,7 @@ async def move_quiz_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("⬅️ Back", callback_data="BACK_TO_ACTION")
     ])
 
-    await query.message.reply_text(
+    await query.message.edit_text(
         "📁 Move quiz to folder:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -849,12 +1571,28 @@ async def move_create_folder_start(update: Update, context: ContextTypes.DEFAULT
         "➕ Send the new folder name for this quiz:"
     )
 
+async def database_add_folder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # 🔒 HARD RESET: exit all other text-driven flows
+    context.user_data.clear()
+
+    # ✅ Enter Database folder creation mode
+    context.user_data["state"] = "DB_ADD_FOLDER"
+
+    await query.message.reply_text(
+        "➕ Send the name of the new Database folder:"
+    )
+
 async def move_quiz_to_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     folder = query.data.split("|", 1)[1]
-    quiz_id = context.user_data["active_quiz_id"]
+    quiz_id = context.user_data.get("active_quiz_id")
+    if not quiz_id:
+        return
 
     cur.execute(
         "UPDATE quizzes SET folder=? WHERE quiz_id=? AND owner_id=?",
@@ -862,14 +1600,23 @@ async def move_quiz_to_folder(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     conn.commit()
 
-    await query.message.reply_text(
+    confirm_msg = await query.message.reply_text(
         f"✅ Quiz moved to 📁 {folder}"
     )
+
+    await asyncio.sleep(2)
+
+    try:
+        await confirm_msg.delete()
+    except:
+        pass
 
     await show_quiz_action_menu(query.message, context)
 
 async def show_quiz_action_menu(message, context):
-    quiz_id = context.user_data["active_quiz_id"]
+    quiz_id = context.user_data.get("active_quiz_id")
+    if not quiz_id:
+        return
     cur.execute(
         "SELECT title, description, timer, shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
         (quiz_id,)
@@ -877,18 +1624,29 @@ async def show_quiz_action_menu(message, context):
     title, desc, timer, sq, sa = cur.fetchone()
 
     cur.execute(
-        "SELECT COUNT(*) FROM questions WHERE quiz_id=?",
+        "SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?",
         (quiz_id,)
     )
     total_questions = cur.fetchone()[0]
 
+    # 📘 Title
     text = f"📘 **{title}**"
+
+    # 📝 Description (if any)
     if desc:
-        text += f"\n\n_{desc}_"
-    text += f"\n\n📊 Questions: {total_questions}"
-    text += f"\n⏱ Timer: {timer}s"
-    text += f"\n🔀 Shuffle Questions: {'ON' if sq else 'OFF'}"
-    text += f"\n🔀 Shuffle Options: {'ON' if sa else 'OFF'}"
+        text += f"\n📝 _{desc}_"
+
+    # ⬜ Blank line
+    text += "\n\n"
+
+    # 📊 Questions & Timer (same row)
+    text += f"📊 Questions: {total_questions}    ⏱ Timer: {timer}s"
+
+    # 🔀 Shuffle settings (last row)
+    text += (
+        f"\n🔀 Questions: {'ON' if sq else 'OFF'}"
+        f"   🔀 Options: {'ON' if sa else 'OFF'}"
+    )
     
     keyboard = [
         [
@@ -908,11 +1666,12 @@ async def show_quiz_action_menu(message, context):
         ],
     ]
 
-    await message.reply_text(
+    await message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
+    context.user_data["quiz_overview_msg_id"] = message.message_id
 
 # =========================
 # EDIT CORRECT ANSWER FLOW
@@ -936,19 +1695,29 @@ async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🔁 Reset question pagination
     context.user_data["reset_q_page"] = True
 
-    quiz_id = context.user_data["active_quiz_id"]
+    quiz_id = context.user_data.get("active_quiz_id")
+    if not quiz_id:
+        return
     cur.execute(
         "SELECT title, description, timer, shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
         (quiz_id,)
     )
     title, desc, timer, sq, sa = cur.fetchone()
 
-    text = f"📘 **{title}**"
-    if desc:
-        text += f"\n\n_{desc}_"
-    text += f"\n\n⏱ Timer: {timer}s"
-    text += f"\n🔀 Shuffle Questions: {'ON' if sq else 'OFF'}"
-    text += f"\n🔀 Shuffle Options: {'ON' if sa else 'OFF'}"
+    cur.execute(
+        "SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?",
+        (quiz_id,)
+    )
+    total_questions = cur.fetchone()[0]
+
+    text = (
+        f"📘 **{title}**"
+        + (f"\n📝 _{desc}_" if desc else "")
+        + "\n\n"
+        + f"📊 Questions: {total_questions}    ⏱ Timer: {timer}s"
+        + f"\n🔀 Questions: {'ON' if sq else 'OFF'}"
+        + f"   🔀 Options: {'ON' if sa else 'OFF'}"
+    )
 
     keyboard = [
         # Row 1
@@ -968,7 +1737,7 @@ async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
     ]
 
-    await query.message.reply_text(
+    await query.message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
@@ -980,24 +1749,34 @@ async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def edit_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
     context.user_data["state"] = "EDIT_TITLE"
-    await query.message.reply_text(
+
+    msg = await query.message.reply_text(
         "📝 Send new title:",
         reply_markup=InlineKeyboardMarkup([
             cancel_edit_button()
         ])
     )
 
+    # 🔑 Remember prompt message for cleanup
+    context.user_data["edit_title_prompt_id"] = msg.message_id
+
 async def edit_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
     context.user_data["state"] = "EDIT_DESC"
-    await query.message.reply_text(
-        "🧾 Send Quiz description:",
+
+    msg = await query.message.reply_text(
+        "🧾 Send new Quiz description:",
         reply_markup=InlineKeyboardMarkup([
             cancel_edit_button()
         ])
     )
+
+    # 🔑 Remember prompt message for cleanup
+    context.user_data["edit_desc_prompt_id"] = msg.message_id
 
 # =========================
 # ⏱ TIMER MENU (REAL)
@@ -1007,34 +1786,89 @@ async def edit_timer_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     keyboard = [
-        [InlineKeyboardButton("15 seconds", callback_data="SET_TIMER_15")],
-        [InlineKeyboardButton("30 seconds", callback_data="SET_TIMER_30")],
-        [InlineKeyboardButton("45 seconds", callback_data="SET_TIMER_45")],
-        [InlineKeyboardButton("1 minute", callback_data="SET_TIMER_60")],
-        [InlineKeyboardButton("3 minutes", callback_data="SET_TIMER_180")],
-        [InlineKeyboardButton("5 minutes", callback_data="SET_TIMER_300")],
+        [
+            InlineKeyboardButton("10 seconds", callback_data="SET_TIMER_10"),
+            InlineKeyboardButton("1 minute", callback_data="SET_TIMER_60"),
+            InlineKeyboardButton("15 minutes", callback_data="SET_TIMER_900"),
+        ],
+        [
+            InlineKeyboardButton("15 seconds", callback_data="SET_TIMER_15"),
+            InlineKeyboardButton("3 minutes", callback_data="SET_TIMER_180"),
+            InlineKeyboardButton("30 minutes", callback_data="SET_TIMER_1800"),
+        ],
+        [
+            InlineKeyboardButton("30 seconds", callback_data="SET_TIMER_30"),
+            InlineKeyboardButton("5 minutes", callback_data="SET_TIMER_300"),
+            InlineKeyboardButton("60 minutes", callback_data="SET_TIMER_3600"),
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_TIMER_MENU")
+        ],
     ]
 
-    keyboard.append([
-        InlineKeyboardButton("⬅️ Back", callback_data="BACK_TO_EDIT_MENU")
-    ])
-
-    await query.message.reply_text(
+    msg = await query.message.reply_text(
         "⏱ Choose timer:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+    # 🔑 Remember prompt message for cleanup
+    context.user_data["edit_timer_prompt_id"] = msg.message_id
+
 async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
     seconds = int(query.data.replace("SET_TIMER_", ""))
-    quiz_id = context.user_data["active_quiz_id"]
+    quiz_id = context.user_data.get("active_quiz_id")
+    if not quiz_id:
+        return
 
-    cur.execute("UPDATE quizzes SET timer=? WHERE quiz_id=?", (seconds, quiz_id))
+    # Update timer
+    cur.execute(
+        "UPDATE quizzes SET timer=? WHERE quiz_id=?",
+        (seconds, quiz_id)
+    )
     conn.commit()
-    await query.message.reply_text(f"✅ Timer set to {seconds}s.")
-    await show_quiz_action_menu(query.message, context)
 
+    # 🔔 Temporary confirmation
+    confirm_msg = await query.message.reply_text(
+        f"✅ Timer set to {seconds}s."
+    )
+
+    # =========================
+    # 🧹 CLEANUP UI MESSAGES
+    # =========================
+    prompt_id = context.user_data.pop("edit_timer_prompt_id", None)
+
+    # Delete "Choose timer" prompt
+    if prompt_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=query.message.chat_id,
+                message_id=prompt_id
+            )
+        except:
+            pass
+
+    # Delete confirmation message
+    try:
+        await confirm_msg.delete()
+    except:
+        pass
+
+    # ✅ Show updated quiz overview ONLY
+    # ✅ Refresh quiz overview SAFELY (same pattern as Edit Title)
+    overview_id = context.user_data.get("quiz_overview_msg_id")
+
+    if overview_id:
+        await show_quiz_action_menu_by_id(
+            chat_id=query.message.chat_id,
+            message_id=overview_id,
+            context=context
+        )
+############################################################################
+# CODE BY PARTS - PART 2
+############################################################################
 # =========================
 # 🔀 SHUFFLE MENU (REAL)
 # =========================
@@ -1042,42 +1876,81 @@ async def edit_shuffle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    quiz_id = context.user_data["active_quiz_id"]
-    cur.execute("SELECT shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?", (quiz_id,))
+    quiz_id = context.user_data.get("active_quiz_id")
+    if not quiz_id:
+        return
+    cur.execute(
+        "SELECT shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
+        (quiz_id,)
+    )
     sq, sa = cur.fetchone()
 
     keyboard = [
-        [InlineKeyboardButton(
-            f"Shuffle Questions: {'ON' if sq else 'OFF'}",
-            callback_data="TOGGLE_Q"
-        )],
-        [InlineKeyboardButton(
-            f"Shuffle Options: {'ON' if sa else 'OFF'}",
-            callback_data="TOGGLE_A"
-        )],
+        [
+            InlineKeyboardButton(
+                f"Shuffle Questions: {'ON' if sq else 'OFF'}",
+                callback_data="TOGGLE_Q"
+            ),
+            InlineKeyboardButton(
+                f"Shuffle Options: {'ON' if sa else 'OFF'}",
+                callback_data="TOGGLE_A"
+            ),
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_SHUFFLE_MENU")
+        ],
     ]
 
-    keyboard.append([
-        InlineKeyboardButton("⬅️ Back", callback_data="BACK_TO_EDIT_MENU")
-    ])
-
-    await query.message.reply_text(
-        "🔀 Shuffle settings:",
+    msg = await query.message.reply_text(
+        "🔀 Shuffle Settings:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
+
+    # 🔑 Remember shuffle menu message for cleanup
+    context.user_data["shuffle_menu_msg_id"] = msg.message_id
 
 async def toggle_shuffle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    quiz_id = context.user_data["active_quiz_id"]
+    quiz_id = context.user_data.get("active_quiz_id")
+    if not quiz_id:
+        return
+
     if query.data == "TOGGLE_Q":
-        cur.execute("UPDATE quizzes SET shuffle_q = 1 - shuffle_q WHERE quiz_id=?", (quiz_id,))
+        cur.execute(
+            "UPDATE quizzes SET shuffle_q = 1 - shuffle_q WHERE quiz_id=?",
+            (quiz_id,)
+        )
     else:
-        cur.execute("UPDATE quizzes SET shuffle_a = 1 - shuffle_a WHERE quiz_id=?", (quiz_id,))
+        cur.execute(
+            "UPDATE quizzes SET shuffle_a = 1 - shuffle_a WHERE quiz_id=?",
+            (quiz_id,)
+        )
+
     conn.commit()
 
-    await show_quiz_action_menu(query.message, context)
+    # 🧹 Remove shuffle menu (fade effect)
+    msg_id = context.user_data.pop("shuffle_menu_msg_id", None)
+    if msg_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=query.message.chat_id,
+                message_id=msg_id
+            )
+        except:
+            pass
+
+    # ✅ Return cleanly to quiz overview
+    # ✅ Refresh quiz overview SAFELY (same pattern as Edit Title)
+    overview_id = context.user_data.get("quiz_overview_msg_id")
+
+    if overview_id:
+        await show_quiz_action_menu_by_id(
+            chat_id=query.message.chat_id,
+            message_id=overview_id,
+            context=context
+        )
 
 # =========================
 # NAVIGATION
@@ -1090,11 +1963,18 @@ async def go_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("📂 Quiz Folder", callback_data="HOME_MY_QUIZZES"),
             InlineKeyboardButton("➕ Create a new Quiz", callback_data="HOME_CREATE"),
+        ],
+        [
+            InlineKeyboardButton("🗄 Database", callback_data="HOME_DATABASE"),
+            InlineKeyboardButton("❓ Create a Question", callback_data="HOME_CREATE_QUESTION"),
+        ],
+        [
+            InlineKeyboardButton("👥 Manage Subscribers", callback_data="HOME_MANAGE_SUBSCRIBERS"),
         ]
     ])
 
-    await query.message.reply_text(
-        "🏠 Home",
+    await query.message.edit_text(
+        "🏠 Home Menu",
         reply_markup=keyboard
     )
 
@@ -1117,15 +1997,90 @@ async def back_to_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    # 🧹 Delete Edit Title prompt (if exists)
+    title_prompt_id = context.user_data.pop("edit_title_prompt_id", None)
+    if title_prompt_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=query.message.chat_id,
+                message_id=title_prompt_id
+            )
+        except:
+            pass
+
+    # 🧹 Delete Edit Description prompt (if exists)
+    desc_prompt_id = context.user_data.pop("edit_desc_prompt_id", None)
+    if desc_prompt_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=query.message.chat_id,
+                message_id=desc_prompt_id
+            )
+        except:
+            pass
+
+    # 🧹 Delete Edit Timer prompt (if exists)
+    timer_prompt_id = context.user_data.pop("edit_timer_prompt_id", None)
+    if timer_prompt_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=query.message.chat_id,
+                message_id=timer_prompt_id
+            )
+        except:
+            pass
+
+    # 🔒 Exit edit mode silently
     context.user_data["state"] = None
-    await edit_menu(update, context)
+
+    # 🚫 DO NOT send any new menu
+    # Previous quiz overview remains visible
 
 async def home_my_quizzes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     # Reuse existing logic
+    context.user_data["quiz_folder_page"] = 0
     await my_quizzes(query.message, context)
+
+async def home_database(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # Reset database pagination
+    context.user_data["db_page"] = 0
+
+    await show_database_menu(query.message, context)
+
+async def home_create_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # 🔒 Clear any quiz-specific state
+    context.user_data.pop("active_quiz_id", None)
+
+    # ✅ Start pure Question Bank creation flow
+    context.user_data["add_q_state"] = "NEW_Q_TEXT"
+    context.user_data["new_question"] = {"options": []}
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
+    ])
+
+    await query.message.reply_text(
+        "❓ Create a Question\n\n📝 Send question text:",
+        reply_markup=keyboard
+    )
+
+async def home_manage_subscribers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    await query.message.reply_text(
+        "👥 **Manage Subscribers**\n\n🚧 This feature is coming soon.",
+        parse_mode="Markdown"
+    )
 
 async def back_to_folders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1170,7 +2125,9 @@ async def show_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data.setdefault("selected_questions", set())
 
-    quiz_id = context.user_data["active_quiz_id"]
+    quiz_id = context.user_data.get("active_quiz_id")
+    if not quiz_id:
+        return
     if "q_page" not in context.user_data:
         context.user_data["q_page"] = 0
     page = context.user_data["q_page"]
@@ -1181,10 +2138,15 @@ async def show_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["reset_q_page"] = False
 
     cur.execute(
-        "SELECT id, question FROM questions WHERE quiz_id=? ORDER BY question COLLATE NOCASE",
+        """
+        SELECT qb.id, qb.question
+        FROM quiz_question_links ql
+        JOIN question_bank qb ON qb.id = ql.question_id
+        WHERE ql.quiz_id=?
+        ORDER BY ql.position, qb.question COLLATE NOCASE
+        """,
         (quiz_id,)
     )
-
     rows = cur.fetchall()
 
     total = len(rows)
@@ -1195,7 +2157,7 @@ async def show_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
 
     # ➕ Add new question
-    keyboard.append([InlineKeyboardButton("➕ Add new question", callback_data="ADD_QUESTION")])
+    keyboard.append([InlineKeyboardButton("➕ Add from Question Bank", callback_data="QB_PICK_FOLDER")])
 
     # Question buttons (10 max)
     selected = context.user_data.get("selected_questions", set())
@@ -1222,7 +2184,7 @@ async def show_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Back button
     keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="EDIT_THIS")])
 
-    await query.message.reply_text(
+    await query.message.edit_text(
         "❓ Questions in this quiz:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -1244,14 +2206,22 @@ async def add_new_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MESSAGE-SAFE RETURN TO QUESTIONS
 # =========================
 async def show_questions_from_message(message, context):
-    quiz_id = context.user_data["active_quiz_id"]
+    quiz_id = context.user_data.get("active_quiz_id")
+    if not quiz_id:
+        return
     page = context.user_data.get("q_page", 0)
 
+    # 🔑 Load questions linked to this quiz FROM QUESTION BANK
     cur.execute(
-        "SELECT id, question FROM questions WHERE quiz_id=? ORDER BY question COLLATE NOCASE",
+        """
+        SELECT qb.id, qb.question
+        FROM quiz_question_links ql
+        JOIN question_bank qb ON qb.id = ql.question_id
+        WHERE ql.quiz_id=?
+        ORDER BY ql.position, qb.question COLLATE NOCASE
+        """,
         (quiz_id,)
     )
-
     rows = cur.fetchall()
 
     total = len(rows)
@@ -1261,30 +2231,46 @@ async def show_questions_from_message(message, context):
 
     keyboard = []
 
+    # ➕ Add from Question Bank
     keyboard.append([
-        InlineKeyboardButton("➕ Add new question", callback_data="ADD_QUESTION")
+        InlineKeyboardButton(
+            "➕ Add from Question Bank",
+            callback_data="QB_PICK_FOLDER"
+        )
     ])
 
+    # Question list
     for i, (qid, q) in enumerate(page_rows, start=start + 1):
         keyboard.append([
-            InlineKeyboardButton(f"{i}. {q[:40]}", callback_data=f"Q_{qid}")
+            InlineKeyboardButton(
+                f"{i}. {q[:40]}",
+                callback_data=f"Q_{qid}"
+            )
         ])
 
-    pages = (total - 1) // QUESTIONS_PER_PAGE + 1
+    # Pagination
+    pages = (total - 1) // QUESTIONS_PER_PAGE + 1 if total else 1
     if pages > 1:
         nav = []
         if page > 0:
-            nav.append(InlineKeyboardButton("◀️ Prev", callback_data="QPAGE_PREV"))
-        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QPAGE_NOP"))
+            nav.append(
+                InlineKeyboardButton("◀️ Prev", callback_data="QPAGE_PREV")
+            )
+        nav.append(
+            InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QPAGE_NOP")
+        )
         if page < pages - 1:
-            nav.append(InlineKeyboardButton("Next ▶️", callback_data="QPAGE_NEXT"))
+            nav.append(
+                InlineKeyboardButton("Next ▶️", callback_data="QPAGE_NEXT")
+            )
         keyboard.append(nav)
 
+    # Back
     keyboard.append([
         InlineKeyboardButton("⬅️ Back", callback_data="EDIT_THIS")
     ])
 
-    await message.reply_text(
+    await message.edit_text(
         "❓ Questions in this quiz:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -1354,14 +2340,27 @@ async def choose_correct_answer(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 async def save_new_question(message, context):
-    quiz_id = context.user_data["active_quiz_id"]
     q = context.user_data["new_question"]
 
     options_text = "||".join(q["options"])
 
-    cur.execute("""
-        INSERT INTO questions (
-            quiz_id,
+    # 🔑 Resolve Question Bank folder (Default for now)
+    cur.execute(
+        """
+        SELECT id
+        FROM question_bank_folders
+        WHERE owner_id=? AND name='Default'
+        """,
+        (OWNER_USER_ID,)
+    )
+    folder_row = cur.fetchone()
+    folder_id = folder_row[0]
+
+    # ✅ 1. INSERT INTO QUESTION BANK (SOURCE OF TRUTH)
+    cur.execute(
+        """
+        INSERT INTO question_bank (
+            folder_id,
             question,
             image_file_id,
             options,
@@ -1369,40 +2368,84 @@ async def save_new_question(message, context):
             explanation
         )
         VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        quiz_id,
-        q["text"],
-        q.get("image"),
-        options_text,
-        q["correct"],
-        q.get("explanation")
-    ))
+        """,
+        (
+            folder_id,
+            q["text"],
+            q.get("image"),
+            options_text,
+            q["correct"],
+            q.get("explanation")
+        )
+    )
+
+    question_id = cur.lastrowid
 
     conn.commit()
 
-    # Reset question state
+    # 🔄 Reset creation state
     context.user_data.pop("add_q_state", None)
     context.user_data.pop("new_question", None)
 
-    await message.reply_text("✅ Question saved.")
-    await show_questions_from_message(message, context)
+    await message.reply_text("✅ Question saved to Question Bank.")
+
+    # =========================
+    # CONTEXT-AWARE RETURN
+    # =========================
+
+    # 🔹 CASE 1: Question was added while editing a quiz
+    if context.user_data.get("active_quiz_id"):
+        context.user_data["reset_q_page"] = True
+        await show_questions_from_message(message, context)
+        return
+
+    # 🔹 CASE 2: Question created from HOME (Question Bank mode)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
+    ])
+
+    context.user_data["add_q_state"] = "NEW_Q_TEXT"
+    context.user_data["new_question"] = {"options": []}
+
+    await message.reply_text(
+        "❓ Create a Question\n\n📝 Send question text:",
+        reply_markup=keyboard
+    )
 
 async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    chat_id = query.message.chat_id
+
+    # 🔥 HARD CLEAN: delete previous preview if exists
+    old_preview_id = context.user_data.get("question_preview_msg_id")
+    if old_preview_id:
+        try:
+            await context.bot.delete_message(chat_id, old_preview_id)
+        except:
+            pass
+
+    # Remove previous list/menu message
+    try:
+        await query.message.delete()
+    except:
+        pass
+
     qid = int(query.data.replace("Q_", ""))
     context.user_data["active_question_id"] = qid
 
-    cur.execute("""
+    cur.execute(
+        """
         SELECT question, image_file_id, options, correct, explanation
-        FROM questions
+        FROM question_bank
         WHERE id=?
-    """, (qid,))
-
+        """,
+        (qid,)
+    )
     row = cur.fetchone()
     if not row:
-        await query.message.reply_text("❌ Question not found.")
+        await context.bot.send_message(chat_id, "❌ Question not found.")
         return
 
     question, image, options, correct, explanation = row
@@ -1419,25 +2462,171 @@ async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✏️ Edit Question", callback_data="EDIT_Q"),
-            InlineKeyboardButton("📋 Copy Question", callback_data="COPY_Q"),
+            InlineKeyboardButton("✏️ Edit", callback_data="EDIT_Q"),
+            InlineKeyboardButton("📂 Move", callback_data="MOVE_Q_START"),
+            InlineKeyboardButton("📋 Copy", callback_data="COPY_Q_START"),
         ],
         [
-            InlineKeyboardButton("🗑 Delete Question", callback_data="DELETE_QUESTION"),
-            InlineKeyboardButton("⬅️ Back", callback_data="EDIT_QUESTIONS"),
+            InlineKeyboardButton("🗑 Delete", callback_data="DELETE_QUESTION"),
+            InlineKeyboardButton("⬅️ Back", callback_data="BACK_TO_QUESTIONS"),
         ],
     ])
 
+    # ✅ TRUE MEDIA LOGIC
     if image:
-        await query.message.reply_photo(
+        msg = await context.bot.send_photo(
+            chat_id=chat_id,
             photo=image,
             caption=text,
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
     else:
-        await query.message.reply_text(
-            text,
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+
+    context.user_data["question_preview_msg_id"] = msg.message_id
+
+async def rebuild_question_preview(chat_id, context):
+    """
+    Completely deletes old preview and rebuilds it
+    based on current DB state.
+    """
+
+    qid = context.user_data.get("active_question_id")
+    if not qid:
+        return
+
+    # 🔥 1️⃣ Delete old preview (if exists)
+    old_preview_id = context.user_data.pop("question_preview_msg_id", None)
+    if old_preview_id:
+        try:
+            await context.bot.delete_message(chat_id, old_preview_id)
+        except:
+            pass
+
+    # 🔑 2️⃣ Load latest question data from DB
+    cur.execute(
+        """
+        SELECT question, image_file_id, options, correct, explanation
+        FROM question_bank
+        WHERE id=?
+        """,
+        (qid,)
+    )
+    row = cur.fetchone()
+    if not row:
+        return
+
+    question, image, options, correct, explanation = row
+    options = options.split("||")
+
+    # 📝 3️⃣ Build preview text
+    text = f"📝 **{question}**\n\n"
+
+    for i, opt in enumerate(options):
+        marker = "✅" if i == correct else "◻️"
+        text += f"{marker} {opt}\n"
+
+    if explanation:
+        text += f"\n🧾 _{explanation}_"
+
+    # 🎛 4️⃣ Build preview buttons
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Edit", callback_data="EDIT_Q"),
+            InlineKeyboardButton("📂 Move", callback_data="QB_MOVE"),
+            InlineKeyboardButton("📋 Copy", callback_data="COPY_Q"),
+        ],
+        [
+            InlineKeyboardButton("🗑 Delete", callback_data="DELETE_QUESTION"),
+            InlineKeyboardButton("⬅️ Back", callback_data="EDIT_QUESTIONS"),
+        ],
+    ])
+
+    # 📨 5️⃣ Send correct message type
+    if image:
+        msg = await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=image,
+            caption=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    else:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+
+    # 💾 6️⃣ Store new preview message ID
+    context.user_data["question_preview_msg_id"] = msg.message_id
+
+async def show_question_preview_by_id(chat_id, context):
+    """
+    Safely rebuilds the question preview without requiring callback_query.
+    Used after editing image.
+    """
+
+    qid = context.user_data.get("active_question_id")
+    if not qid:
+        return
+
+    cur.execute(
+        """
+        SELECT question, image_file_id, options, correct, explanation
+        FROM question_bank
+        WHERE id=?
+        """,
+        (qid,)
+    )
+
+    row = cur.fetchone()
+    if not row:
+        return
+
+    question, image, options, correct, explanation = row
+    options = options.split("||")
+
+    text = f"📝 **{question}**\n\n"
+
+    for i, opt in enumerate(options):
+        marker = "✅" if i == correct else "◻️"
+        text += f"{marker} {opt}\n"
+
+    if explanation:
+        text += f"\n🧾 _{explanation}_"
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Edit", callback_data="EDIT_Q"),
+            InlineKeyboardButton("📂 Move", callback_data="QB_MOVE"),
+            InlineKeyboardButton("📋 Copy", callback_data="COPY_Q"),
+        ],
+        [
+            InlineKeyboardButton("🗑 Delete", callback_data="DELETE_QUESTION"),
+            InlineKeyboardButton("⬅️ Back", callback_data="EDIT_QUESTIONS"),
+        ],
+    ])
+
+    if image:
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=image,
+            caption=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
@@ -1446,76 +2635,185 @@ async def edit_question_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
 
-    keyboard = [
-        [
-            InlineKeyboardButton("📝 Edit question text", callback_data="EDIT_Q_TEXT"),
-            InlineKeyboardButton("🖼 Change / remove image", callback_data="EDIT_Q_IMAGE"),
-        ],
-        [
-            InlineKeyboardButton("🔁 Edit choices / options", callback_data="EDIT_Q_OPTIONS"),
-            InlineKeyboardButton("✅ Change correct answer", callback_data="EDIT_Q_CORRECT"),
-        ],
-        [
-            InlineKeyboardButton("🧾 Edit explanation", callback_data="EDIT_Q_EXPLANATION"),
-            InlineKeyboardButton("⬅️ Back to Question Options", callback_data="BACK_TO_Q_OPTIONS"),
-        ],
-    ]
+    chat_id = query.message.chat_id
 
-    await query.message.reply_text(
-        "✏️ **Edit Question**",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
+    qid = context.user_data.get("active_question_id")
+    if not qid:
+        await query.message.reply_text("❌ No question selected.")
+        return
+
+    # 🧹 Delete old preview completely (safe reset)
+    try:
+        await query.message.delete()
+    except:
+        pass
+
+    # 🔑 Load fresh data from Question Bank
+    cur.execute(
+        """
+        SELECT question, image_file_id, options, correct, explanation
+        FROM question_bank
+        WHERE id=?
+        """,
+        (qid,)
     )
+    row = cur.fetchone()
+    if not row:
+        return
+
+    question, image, options, correct, explanation = row
+    options = options.split("||")
+
+    text = f"📝 **{question}**\n\n"
+
+    for i, opt in enumerate(options):
+        marker = "✅" if i == correct else "◻️"
+        text += f"{marker} {opt}\n"
+
+    if explanation:
+        text += f"\n🧾 _{explanation}_"
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📝 Question Text", callback_data="EDIT_Q_TEXT"),
+            InlineKeyboardButton("🖼 Edit Image", callback_data="EDIT_Q_IMAGE"),
+        ],
+        [
+            InlineKeyboardButton("🔁 Edit Choices", callback_data="EDIT_Q_OPTIONS"),
+            InlineKeyboardButton("✅ Edit Answer", callback_data="EDIT_Q_CORRECT"),
+        ],
+        [
+            InlineKeyboardButton("🧾 Explanation", callback_data="EDIT_Q_EXPLANATION"),
+            InlineKeyboardButton("⬅️ Back", callback_data="BACK_TO_Q_OPTIONS"),
+        ],
+    ])
+
+    # ✅ Send correct message type (NO PLACEHOLDER IMAGE)
+    if image:
+        msg = await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=image,
+            caption=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    else:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+
+    # 🔑 Store new preview message ID
+    context.user_data["question_preview_msg_id"] = msg.message_id
 
 async def back_to_question_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    await question_action_menu(update, context)
+    chat_id = query.message.chat_id
+
+    # 🧹 Delete the Edit menu message
+    try:
+        await query.message.delete()
+    except:
+        pass
+
+    # 🔄 Rebuild Question Preview cleanly
+    await rebuild_question_preview(chat_id, context)
 
 async def edit_question_text_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    # Mark that we are editing question text
+    # 🔒 Safety: ensure a Question Bank question is active
+    qid = context.user_data.get("active_question_id")
+    if not qid:
+        await query.message.reply_text("❌ No question selected.")
+        return
+
+    # 🔄 Clear other edit modes
+    context.user_data.pop("add_q_state", None)
+    context.user_data.pop("edit_options", None)
+
+    # ✏️ Enter text edit mode (Question Bank)
     context.user_data["edit_q_field"] = "TEXT"
 
-    await query.message.reply_text("📝 Send new question text:")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_EDIT_Q_TEXT")]
+    ])
+
+    msg = await query.message.reply_text(
+        "📝 Send new question text:",
+        reply_markup=keyboard
+    )
+
+    # 🔑 Store prompt message ID for cleanup
+    context.user_data["edit_text_prompt_id"] = msg.message_id
 
 async def edit_question_image_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    # Mark edit mode
+    # 🔒 Safety: ensure a Question Bank question is active
+    qid = context.user_data.get("active_question_id")
+    if not qid:
+        await query.message.reply_text("❌ No question selected.")
+        return
+
+    # 🔄 Clear other edit modes
+    context.user_data.pop("add_q_state", None)
+    context.user_data.pop("edit_options", None)
+
+    # 🖼 Enter image edit mode
     context.user_data["edit_q_field"] = "IMAGE"
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🖼 Send new image", callback_data="EDIT_Q_IMAGE_SEND")],
-        [InlineKeyboardButton("🗑 Remove image", callback_data="EDIT_Q_IMAGE_REMOVE")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="EDIT_Q_BACK")]
+        [InlineKeyboardButton("🖼 Send new Image", callback_data="EDIT_Q_IMAGE_SEND")],
+        [InlineKeyboardButton("🗑 Remove Image", callback_data="EDIT_Q_IMAGE_REMOVE")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_EDIT_Q_IMAGE")]
     ])
 
-    await query.message.reply_text(
+    msg = await query.message.reply_text(
         "🖼 Change or remove question image:",
         reply_markup=keyboard
     )
+
+    # 🔑 Track this message for cleanup
+    context.user_data["edit_image_menu_msg_id"] = msg.message_id
 
 async def remove_question_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    qid = context.user_data["active_question_id"]
+    qid = context.user_data.get("active_question_id")
+    if not qid:
+        await query.message.reply_text("❌ No question selected.")
+        return
 
+    chat_id = query.message.chat_id
+
+    # 1️⃣ Remove image from DB
     cur.execute(
-        "UPDATE questions SET image_file_id=NULL WHERE id=?",
+        "UPDATE question_bank SET image_file_id=NULL WHERE id=?",
         (qid,)
     )
     conn.commit()
 
+    # Exit image edit mode
     context.user_data.pop("edit_q_field", None)
 
-    await query.message.reply_text("🗑 Image removed.")
-    await show_questions_from_message(query.message, context)
+    # 2️⃣ Delete image edit menu
+    menu_id = context.user_data.pop("edit_image_menu_msg_id", None)
+    if menu_id:
+        try:
+            await context.bot.delete_message(chat_id, menu_id)
+        except:
+            pass
+
+    # 3️⃣ Rebuild preview safely (TEXT will be sent automatically)
+    await rebuild_question_preview(chat_id, context)
 
 async def edit_question_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1532,43 +2830,85 @@ async def edit_question_image_send(update: Update, context: ContextTypes.DEFAULT
     # Tell bot we are now waiting for an image
     context.user_data["edit_q_field"] = "IMAGE"
 
-    await query.message.reply_text(
+    msg = await query.message.reply_text(
         "🖼 Please send the new image now."
     )
+
+    context.user_data["edit_image_prompt_msg_id"] = msg.message_id
 
 async def edit_question_options_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    qid = context.user_data["active_question_id"]
+    # 🔒 Safety: ensure a Question Bank question is active
+    qid = context.user_data.get("active_question_id")
+    if not qid:
+        await query.message.reply_text("❌ No question selected.")
+        return
 
-    # Load existing options for reference
-    cur.execute("SELECT options FROM questions WHERE id=?", (qid,))
+    # 🔑 Load existing options from QUESTION BANK
+    cur.execute(
+        "SELECT options FROM question_bank WHERE id=?",
+        (qid,)
+    )
     row = cur.fetchone()
+    if not row:
+        await query.message.reply_text("❌ Question not found.")
+        return
+
     old_options = row[0].split("||")
 
+    # 🔄 Clear other edit modes safely
+    context.user_data.pop("add_q_state", None)
+    context.user_data.pop("edit_options", None)
+    context.user_data.pop("edit_options_flow_msgs", None)
+
+    # 🔁 Enter options edit mode
     context.user_data["edit_q_field"] = "OPTIONS"
     context.user_data["edit_options"] = []
 
-    await query.message.reply_text(
+    # 🔥 NEW: Track ALL temporary messages in this flow
+    context.user_data["edit_options_flow_msgs"] = []
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_EDIT_Q_OPTIONS")]
+    ])
+
+    msg = await query.message.reply_text(
         "✏️ Editing options\n\n"
         f"Current options:\n"
         f"1️⃣ {old_options[0]}\n"
         f"2️⃣ {old_options[1]}\n"
         f"3️⃣ {old_options[2]}\n"
         f"4️⃣ {old_options[3]}\n\n"
-        "➡️ Send NEW option 1:"
+        "➡️ Send NEW option 1:",
+        reply_markup=keyboard
     )
+
+    # 🔑 Store this message for later full declutter
+    context.user_data["edit_options_flow_msgs"].append(msg.message_id)
 
 async def edit_question_correct_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    qid = context.user_data["active_question_id"]
+    # 🔒 Safety: ensure a Question Bank question is active
+    qid = context.user_data.get("active_question_id")
+    if not qid:
+        await query.message.reply_text("❌ No question selected.")
+        return
 
-    # Load options
-    cur.execute("SELECT options, correct FROM questions WHERE id=?", (qid,))
-    options_text, current_correct = cur.fetchone()
+    # 🔑 Load options + correct answer FROM QUESTION BANK
+    cur.execute(
+        "SELECT options, correct FROM question_bank WHERE id=?",
+        (qid,)
+    )
+    row = cur.fetchone()
+    if not row:
+        await query.message.reply_text("❌ Question not found.")
+        return
+
+    options_text, current_correct = row
     opts = options_text.split("||")
 
     keyboard = InlineKeyboardMarkup([
@@ -1587,243 +2927,246 @@ async def edit_question_correct_apply(update: Update, context: ContextTypes.DEFA
     query = update.callback_query
     await query.answer()
 
-    correct_index = int(query.data.replace("EDIT_CORRECT_", ""))
-    qid = context.user_data["active_question_id"]
+    qid = context.user_data.get("active_question_id")
+    if not qid:
+        await query.message.reply_text("❌ No question selected.")
+        return
 
+    correct_index = int(query.data.replace("EDIT_CORRECT_", ""))
+
+    # 🔑 UPDATE SOURCE OF TRUTH
     cur.execute(
-        "UPDATE questions SET correct=? WHERE id=?",
+        "UPDATE question_bank SET correct=? WHERE id=?",
         (correct_index, qid)
     )
     conn.commit()
 
-    await query.message.reply_text("✅ Correct answer updated.")
-    await show_questions_from_message(query.message, context)
+    chat_id = query.message.chat_id
+
+    # 🧹 Delete the "Choose correct answer" message
+    try:
+        await query.message.delete()
+    except:
+        pass
+
+    # ✅ Show temporary confirmation
+    confirm_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text="✅ Correct answer updated."
+    )
+
+    await asyncio.sleep(2)
+
+    # 🧹 Delete confirmation message
+    try:
+        await confirm_msg.delete()
+    except:
+        pass
+
+    # 🔄 Rebuild updated preview cleanly
+    await rebuild_question_preview(chat_id, context)
 
 async def edit_question_explanation_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    qid = context.user_data["active_question_id"]
+    qid = context.user_data.get("active_question_id")
+    if not qid:
+        await query.message.reply_text("❌ No question selected.")
+        return
 
     # Load current explanation
-    cur.execute("SELECT explanation FROM questions WHERE id=?", (qid,))
+    cur.execute(
+        "SELECT explanation FROM question_bank WHERE id=?",
+        (qid,)
+    )
     row = cur.fetchone()
     current = row[0] if row and row[0] else "— none —"
 
     context.user_data["edit_q_field"] = "EXPLANATION"
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏭ Remove explanation", callback_data="EDIT_Q_EXPL_REMOVE")]
+        [
+            InlineKeyboardButton("🗑 Remove Explanation", callback_data="EDIT_Q_EXPL_REMOVE"),
+            InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_EDIT_Q_EXPL"),
+        ]
     ])
 
-    await query.message.reply_text(
+    msg = await query.message.reply_text(
         f"🧾 Current explanation:\n\n{current}\n\n"
         "✏️ Send new explanation text:",
         reply_markup=keyboard
     )
 
+    # Track prompt message for cleanup
+    context.user_data["edit_expl_prompt_id"] = msg.message_id
+
 async def edit_question_explanation_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    qid = context.user_data["active_question_id"]
+    qid = context.user_data.get("active_question_id")
+    if not qid:
+        return
 
+    chat_id = query.message.chat_id
+
+    # Remove explanation from DB
     cur.execute(
-        "UPDATE questions SET explanation=NULL WHERE id=?",
+        "UPDATE question_bank SET explanation=NULL WHERE id=?",
         (qid,)
     )
     conn.commit()
 
+    # Delete prompt message
+    prompt_id = context.user_data.pop("edit_expl_prompt_id", None)
+    if prompt_id:
+        try:
+            await context.bot.delete_message(chat_id, prompt_id)
+        except:
+            pass
+
+    # Exit edit mode
     context.user_data.pop("edit_q_field", None)
 
-    await query.message.reply_text("🗑 Explanation removed.")
-    await show_questions_from_message(query.message, context)
+    # Confirmation
+    confirm = await context.bot.send_message(
+        chat_id,
+        "🗑 Explanation removed."
+    )
+
+    await asyncio.sleep(2)
+
+    try:
+        await confirm.delete()
+    except:
+        pass
+
+    # Rebuild preview cleanly
+    await rebuild_question_preview(chat_id, context)
 
 async def play_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    # 🧹 DELETE READY MESSAGE ONLY FOR PLAYER MODE
+    # (Admin "Start this Quiz" must NOT delete Quiz Overview)
+    if "play_quiz_id" in context.user_data and "active_quiz_id" not in context.user_data:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
 
     # 🔑 FIX: ADMIN START (from quiz menu)
     if "play_quiz_id" not in context.user_data:
         quiz_id = context.user_data.get("active_quiz_id")
         if not quiz_id:
-            await query.message.reply_text("❌ Quiz not found.")
             return
         context.user_data["play_quiz_id"] = quiz_id
 
-    quiz_id = context.user_data.get("play_quiz_id")
-    group_chat_id = context.user_data.get("group_chat_id")
-
-    # 🏆 CREATE LEADERBOARD MESSAGE (GROUP ONLY, ONCE)
-    if group_chat_id and quiz_id not in GROUP_LB_MESSAGES:
-        leaderboard_text = (
-            "🏆 *Quiz Leaderboard*\n\n"
-            "_Waiting for players to answer..._"
-        )
-
-        lb_msg = await context.bot.send_message(
-            chat_id=group_chat_id,
-            text=leaderboard_text,
-            parse_mode="Markdown"
-        )
-
-        GROUP_LB_MESSAGES[quiz_id] = {
-            "chat_id": group_chat_id,
-            "message_id": lb_msg.message_id
-        }
-
-        GROUP_LEADERBOARDS.setdefault(quiz_id, {})
-
-    # ▶️ START QUIZ (shared logic)
+    # ▶️ STEP 2: START QUIZ (UNCHANGED LOGIC)
     await start_play_quiz(update, context)
+
+def build_group_message_link(chat_id: int, message_id: int) -> str:
+    """
+    Always generate a valid Telegram message link.
+    Works for private supergroups (no username).
+    """
+    chat_id_str = str(chat_id)
+
+    # Supergroup / private group
+    if chat_id_str.startswith("-100"):
+        internal_id = chat_id_str[4:]
+        return f"https://t.me/c/{internal_id}/{message_id}"
+
+    # ❗ Fallback: no valid public link possible
+    # (Telegram does NOT support numeric IDs here)
+    return None
 
 async def play_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
-    data = query.data  # PLAY_ANSWER_{index}
-    chosen_index = int(data.replace("PLAY_ANSWER_", ""))
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
-    play = context.user_data["play"]
-    question = play["questions"][play["index"]]
-    correct_index = question["correct"]
-
-    # 🔒 LOCK ANSWERS AFTER FIRST TAP
-    if play.get("locked"):
+    play = context.user_data.get("play")
+    if not play or play.get("locked"):
         return
+
+    # 🔒 Lock immediately
     play["locked"] = True
 
-    # ✅ INCREASE SCORE WHEN ANSWER IS CORRECT
+    # ⛔ CANCEL TIMER TASK (SYMMETRY WITH TIMEOUT)
+    task = play.get("timer_task")
+    if task:
+        task.cancel()
+    play["timer_task"] = None
+
+    # 🧹 DELETE ALL TIMER MESSAGES (🔴 FIX)
+    for timer_msg_id in play.get("timer_message_ids", []):
+        try:
+            await context.bot.delete_message(
+                chat_id=query.from_user.id,
+                message_id=timer_msg_id
+            )
+        except:
+            pass
+    play["timer_message_ids"] = []
+
+    # 📌 Parse answer
+    chosen_index = int(query.data.replace("PLAY_ANSWER_", ""))
+    q = play["questions"][play["index"]]
+    correct_index = q["correct"]
+
+    # ✅ Score
     if chosen_index == correct_index:
         play["score"] += 1
 
-    # 🎨 BUILD GREEN / RED BUTTONS
-    buttons = []
-    for i, option in enumerate(question["options"]):
-        if i == correct_index:
-            label = f"✅ {option}"
-        elif i == chosen_index:
-            label = f"❌ {option}"
-        else:
-            label = option
+    # 🎨 Build feedback buttons
+    labels = ["A", "B", "C", "D"]
 
-        buttons.append([InlineKeyboardButton(label, callback_data="LOCKED")])
-
-    # 🎨 UPDATE MESSAGE WITH VISUAL FEEDBACK
-    await query.message.edit_reply_markup(
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-    # ➡️ MOVE TO NEXT QUESTION
-    play["index"] += 1
-    play["locked"] = False
-
-    # 🏁 QUIZ FINISHED
-    if play["index"] >= len(play["questions"]):
-        quiz_id = play["quiz_id"]
-        user = query.from_user
-        score = play["score"]
-
-        GROUP_LEADERBOARDS.setdefault(quiz_id, {})
-        entry = GROUP_LEADERBOARDS[quiz_id].get(user.id)
-
-        update_lb = False
-
-        # 🥇 FIRST ATTEMPT → update leaderboard
-        if not entry:
-            GROUP_LEADERBOARDS[quiz_id][user.id] = {
-                "name": user.first_name,
-                "score": score,
-                "attempts": 1
-            }
-            update_lb = True
-
-        # 🥈 SECOND ATTEMPT → update leaderboard
-        elif entry["attempts"] == 1:
-            entry["score"] = score
-            entry["attempts"] = 2
-            update_lb = True
-
-        # 🚫 THIRD ATTEMPT AND BEYOND → DO NOT update leaderboard
-        else:
-            entry["attempts"] += 1
-
-        # 🔄 UPDATE GROUP LEADERBOARD (NO AUTO-SCROLL)
-        if update_lb:
-            await update_group_leaderboard(quiz_id, context)
-
-        # 🧾 PERSONAL RESULT (PRIVATE CHAT)
-        await query.message.reply_text(
-            f"🏁 Quiz finished!\n\nYour score: {score}"
+    buttons = [[
+        InlineKeyboardButton(
+            f"{labels[i]}"
+            f"{' ✅' if i == correct_index else ' ❌' if i == chosen_index else ' ✖️'}",
+            callback_data="LOCKED"
         )
+        for i in range(len(q["options"]))
+    ]]
 
-        return
+    explanation = q.get("explanation")
+    if explanation:
+        buttons.append([
+            InlineKeyboardButton(explanation, callback_data="LOCKED")
+        ])
 
-    # ➡️ NEXT QUESTION
-    await send_next_question(query.from_user.id, context)
-
-async def start_quiz_for_user(user_id, context):
-    quiz_id = context.user_data.get("play_quiz_id")
-    if not quiz_id:
-        return
-
-    # Load quiz settings
-    cur.execute(
-        "SELECT shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
-        (quiz_id,)
-    )
-    shuffle_q, shuffle_a = cur.fetchone() or (0, 0)
-
-    # Load questions
-    cur.execute(
-        "SELECT question, image_file_id, options, correct, explanation "
-        "FROM questions WHERE quiz_id=?",
-        (quiz_id,)
-    )
-    rows = cur.fetchall()
-
-    if not rows:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="❌ This quiz has no questions."
+    # 🔒 Finalize UI
+    try:
+        await query.message.edit_reply_markup(
+            reply_markup=InlineKeyboardMarkup(buttons)
         )
-        return
+    except:
+        pass
 
-    questions = []
-    for text, image, options, correct, explanation in rows:
-        opts = options.split("||")
+    # 🔴 HARD ASYNC BOUNDARY (CRITICAL)
+    await asyncio.sleep(0)
 
-        if shuffle_a:
-            import random
-            indexed = list(enumerate(opts))
-            random.shuffle(indexed)
-            opts = [o for _, o in indexed]
-            correct = [i for i, (old_i, _) in enumerate(indexed) if old_i == correct][0]
-
-        questions.append({
-            "text": text,
-            "image": image,
-            "options": opts,
-            "correct": correct,
-            "explanation": explanation
-        })
-
-    if shuffle_q:
-        import random
-        random.shuffle(questions)
-
-    # 🔑 CREATE PLAY SESSION
-    context.user_data["play"] = {
-        "questions": questions,
-        "index": 0,
-        "score": 0
-    }
-
-    await send_next_question(user_id, context)
+    # ▶️ Advance quiz SAFELY
+    await advance_quiz(query.from_user.id, context)
 
 async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     quiz_id = context.user_data.get("play_quiz_id")
     if not quiz_id:
@@ -1840,8 +3183,19 @@ async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Load questions
     cur.execute(
-        "SELECT id, question, image_file_id, options, correct, explanation "
-        "FROM questions WHERE quiz_id=?",
+        """
+        SELECT
+            qb.id,
+            qb.question,
+            qb.image_file_id,
+            qb.options,
+            qb.correct,
+            qb.explanation
+        FROM quiz_question_links ql
+        JOIN question_bank qb ON qb.id = ql.question_id
+        WHERE ql.quiz_id=?
+        ORDER BY ql.position ASC, qb.question COLLATE NOCASE
+        """,
         (quiz_id,)
     )
     rows = cur.fetchall()
@@ -1873,54 +3227,193 @@ async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         import random
         random.shuffle(questions)
 
-    # 🔑 CREATE PLAY SESSION (THIS FIXES KeyError)
+    # 🔑 CREATE PLAY SESSION
     context.user_data["play"] = {
         "questions": questions,
         "index": 0,
         "score": 0,
         "quiz_id": quiz_id,
+        "user_name": format_user_name(query.from_user),
+
+        "locked": False,
+        "timer_task": None,
+        "timer_message_ids": [],
+
+        # 🧠 NEW: store quiz question message IDs for cleanup
+        "question_message_ids": [],
+
+        # 🔐 HARD ASYNC LOCK
+        "context_lock": asyncio.Lock(),
     }
-    
+
     user_id = query.from_user.id
     await send_next_question(user_id, context)
 
 async def send_next_question(user_id, context):
     play = context.user_data.get("play")
     if not play:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="❌ Quiz session expired."
-        )
         return
 
-    q = play["questions"][play["index"]]
+    # ⛔ Stop previous timer safely (from outside the task)
+    old_task = play.get("timer_task")
+    if old_task:
+        old_task.cancel()
+        play["timer_task"] = None
 
-    text = f"❓ {q['text']}"
+    quiz_id = play["quiz_id"]
 
-    keyboard = []
-    for i, option in enumerate(q["options"]):
-        keyboard.append([
-            InlineKeyboardButton(
-                option,
-                callback_data=f"PLAY_ANSWER_{i}"
-            )
-        ])
+    # ⏱ Load timer value
+    cur.execute("SELECT timer FROM quizzes WHERE quiz_id=?", (quiz_id,))
+    timer_seconds = cur.fetchone()[0]
 
+    index = play["index"]
+    total = len(play["questions"])
+    q = play["questions"][index]
+
+    labels = ["A", "B", "C", "D"]
+
+    options_text = "\n\n".join(
+        f"{labels[i]}. {opt.strip()}"
+        for i, opt in enumerate(q["options"])
+    )
+
+    question_text = (
+        f"[{index+1}/{total}] 🧠 {q['text']}\n\n"
+        f"{options_text}"
+    )
+
+    # 🔘 Inline buttons
+    keyboard = [[
+        InlineKeyboardButton(labels[i], callback_data=f"PLAY_ANSWER_{i}")
+        for i in range(len(q["options"]))
+    ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    if q["image"]:
-        await context.bot.send_photo(
-            chat_id=user_id,
-            photo=q["image"],
-            caption=text,
-            reply_markup=reply_markup
-        )
+    # 📨 Send question (image-safe)
+    if q.get("image"):
+        try:
+            msg = await context.bot.send_photo(
+                chat_id=user_id,
+                photo=q["image"],
+                caption=question_text,
+                reply_markup=reply_markup
+            )
+        except:
+            msg = await context.bot.send_message(
+                chat_id=user_id,
+                text=question_text,
+                reply_markup=reply_markup
+            )
     else:
-        await context.bot.send_message(
+        msg = await context.bot.send_message(
             chat_id=user_id,
-            text=text,
+            text=question_text,
             reply_markup=reply_markup
         )
+
+    # 🔑 AUTHORITATIVE question message (used by timer + answer)
+    play["current_question_message_id"] = msg.message_id
+
+    # 🧹 Keep history for cleanup
+    play.setdefault("question_message_ids", [])
+    play["question_message_ids"].append(msg.message_id)
+
+    play["locked"] = False
+
+    # 🕒 Send timer message
+    timer_msg = await context.bot.send_message(
+        chat_id=user_id,
+        text=f"⏱ Time left: {timer_seconds}s"
+    )
+    play.setdefault("timer_message_ids", [])
+    play["timer_message_ids"].append(timer_msg.message_id)
+
+    # ⏳ Start timer task
+    play["timer_task"] = asyncio.create_task(
+        countdown_timer(user_id, context, timer_seconds, play)
+    )
+
+async def countdown_timer(user_id, context, seconds, play):
+    if not play.get("timer_message_ids"):
+        return
+
+    timer_msg_id = play["timer_message_ids"][-1]
+
+    # ⏱ Countdown loop
+    for remaining in range(seconds - 1, -1, -1):
+        await asyncio.sleep(1)
+
+        # User answered → exit cleanly
+        if play.get("locked"):
+            return
+
+        try:
+            if remaining > 0:
+                await context.bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=timer_msg_id,
+                    text=f"⏱ Time left: {remaining}s"
+                )
+            else:
+                await context.bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=timer_msg_id,
+                    text="⏳ Time’s up!"
+                )
+        except:
+            pass
+
+    # 🔒 TIME IS UP
+    if play.get("locked"):
+        return
+
+    play["locked"] = True
+
+    # ⚠️ DO NOT cancel this task — we ARE the task
+    play["timer_task"] = None
+
+    q = play["questions"][play["index"]]
+    correct_index = q["correct"]
+
+    labels = ["A", "B", "C", "D"]
+
+    buttons = [[
+        InlineKeyboardButton(
+            f"{labels[i]}{' ✅' if i == correct_index else ' ✖️'}",
+            callback_data="LOCKED"
+        )
+        for i in range(len(q["options"]))
+    ]]
+
+    explanation = q.get("explanation")
+    if explanation:
+        buttons.append([
+            InlineKeyboardButton(explanation, callback_data="LOCKED")
+        ])
+
+    # 🔑 Edit the correct question message
+    msg_id = play.get("current_question_message_id")
+    if not msg_id:
+        return
+
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=user_id,
+            message_id=msg_id,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    except:
+        pass
+
+    # ▶️ Advance quiz
+    if play["index"] >= len(play["questions"]) - 1:
+        await finish_quiz(user_id, context)
+    else:
+        await advance_quiz(user_id, context)
+
+############################################################################
+# CODE BY PARTS - PART 3
+############################################################################
 
 async def show_leaderboard(chat_id, quiz_id, bot):
     cur.execute("""
@@ -1946,36 +3439,69 @@ async def show_leaderboard(chat_id, quiz_id, bot):
         parse_mode="Markdown"
     )
 
-async def send_quiz_to_group(chat_id, quiz_id, context):
+async def send_quiz_to_group(chat_id, quiz_id, context, token):
+    # =========================
+    # BUILD LEADERBOARD KEY
+    # =========================
+    leaderboard_key = make_leaderboard_key(quiz_id, token)
+
+    # =========================
+    # LOAD QUIZ INFO
+    # =========================
     cur.execute("""
         SELECT title, description, timer, shuffle_q, shuffle_a
-        FROM quizzes WHERE quiz_id=?
+        FROM quizzes
+        WHERE quiz_id=?
     """, (quiz_id,))
     title, desc, timer, sq, sa = cur.fetchone()
 
-    cur.execute("SELECT COUNT(*) FROM questions WHERE quiz_id=?", (quiz_id,))
+    cur.execute(
+        "SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?",
+        (quiz_id,)
+    )
     total_questions = cur.fetchone()[0]
 
+    # =========================
+    # BUILD MESSAGE TEXT
+    # =========================
     text = f"📘 *{title}*\n"
 
     if desc:
-        text += f"_{desc}_\n"
+        text += f"📝 _{desc}_\n"
 
+    # Spacer line (visual breathing room)
+    text += "\n"
+
+    # Quiz stats
+    text += f"🧠 *{total_questions} Questions* • ⏱ *{timer}s*\n"
+
+    # Shuffle settings
     text += (
-        f"\n📊 {total_questions} questions • ⏱ {timer}s • "
-        f"🔀 {'ON' if sq else 'OFF'}/{'ON' if sa else 'OFF'}\n\n"
-        "🏆 Leaderboard\n— No attempts yet —"
+        f"🔀 Questions: {'ON' if sq else 'OFF'} • "
+        f"Answers: {'ON' if sa else 'OFF'}\n\n"
     )
 
+    # Leaderboard header
+    text += (
+        "🏆 *Leaderboard*\n"
+        "— No attempts yet —"
+    )
+
+    # =========================
+    # START BUTTON (TOKEN-BOUND)
+    # =========================
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
                 "▶️ Start Quiz",
-                url=f"https://t.me/{BOT_USERNAME}?start=PLAY_{quiz_id}"
+                url=f"https://t.me/{BOT_USERNAME}?start=PLAY_{quiz_id}_{token}"
             )
         ]
     ])
 
+    # =========================
+    # SEND MESSAGE TO GROUP
+    # =========================
     msg = await context.bot.send_message(
         chat_id=chat_id,
         text=text,
@@ -1983,24 +3509,25 @@ async def send_quiz_to_group(chat_id, quiz_id, context):
         parse_mode="Markdown"
     )
 
-    # 🔑 THIS MESSAGE IS BOTH QUIZ + LEADERBOARD
-    GROUP_LB_MESSAGES[quiz_id] = {
+    # =========================
+    # REGISTER LEADERBOARD STATE (SINGLE SOURCE OF TRUTH)
+    # =========================
+    GROUP_LB_MESSAGES[leaderboard_key] = {
+        "quiz_id": quiz_id,
+        "token": token,
         "chat_id": chat_id,
         "message_id": msg.message_id,
-        "page": 0
+        "page": 0,
     }
 
-    GROUP_LEADERBOARDS[quiz_id] = {}
+    GROUP_LEADERBOARDS[leaderboard_key] = {}
 
-    # 🔑 SAVE GROUP QUIZ STATE
-    GROUP_QUIZZES[quiz_id] = {
-        "chat_id": chat_id,
-        "message_id": msg.message_id
-    }
-
-    GROUP_LEADERBOARDS[quiz_id] = {}
-
-def build_group_quiz_text(quiz_id, page=0):
+def build_group_quiz_text(leaderboard_key, page=0):
+    # 🔑 Split leaderboard key
+    try:
+        quiz_id, _ = leaderboard_key.split(":", 1)
+    except ValueError:
+        return "❌ Invalid leaderboard.", 0
     # Load quiz info
     cur.execute(
         "SELECT title, description, timer, shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
@@ -2008,23 +3535,38 @@ def build_group_quiz_text(quiz_id, page=0):
     )
     title, desc, timer, sq, sa = cur.fetchone()
 
-    cur.execute("SELECT COUNT(*) FROM questions WHERE quiz_id=?", (quiz_id,))
+    cur.execute(
+        "SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?",
+        (quiz_id,)
+    )
     total_questions = cur.fetchone()[0]
 
+    # =========================
+    # BUILD QUIZ PREVIEW (ADMIN-LIKE FORMAT)
+    # =========================
     text = f"📘 *{title}*\n"
-    if desc:
-        text += f"{desc}\n"
 
+    if desc:
+        text += f"📝 _{desc}_\n"
+
+    # Spacer
     text += "\n"
+
+    # Quiz stats
+    text += f"🧠 *{total_questions} Questions* • ⏱ *{timer}s*\n"
+
+    # Shuffle settings
     text += (
-        f"📊 {total_questions} Questions • "
-        f"⏱ {timer}s • "
-        f"🔀 Q: {'ON' if sq else 'OFF'} / A: {'ON' if sa else 'OFF'}\n\n"
+        f"🔀 Questions: {'ON' if sq else 'OFF'} • "
+        f"Answers: {'ON' if sa else 'OFF'}\n\n"
     )
 
-    text += "🏆 *Quiz Leaderboard*\n"
+    # =========================
+    # LEADERBOARD SECTION
+    # =========================
+    text += "🏆 *Leaderboard*\n"
 
-    leaderboard = list(GROUP_LEADERBOARDS.get(quiz_id, {}).values())
+    leaderboard = list(GROUP_LEADERBOARDS.get(leaderboard_key, {}).values())
 
     if not leaderboard:
         text += "_No attempts yet_\n"
@@ -2054,8 +3596,12 @@ def build_group_quiz_text(quiz_id, page=0):
 
     return text, pages
 
-async def update_group_leaderboard(quiz_id, context):
-    info = GROUP_LB_MESSAGES.get(quiz_id)
+async def update_group_leaderboard(leaderboard_key, context):
+    """
+    Updates the leaderboard message in the group for ONE quiz post instance.
+    leaderboard_key format: quiz_id:token
+    """
+    info = GROUP_LB_MESSAGES.get(leaderboard_key)
     if not info:
         return
 
@@ -2063,31 +3609,52 @@ async def update_group_leaderboard(quiz_id, context):
     message_id = info["message_id"]
     page = info.get("page", 0)
 
-    text, pages = build_group_quiz_text(quiz_id, page)
+    # 🔑 Split leaderboard key
+    try:
+        quiz_id, token = leaderboard_key.split(":", 1)
+    except ValueError:
+        print("⚠️ Invalid leaderboard key:", leaderboard_key)
+        return
+
+    # 🔨 Build updated leaderboard text
+    text, pages = build_group_quiz_text(leaderboard_key, page)
 
     buttons = []
 
+    # ◀ ▶ Pagination
     if pages > 1:
         nav = []
         if page > 0:
-            nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"LB_PREV|{quiz_id}"))
-        nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="LB_NOP"))
+            nav.append(
+                InlineKeyboardButton("◀ Prev", callback_data=f"LB_PREV|{leaderboard_key}")
+            )
+        nav.append(
+            InlineKeyboardButton(f"{page+1}/{pages}", callback_data="LB_NOP")
+        )
         if page < pages - 1:
-            nav.append(InlineKeyboardButton("Next ▶", callback_data=f"LB_NEXT|{quiz_id}"))
+            nav.append(
+                InlineKeyboardButton("Next ▶", callback_data=f"LB_NEXT|{leaderboard_key}")
+            )
         buttons.append(nav)
 
+    # ▶️ Start Quiz button (reconstructed safely)
     buttons.append([
-        InlineKeyboardButton("▶️ Start this Quiz", url=f"https://t.me/{BOT_USERNAME}?start=PLAY_{quiz_id}"
-)
+        InlineKeyboardButton(
+            "▶️ Start this Quiz",
+            url=f"https://t.me/{BOT_USERNAME}?start=PLAY_{quiz_id}_{token}"
+        )
     ])
 
-    await context.bot.edit_message_text(
-        chat_id=chat_id,
-        message_id=message_id,
-        text=text,
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode="Markdown"
-    )
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print("⚠️ Failed to edit leaderboard message:", e)
 
 async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2098,11 +3665,34 @@ async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.message.reply_text("❌ No quiz selected.")
         return
 
-    await query.message.reply_text(
-        "👥 Add this bot to a group and make it admin.\n"
-        "Then type this command in the group:\n\n"
-        f"/post_{quiz_id}"
+    # 🔑 Generate a unique token every time
+    token = secrets.token_urlsafe(8)
+    timestamp = int(time.time())
+
+    # 💾 Save token (admin-only)
+    cur.execute(
+        """
+        INSERT INTO quiz_post_tokens (token, quiz_id, owner_id, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (token, quiz_id, OWNER_USER_ID, timestamp)
     )
+    conn.commit()
+
+    # 📤 Send unique post command to admin
+    msg = await query.message.reply_text(
+        f"/post {quiz_id}_{token}"
+    )
+
+    # ⏳ Auto-delete the message after 5 seconds
+    async def delete_later():
+        await asyncio.sleep(5)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+    asyncio.create_task(delete_later())
 
 async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -2112,22 +3702,104 @@ async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type not in ("group", "supergroup"):
         return
 
-    text = update.message.text
-    if not text.startswith("/post_"):
+    user_id = update.effective_user.id
+    args = context.args
+
+    if not args:
+        await update.message.reply_text("❌ Missing quiz post token.")
         return
 
-    quiz_id = text.replace("/post_", "").strip()
+    payload = args[0]
 
-    await send_quiz_to_group(chat.id, quiz_id, context)
+    # =========================
+    # PARSE: /post <quiz_id>_<token>
+    # =========================
+    try:
+        quiz_id, token = payload.rsplit("_", 1)
+    except ValueError:
+        await update.message.reply_text("❌ Invalid post command format.")
+        return
+
+    # =========================
+    # OWNER-ONLY PROTECTION
+    # =========================
+    if user_id != OWNER_USER_ID:
+        warn_msg = await update.message.reply_text(
+            "❌ Only the bot owner can post quizzes."
+        )
+
+        async def delete_later():
+            await asyncio.sleep(3)
+            try:
+                await warn_msg.delete()
+            except:
+                pass
+            try:
+                await update.message.delete()
+            except:
+                pass
+
+        asyncio.create_task(delete_later())
+        return
+
+    # =========================
+    # TOKEN VALIDATION
+    # =========================
+    cur.execute(
+        """
+        SELECT token
+        FROM quiz_post_tokens
+        WHERE token=? AND quiz_id=?
+        """,
+        (token, quiz_id)
+    )
+    row = cur.fetchone()
+
+    if not row:
+        warn_msg = await update.message.reply_text(
+            "❌ This quiz post command is invalid or expired."
+        )
+
+        async def delete_later():
+            await asyncio.sleep(3)
+            try:
+                await warn_msg.delete()
+            except:
+                pass
+            try:
+                await update.message.delete()
+            except:
+                pass
+
+        asyncio.create_task(delete_later())
+        return
+
+    # =========================
+    # POST QUIZ TO GROUP
+    # =========================
+    await send_quiz_to_group(chat.id, quiz_id, context, token)
+
+    # =========================
+    # MARK TOKEN AS USED FOR POSTING (OPTIONAL)
+    # =========================
+    # ⚠️ DO NOT DELETE TOKEN — it is still needed for PLAY links
+    # If you want to prevent re-posting, add a `used_for_post` column later
+    # 🧹 Clean up the /post command message in group
+    try:
+        await update.message.delete()
+    except:
+        pass
 
 async def leaderboard_page_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    data = query.data
-    action, quiz_id = data.split("|", 1)
+    try:
+        action, leaderboard_key = query.data.split("|", 1)
+    except ValueError:
+        return
 
-    info = GROUP_LB_MESSAGES.get(quiz_id)
+    info = GROUP_LB_MESSAGES.get(leaderboard_key)
     if not info:
         return
 
@@ -2142,24 +3814,9 @@ async def leaderboard_page_nav(update: Update, context: ContextTypes.DEFAULT_TYP
         page = 0
 
     info["page"] = page
-    GROUP_LB_MESSAGES[quiz_id] = info
+    GROUP_LB_MESSAGES[leaderboard_key] = info
 
-    await update_group_leaderboard(quiz_id, context)
-
-async def post_quiz_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    quiz_id = context.user_data.get("active_quiz_id")
-    if not quiz_id:
-        await query.message.reply_text("❌ No quiz selected.")
-        return
-
-    await query.message.reply_text(
-        "👥 Add this bot to a group and make it admin.\n\n"
-        "Then type this command in the group:\n\n"
-        f"/post_{quiz_id}"
-    )
+    await update_group_leaderboard(leaderboard_key, context)
 
 async def folder_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2181,41 +3838,80 @@ async def folder_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await show_quizzes_in_folder(query.message, context, folder)
 
+async def database_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["db_page"] = max(
+        0, context.user_data.get("db_page", 0) - 1
+    )
+
+    await show_database_menu(query.message, context)
+
+
+async def database_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["db_page"] = context.user_data.get("db_page", 0) + 1
+
+    await show_database_menu(query.message, context)
+
 async def copy_question_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    source_qid = context.user_data.get("active_question_id")
+    qid = context.user_data.get("active_question_id")
     source_quiz_id = context.user_data.get("active_quiz_id")
 
-    if not source_qid or not source_quiz_id:
+    if not qid or not source_quiz_id:
         await query.message.reply_text("❌ No question selected.")
         return
 
     context.user_data["state"] = "COPY_QUESTION"
     page = context.user_data.get("copy_q_page", 0)
 
+    # 🔑 Load all quizzes owned by user
     cur.execute(
         "SELECT quiz_id, title FROM quizzes WHERE owner_id=? ORDER BY title",
         (OWNER_USER_ID,)
     )
     quizzes = cur.fetchall()
 
-    source_quiz_id = context.user_data.get("active_quiz_id")
+    # 🔑 Filter quizzes where question is NOT already linked
+    available = []
+    for quiz_id, title in quizzes:
+        if quiz_id == source_quiz_id:
+            continue
 
-    # ❌ Prevent copying into the same quiz
-    quizzes = [q for q in quizzes if q[0] != source_quiz_id]
+        cur.execute(
+            """
+            SELECT 1
+            FROM quiz_question_links
+            WHERE quiz_id=? AND question_id=?
+            """,
+            (quiz_id, qid)
+        )
+        if cur.fetchone():
+            continue
 
-    per_page = 5
-    pages = (len(quizzes) - 1) // per_page + 1
+        available.append((quiz_id, title))
+
+    if not available:
+        await query.message.reply_text("ℹ️ This question is already linked to all quizzes.")
+        return
+
+    # Pagination
+    PER_PAGE = 5
+    pages = (len(available) - 1) // PER_PAGE + 1
     page = max(0, min(page, pages - 1))
 
-    start = page * per_page
-    end = start + per_page
+    start = page * PER_PAGE
+    end = start + PER_PAGE
 
     keyboard = []
 
-    for quiz_id, title in quizzes[start:end]:
+    for quiz_id, title in available[start:end]:
         keyboard.append([
             InlineKeyboardButton(
                 f"📘 {title}",
@@ -2223,7 +3919,6 @@ async def copy_question_start(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         ])
 
-    # Pagination
     if pages > 1:
         nav = []
         if page > 0:
@@ -2237,8 +3932,8 @@ async def copy_question_start(update: Update, context: ContextTypes.DEFAULT_TYPE
         InlineKeyboardButton("⬅️ Cancel", callback_data="EDIT_QUESTIONS")
     ])
 
-    await query.message.reply_text(
-        "📋 *Copy Question*\n\nSelect target quiz:",
+    await query.message.edit_text(
+        "📋 *Add question to another quiz*\n\nSelect target quiz:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
@@ -2248,56 +3943,45 @@ async def copy_question_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     target_quiz_id = query.data.split("|", 1)[1]
-    source_qid = context.user_data.get("active_question_id")
+    qid = context.user_data.get("active_question_id")
 
-    if not source_qid:
-        await query.message.reply_text("❌ Source question not found.")
+    if not qid:
+        await query.message.reply_text("❌ No question selected.")
         return
 
-    # Load source question
-    cur.execute("""
-        SELECT question, image_file_id, options, correct, explanation
-        FROM questions
-        WHERE id=?
-    """, (source_qid,))
-    row = cur.fetchone()
-
-    if not row:
-        await query.message.reply_text("❌ Question not found.")
+    # 🔒 Prevent duplicate links
+    cur.execute(
+        """
+        SELECT 1
+        FROM quiz_question_links
+        WHERE quiz_id=? AND question_id=?
+        """,
+        (target_quiz_id, qid)
+    )
+    if cur.fetchone():
+        await query.message.reply_text("ℹ️ Question already exists in this quiz.")
         return
 
-    question, image, options, correct, explanation = row
-
-    # Insert duplicated question
-    cur.execute("""
-        INSERT INTO questions (
-            quiz_id,
-            question,
-            image_file_id,
-            options,
-            correct,
-            explanation
-        )
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        target_quiz_id,
-        question,
-        image,
-        options,
-        correct,
-        explanation
-    ))
-
+    # 🔑 Insert link ONLY (no duplication)
+    cur.execute(
+        """
+        INSERT INTO quiz_question_links (quiz_id, question_id, position)
+        VALUES (?, ?, (
+            SELECT COALESCE(MAX(position), 0) + 1
+            FROM quiz_question_links
+            WHERE quiz_id=?
+        ))
+        """,
+        (target_quiz_id, qid, target_quiz_id)
+    )
     conn.commit()
 
     context.user_data.pop("state", None)
 
-    await query.message.reply_text(
-        "✅ Question copied successfully."
-    )
+    await query.message.reply_text("✅ Question added to quiz.")
 
-    # Return to questions list
-    await show_questions(update, context)
+    # Return to source quiz question list
+    await show_questions_from_message(query.message, context)
 
 async def copy_q_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2322,29 +4006,116 @@ async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     dtype, value = data
 
+    # ======================================================
+    # 🗑 DELETE QUESTION (CONTEXT-AWARE)
+    # ======================================================
     if dtype == "QUESTION":
-        cur.execute("DELETE FROM questions WHERE id=?", (value,))
+        qid = value
+        delete_scope = context.user_data.get("delete_scope")
+
+        # ❗ HARD DELETE (DATABASE ONLY)
+        if delete_scope == "DATABASE":
+            cur.execute(
+                "DELETE FROM quiz_question_links WHERE question_id=?",
+                (qid,)
+            )
+            cur.execute(
+                "DELETE FROM question_bank WHERE id=?",
+                (qid,)
+            )
+            conn.commit()
+
+            context.user_data.pop("active_question_id", None)
+            context.user_data.pop("delete_scope", None)
+
+            await query.message.reply_text(
+                "🗑 Question permanently deleted from Database."
+            )
+            await show_database_questions(update, context)
+            return  # ⬅️ STOP here, do NOT fall through
+
+        # ✅ SOFT DELETE (REMOVE FROM QUIZ ONLY)
+        quiz_id = context.user_data.get("active_quiz_id")
+        if not quiz_id:
+            return
+
+        cur.execute(
+            """
+            DELETE FROM quiz_question_links
+            WHERE quiz_id=? AND question_id=?
+            """,
+            (quiz_id, qid)
+        )
         conn.commit()
-        await query.message.reply_text("🗑 Question deleted.")
+
+        context.user_data.pop("active_question_id", None)
+
+        await query.message.reply_text("🗑 Question removed from quiz.")
         await show_questions(update, context)
 
+    # ======================================================
+    # 🗑 DELETE QUIZ (UNLINK QUESTIONS ONLY)
+    # ======================================================
     elif dtype == "QUIZ":
-        cur.execute("DELETE FROM questions WHERE quiz_id=?", (value,))
-        cur.execute("DELETE FROM quizzes WHERE quiz_id=?", (value,))
-        conn.commit()
-        await query.message.reply_text("🗑 Quiz deleted.")
-        await my_quizzes(query.message, context)
+        quiz_id = value
 
-    elif dtype == "FOLDER":
+        # 🔑 Remember the folder BEFORE clearing state
+        folder = context.user_data.get("last_quiz_folder", "Default")
+
         cur.execute(
-            "UPDATE quizzes SET folder='Default' WHERE folder=?",
-            (value,)
+            "DELETE FROM quiz_question_links WHERE quiz_id=?",
+            (quiz_id,)
+        )
+        cur.execute(
+            "DELETE FROM quizzes WHERE quiz_id=?",
+            (quiz_id,)
+        )
+        conn.commit()
+
+        context.user_data.pop("active_quiz_id", None)
+
+        # 🔔 Temporary confirmation
+        msg = await query.message.reply_text("🗑 Quiz deleted.")
+
+        # 🧹 Auto-delete confirmation after 2 seconds
+        await asyncio.sleep(2)
+        try:
+            await msg.delete()
+        except:
+            pass
+
+        # ✅ Return to quiz list inside the SAME folder
+        await show_quizzes_in_folder(query.message, context, folder)
+
+    # ======================================================
+    # 🗑 DELETE FOLDER (QUIZZES ONLY, QUESTIONS SAFE)
+    # ======================================================
+    elif dtype == "FOLDER":
+        folder = value
+
+        cur.execute(
+            "SELECT quiz_id FROM quizzes WHERE folder=?",
+            (folder,)
+        )
+        quiz_ids = [row[0] for row in cur.fetchall()]
+
+        for qid in quiz_ids:
+            cur.execute(
+                "DELETE FROM quiz_question_links WHERE quiz_id=?",
+                (qid,)
+            )
+
+        cur.execute(
+            "DELETE FROM quizzes WHERE folder=?",
+            (folder,)
         )
         cur.execute(
             "DELETE FROM folders WHERE name=?",
-            (value,)
+            (folder,)
         )
+
         conn.commit()
+
         await query.message.reply_text("🗑 Folder deleted.")
         await show_quiz_folders(query.message, context)
 
@@ -2352,33 +4123,1756 @@ async def cancel_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    # Clear delete state
     context.user_data.pop("confirm_delete", None)
 
-    await query.message.reply_text("❌ Deletion cancelled.")
+    # 🧹 Delete the confirmation dialog itself
+    try:
+        await query.message.delete()
+    except:
+        pass
+
+    # 🔕 No messages, no redraw
+
+async def end_quiz(user_id, context):
+    play = context.user_data.get("play")
+    if not play:
+        return
+
+    # 🔒 HARD GUARANTEE: END ONLY ONCE
+    if play.get("ended"):
+        return
+
+    play["ended"] = True
+
+    # Normalize index to END
+    play["index"] = len(play["questions"])
+
+    await finish_quiz(user_id, context)
+
+async def stop_active_quiz(user_id, context):
+    """
+    Safely stops an ongoing quiz immediately
+    and CLEANS all quiz-related messages.
+    """
+    play = context.user_data.get("play")
+    if not play:
+        return
+
+    # 🛑 Mark quiz as stopped
+    play["locked"] = True
+    play["finished"] = True
+    play["ended"] = True
+
+    # ⛔ STEP 1: CANCEL TIMER TASK
+    task = play.get("timer_task")
+    current = asyncio.current_task()
+    if task and task is not current:
+        task.cancel()
+    play["timer_task"] = None
+
+    # ⏱ STEP 2: DELETE ALL TIMER MESSAGES (FIX)
+    for timer_msg_id in play.get("timer_message_ids", []):
+        try:
+            await context.bot.delete_message(
+                chat_id=user_id,
+                message_id=timer_msg_id
+            )
+        except Exception:
+            pass
+    play["timer_message_ids"] = []
+
+    # 🧹 STEP 3: DELETE ALL QUESTION MESSAGES
+    for msg_id in play.get("question_message_ids", []):
+        try:
+            await context.bot.delete_message(
+                chat_id=user_id,
+                message_id=msg_id
+            )
+        except Exception:
+            pass
+
+    # 🧹 STEP 4: FINAL CLEANUP
+    play.clear()
+    context.user_data.pop("play", None)
+    context.user_data.pop("play_quiz_id", None)
+
+async def finish_quiz(user_id, context):
+    play = context.user_data.get("play")
+    if not play:
+        return
+
+    # 🔒 Ensure finish logic runs ONCE
+    if play.get("finish_sent"):
+        return
+    play["finish_sent"] = True
+
+    quiz_id = play["quiz_id"]
+    score = play["score"]
+    total = len(play["questions"])
+
+    # ⛔ Stop timers and lock state FIRST
+    play["locked"] = True
+
+    task = play.get("timer_task")
+    current = asyncio.current_task()
+    if task and task is not current:
+        task.cancel()
+    play["timer_task"] = None
+
+    # =========================
+    # 🏆 GROUP LEADERBOARD (CORRECT & RELIABLE)
+    # =========================
+    leaderboard_key = context.user_data.get("leaderboard_key")
+
+    if leaderboard_key:
+        lb_info = GROUP_LB_MESSAGES.get(leaderboard_key)
+
+        if lb_info:
+            GROUP_LEADERBOARDS.setdefault(leaderboard_key, {})
+
+            # ✅ FIRST ATTEMPT ONLY
+            if user_id not in GROUP_LEADERBOARDS[leaderboard_key]:
+                GROUP_LEADERBOARDS[leaderboard_key][user_id] = {
+                    "name": play["user_name"],
+                    "score": score,
+                }
+
+                try:
+                    await update_group_leaderboard(leaderboard_key, context)
+                except Exception as e:
+                    print("⚠️ Leaderboard update failed:", e)
+
+    # =========================
+    # 🧹 CLEAN PREVIOUS QUIZ MESSAGES
+    # =========================
+
+    # 🧹 Delete all question messages
+    for msg_id in play.get("question_message_ids", []):
+        try:
+            await context.bot.delete_message(
+                chat_id=user_id,
+                message_id=msg_id
+            )
+        except Exception:
+            pass
+
+    # 🧹 Delete timer message (if still present)
+    for timer_msg_id in play.get("timer_message_ids", []):
+        try:
+            await context.bot.delete_message(
+                chat_id=user_id,
+                message_id=timer_msg_id
+            )
+        except Exception:
+            pass
+
+    # =========================
+    # 📘 LOAD QUIZ META (TITLE, TIMER)
+    # =========================
+    cur.execute(
+        "SELECT title, timer FROM quizzes WHERE quiz_id=?",
+        (quiz_id,)
+    )
+    row = cur.fetchone()
+    title, timer = row if row else ("Quiz", 0)
+
+    # =========================
+    # 🏁 FINAL SCORE MESSAGE (PRIVATE CHAT)
+    # =========================
+    buttons = [
+        [
+            InlineKeyboardButton("🔁 Start Again", callback_data="PLAY_START"),
+            InlineKeyboardButton("🗑 Delete", callback_data="DELETE_FINISH_MSG"),
+        ]
+    ]
+
+    message_text = (
+        f"*{title}*\n"
+        f"{total} Questions • ⏱ {timer}s\n\n"
+        f"🏁 *Quiz Finished!* : *Your Score {score}/{total}*\n\n"
+        "📊 The leaderboard in the group has been updated. "
+        "Please return to the 👥 Group or Channel where this quiz was posted."
+    )
+
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=message_text,
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown"
+    )
+
+    # 🧹 FINAL CLEANUP
+    context.user_data.pop("play", None)
+
+async def advance_quiz(user_id, context):
+    play = context.user_data.get("play")
+    if not play:
+        return
+
+    async with play["context_lock"]:
+        # 🚫 Prevent double-advance
+        if play.get("finished"):
+            return
+
+        play["index"] += 1
+
+        # 🏁 END OF QUIZ
+        if play["index"] >= len(play["questions"]):
+            play["finished"] = True
+            await finish_quiz(user_id, context)
+            return
+
+        # ▶️ NEXT QUESTION
+        await send_next_question(user_id, context)
+
+async def qb_pick_folder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # Safety check
+    if "active_quiz_id" not in context.user_data:
+        await query.message.reply_text("❌ No active quiz.")
+        return
+
+    # 🔒 Initialize Question Bank selection state
+    context.user_data["qb_selected"] = set()
+    context.user_data["qb_q_page"] = 0
+    context.user_data.pop("qb_folder_name", None)
+
+    await qb_pick_folder_menu(query.message, context)
+
+async def qb_folder_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["qb_folder_page"] = max(
+        0, context.user_data.get("qb_folder_page", 0) - 1
+    )
+
+    await qb_pick_folder_menu(query.message, context)
+
+async def qb_folder_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["qb_folder_page"] = context.user_data.get("qb_folder_page", 0) + 1
+
+    await qb_pick_folder_menu(query.message, context)
+
+async def qb_question_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # Move page backward
+    context.user_data["qb_q_page"] = max(
+        0,
+        context.user_data.get("qb_q_page", 0) - 1
+    )
+
+    # Reload the same folder
+    await qb_open_folder(update, context)
+
+async def qb_question_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # Move page forward
+    context.user_data["qb_q_page"] = context.user_data.get("qb_q_page", 0) + 1
+
+    # Reload the same folder
+    await qb_open_folder(update, context)
+
+def ensure_default_qb_folder():
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO question_bank_folders (owner_id, name)
+        VALUES (?, 'Default')
+        """,
+        (OWNER_USER_ID,)
+    )
+    conn.commit()
+
+async def quiz_folder_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["quiz_folder_page"] = max(
+        0, context.user_data.get("quiz_folder_page", 0) - 1
+    )
+
+    await show_quiz_folders(query.message, context)
+
+
+async def quiz_folder_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["quiz_folder_page"] = context.user_data.get("quiz_folder_page", 0) + 1
+
+    await show_quiz_folders(query.message, context)
+
+async def qb_move_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # Safety check
+    qid = context.user_data.get("active_question_id")
+    if not qid:
+        await query.message.reply_text("❌ No question selected.")
+        return
+
+    # Reset pagination
+    context.user_data["qb_move_page"] = 0
+
+    await show_qb_move_folders(query.message, context)
+
+async def qb_move_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["qb_move_page"] = max(
+        0, context.user_data.get("qb_move_page", 0) - 1
+    )
+
+    await show_qb_move_folders(query.message, context)
+
+
+async def qb_move_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["qb_move_page"] = context.user_data.get("qb_move_page", 0) + 1
+
+    await show_qb_move_folders(query.message, context)
+
+async def show_qb_move_folders(message, context):
+    page = context.user_data.get("qb_move_page", 0)
+    PER_PAGE = 5
+
+    # Load Question Bank folders
+    cur.execute(
+        """
+        SELECT id, name
+        FROM question_bank_folders
+        WHERE owner_id=?
+        ORDER BY name COLLATE NOCASE
+        """,
+        (OWNER_USER_ID,)
+    )
+    folders = cur.fetchall()
+
+    total = len(folders)
+    pages = (total - 1) // PER_PAGE + 1 if total else 1
+    page = max(0, min(page, pages - 1))
+
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+    page_items = folders[start:end]
+
+    keyboard = []
+
+    for folder_id, name in page_items:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"📁 {name}",
+                callback_data=f"QB_MOVE_TO|{folder_id}"
+            )
+        ])
+
+    # Pagination controls
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(
+                InlineKeyboardButton("◀ Prev", callback_data="QB_MOVE_PREV")
+            )
+        nav.append(
+            InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QB_MOVE_NOP")
+        )
+        if page < pages - 1:
+            nav.append(
+                InlineKeyboardButton("Next ▶", callback_data="QB_MOVE_NEXT")
+            )
+        keyboard.append(nav)
+
+    # Back button
+    keyboard.append([
+        InlineKeyboardButton("⬅️ Cancel", callback_data="EDIT_QUESTIONS")
+    ])
+
+    await message.edit_text(
+        "📂 Move Question\n\nSelect destination folder:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+############################################################################
+# CODE BY PARTS - PART 4
+############################################################################
+
+async def qb_move_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    qid = context.user_data.get("active_question_id")
+    if not qid:
+        await query.message.reply_text("❌ No question selected.")
+        return
+
+    folder_id = int(query.data.split("|", 1)[1])
+
+    # Update Question Bank
+    cur.execute(
+        "UPDATE question_bank SET folder_id=? WHERE id=?",
+        (folder_id, qid)
+    )
+    conn.commit()
+
+    await query.message.reply_text("✅ Question moved successfully.")
+
+    # Return to Database view
+    await show_database_menu(query.message, context)
+
+async def qb_open_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # =========================
+    # 🔑 Determine folder name
+    # =========================
+    if query.data.startswith("QB_OPEN_FOLDER|"):
+        folder_name = query.data.split("|", 1)[1]
+        context.user_data["qb_folder_name"] = folder_name
+        context.user_data["qb_q_page"] = 0  # reset page on new folder
+    else:
+        folder_name = context.user_data.get("qb_folder_name")
+
+    if not folder_name:
+        await query.message.reply_text(
+            "❌ Folder context lost. Please reopen the folder."
+        )
+        return
+
+    # =========================
+    # 📄 Page state
+    # =========================
+    PER_PAGE = 10
+    page = context.user_data.get("qb_q_page", 0)
+
+    # =========================
+    # 📁 Resolve folder_id
+    # =========================
+    cur.execute(
+        """
+        SELECT id
+        FROM question_bank_folders
+        WHERE owner_id=? AND name=?
+        """,
+        (OWNER_USER_ID, folder_name)
+    )
+    row = cur.fetchone()
+
+    if not row:
+        await query.message.reply_text("❌ Folder not found.")
+        return
+
+    folder_id = row[0]
+
+    # =========================
+    # 📚 Load questions
+    # =========================
+    cur.execute(
+        """
+        SELECT id, question
+        FROM question_bank
+        WHERE folder_id=?
+        ORDER BY question COLLATE NOCASE
+        """,
+        (folder_id,)
+    )
+    questions = cur.fetchall()
+
+    if not questions:
+        msg = await query.message.reply_text(
+            f"📁 **{folder_name}**\n\n_No questions in this folder._",
+            parse_mode="Markdown"
+        )
+
+        # ⏳ Auto-delete after 2 seconds
+        await asyncio.sleep(2)
+
+        try:
+            await msg.delete()
+        except:
+            pass
+
+        return
+
+    # =========================
+    # 🔢 Pagination math
+    # =========================
+    total = len(questions)
+    pages = (total - 1) // PER_PAGE + 1
+    page = max(0, min(page, pages - 1))
+    context.user_data["qb_q_page"] = page
+
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+    page_items = questions[start:end]
+
+    # =========================
+    # 🧠 Selection state (SINGLE SOURCE OF TRUTH)
+    # =========================
+    selected = context.user_data.setdefault("qb_selected", set())
+    quiz_id = context.user_data.get("active_quiz_id")
+
+    keyboard = []
+    # 🎲 Auto Add buttons (TOP of list)
+    keyboard.append([
+        InlineKeyboardButton("🎲 Add 10", callback_data="QB_AUTO_ADD|10"),
+        InlineKeyboardButton("🎲 Add 50", callback_data="QB_AUTO_ADD|50"),
+        InlineKeyboardButton("🎲 Add 100", callback_data="QB_AUTO_ADD|100"),
+    ])
+
+    # =========================
+    # ❓ Question buttons
+    # =========================
+    for qid, text in page_items:
+        # Check if already added to quiz
+        cur.execute(
+            """
+            SELECT 1
+            FROM quiz_question_links
+            WHERE quiz_id=? AND question_id=?
+            """,
+            (quiz_id, qid)
+        )
+        already_added = cur.fetchone() is not None
+
+        if already_added:
+            label = f"✅ {text[:45]}"
+            callback = f"QB_REMOVE_Q|{qid}"
+        else:
+            checked = "☑" if qid in selected else "⬜"
+            label = f"{checked} {text[:45]}"
+            callback = f"QB_SELECT_Q|{qid}"
+
+        keyboard.append([
+            InlineKeyboardButton(label, callback_data=callback)
+        ])
+
+    # =========================
+    # ➕ Add Selected button
+    # =========================
+    if selected:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"➕ Add Selected ({len(selected)})",
+                callback_data="QB_ADD_SELECTED"
+            )
+        ])
+
+    # =========================
+    # ◀ ▶ Pagination buttons
+    # =========================
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(
+                InlineKeyboardButton("◀ Prev", callback_data="QB_Q_PREV")
+            )
+        nav.append(
+            InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QB_Q_NOP")
+        )
+        if page < pages - 1:
+            nav.append(
+                InlineKeyboardButton("Next ▶", callback_data="QB_Q_NEXT")
+            )
+        keyboard.append(nav)
+
+    # =========================
+    # ⬅️ Back button
+    # =========================
+    keyboard.append([
+        InlineKeyboardButton("⬅️ Back", callback_data="QB_PICK_FOLDER")
+    ])
+
+    await query.message.edit_text(
+        f"📁 **{folder_name}**\n\nSelect questions:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def qb_select_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # Safety checks
+    quiz_id = context.user_data.get("active_quiz_id")
+    if not quiz_id:
+        await query.message.reply_text("❌ No active quiz.")
+        return
+
+    qid = int(query.data.split("|", 1)[1])
+
+    # ❌ Prevent duplicate link
+    cur.execute(
+        """
+        SELECT 1
+        FROM quiz_question_links
+        WHERE quiz_id=? AND question_id=?
+        """,
+        (quiz_id, qid)
+    )
+    if cur.fetchone():
+        await query.message.reply_text(
+            "ℹ️ This question is already in the quiz."
+        )
+        return
+
+    # 🔢 Determine next position
+    cur.execute(
+        """
+        SELECT COALESCE(MAX(position), 0) + 1
+        FROM quiz_question_links
+        WHERE quiz_id=?
+        """,
+        (quiz_id,)
+    )
+    position = cur.fetchone()[0]
+
+    # 🔑 LINK question to quiz (NO DUPLICATION)
+    cur.execute(
+        """
+        INSERT INTO quiz_question_links (quiz_id, question_id, position)
+        VALUES (?, ?, ?)
+        """,
+        (quiz_id, qid, position)
+    )
+    conn.commit()
+
+    await query.message.reply_text("✅ Question added to quiz.")
+
+    # 🔁 Reset pagination and return to quiz questions
+    context.user_data["reset_q_page"] = True
+    await show_questions_from_message(query.message, context)
+
+async def cancel_create_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # 🔒 Exit question creation cleanly
+    context.user_data.pop("add_q_state", None)
+    context.user_data.pop("new_question", None)
+
+    # 🔁 Return to Home menu
+    await go_home(update, context)
+
+async def cancel_timer_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # 🧹 Delete ONLY the Timer Settings menu
+    msg_id = context.user_data.pop("edit_timer_prompt_id", None)
+    if msg_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=query.message.chat_id,
+                message_id=msg_id
+            )
+        except:
+            pass
+
+    # 🔕 IMPORTANT:
+    # Do NOT send any new message
+    # Do NOT redraw Quiz Overview
+    # Let the previous screen remain
+
+async def cancel_shuffle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # 🧹 Delete ONLY the Shuffle Settings menu
+    msg_id = context.user_data.pop("shuffle_menu_msg_id", None)
+    if msg_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=query.message.chat_id,
+                message_id=msg_id
+            )
+        except:
+            pass
+
+    # 🔕 IMPORTANT:
+    # Do NOT send any new message
+    # Do NOT redraw Quiz Overview
+    # Let the previous screen remain visible
+
+async def cancel_edit_question_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+
+    # Delete the prompt message
+    prompt_id = context.user_data.pop("edit_text_prompt_id", None)
+    if prompt_id:
+        try:
+            await context.bot.delete_message(chat_id, prompt_id)
+        except:
+            pass
+
+    # Exit edit mode safely
+    context.user_data.pop("edit_q_field", None)
+
+async def force_stop_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    play = context.user_data.get("play")
+
+    if not play:
+        return
+
+    # =========================
+    # 🧮 ANTI-ABUSE RULE
+    # =========================
+    answered_questions = play.get("index", 0)
+    MIN_REQUIRED = 3
+
+    leaderboard_key = context.user_data.get("leaderboard_key")
+
+    # Only count score if user answered enough questions
+    if answered_questions >= MIN_REQUIRED and leaderboard_key:
+        GROUP_LEADERBOARDS.setdefault(leaderboard_key, {})
+
+        # Save score only once
+        if user_id not in GROUP_LEADERBOARDS[leaderboard_key]:
+            GROUP_LEADERBOARDS[leaderboard_key][user_id] = {
+                "name": play["user_name"],
+                "score": play["score"],
+            }
+
+            try:
+                await update_group_leaderboard(leaderboard_key, context)
+            except Exception as e:
+                print("⚠️ Leaderboard update failed on stop:", e)
+
+    # 🛑 Mark quiz as ended
+    play["locked"] = True
+    play["finished"] = True
+    play["ended"] = True
+
+    # ⛔ Cancel timer task safely
+    task = play.get("timer_task")
+    current = asyncio.current_task()
+    if task and task is not current:
+        task.cancel()
+    play["timer_task"] = None
+
+    # 🧹 Delete timer messages
+    for msg_id in play.get("timer_message_ids", []):
+        try:
+            await context.bot.delete_message(user_id, msg_id)
+        except:
+            pass
+
+    # 🧹 Delete question messages
+    for msg_id in play.get("question_message_ids", []):
+        try:
+            await context.bot.delete_message(user_id, msg_id)
+        except:
+            pass
+
+    # 🧹 Delete warning message
+    warning_id = play.get("warning_message_id")
+    if warning_id:
+        try:
+            await context.bot.delete_message(user_id, warning_id)
+        except:
+            pass
+
+    # 🧹 FULL CLEANUP
+    play.clear()
+    context.user_data.pop("play", None)
+    context.user_data.pop("play_quiz_id", None)
+
+    # ✅ Confirmation (auto-clean)
+    msg = await query.message.reply_text("🛑 Quiz stopped. You may continue.")
+    await asyncio.sleep(3)
+    try:
+        await msg.delete()
+    except:
+        pass
+
+async def global_quiz_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+
+    data = query.data or ""
+    play = context.user_data.get("play")
+
+    # ✅ No quiz running → allow everything
+    if not play:
+        return
+
+    # ✅ Always allow answer buttons
+    if data.startswith("PLAY_ANSWER_"):
+        return
+
+    # ✅ Always allow stop / resume
+    if data in ("FORCE_STOP_QUIZ", "RESUME_QUIZ"):
+        return
+
+    # ✅ If warning already shown → block silently
+    if play.get("warning_message_id"):
+        raise ApplicationHandlerStop
+
+    # ⚠️ SHOW WARNING MESSAGE (ONCE)
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("▶️ Resume Quiz", callback_data="RESUME_QUIZ"),
+            InlineKeyboardButton("🛑 Stop Quiz", callback_data="FORCE_STOP_QUIZ"),
+        ]
+    ])
+
+    msg = await query.message.reply_text(
+        "⚠️ A quiz is currently running.\n\n"
+        "Please stop or resume the quiz to continue. ⚠️ Stopping the quiz after 3 Questions will update the Score Leaderboard",
+        reply_markup=keyboard
+    )
+
+    # 🔒 Lock UI with warning message ID
+    play["warning_message_id"] = msg.message_id
+
+    # 🚫 Stop all other handlers
+    raise ApplicationHandlerStop
+
+async def resume_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    play = context.user_data.get("play")
+    if not play:
+        return
+
+    # 🧹 Remove warning message
+    warning_id = play.get("warning_message_id")
+    if warning_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=query.from_user.id,
+                message_id=warning_id
+            )
+        except:
+            pass
+
+    # 🔓 Unlock UI
+    play.pop("warning_message_id", None)
+
+async def shuffle_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # 🧹 Delete shuffle menu only
+    msg_id = context.user_data.pop("shuffle_menu_msg_id", None)
+    if msg_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=query.message.chat_id,
+                message_id=msg_id
+            )
+        except:
+            pass
+
+    # 🔕 DO NOT send any new message
+    # Let the existing quiz overview stay visible
+
+def build_qb_question_keyboard(context):
+    """
+    Builds the Question Bank question list keyboard
+    WITHOUT sending a message.
+    Used for checkbox toggle UI updates.
+    """
+
+    # =========================
+    # Context & pagination
+    # =========================
+    folder_name = context.user_data.get("qb_folder_name")
+    page = context.user_data.get("qb_q_page", 0)
+    selected = context.user_data.setdefault("qb_selected", set())
+    quiz_id = context.user_data.get("active_quiz_id")
+
+    PER_PAGE = 10
+
+    # =========================
+    # Resolve folder_id
+    # =========================
+    cur.execute(
+        """
+        SELECT id
+        FROM question_bank_folders
+        WHERE owner_id=? AND name=?
+        """,
+        (OWNER_USER_ID, folder_name)
+    )
+    row = cur.fetchone()
+    if not row:
+        return InlineKeyboardMarkup([])
+
+    folder_id = row[0]
+
+    # =========================
+    # Load questions
+    # =========================
+    cur.execute(
+        """
+        SELECT id, question
+        FROM question_bank
+        WHERE folder_id=?
+        ORDER BY question COLLATE NOCASE
+        """,
+        (folder_id,)
+    )
+    questions = cur.fetchall()
+
+    total = len(questions)
+    pages = (total - 1) // PER_PAGE + 1 if total else 1
+    page = max(0, min(page, pages - 1))
+    context.user_data["qb_q_page"] = page
+
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+    page_items = questions[start:end]
+
+    keyboard = []
+
+    # =========================
+    # Question buttons
+    # =========================
+    for qid, text in page_items:
+        # Check if already added to quiz
+        cur.execute(
+            """
+            SELECT 1
+            FROM quiz_question_links
+            WHERE quiz_id=? AND question_id=?
+            """,
+            (quiz_id, qid)
+        )
+        already_added = cur.fetchone() is not None
+
+        if already_added:
+            label = f"✅ {text[:45]}"
+            callback = f"QB_REMOVE_Q|{qid}"
+        else:
+            checked = "☑" if qid in selected else "⬜"
+            label = f"{checked} {text[:45]}"
+            callback = f"QB_SELECT_Q|{qid}"
+
+        keyboard.append([
+            InlineKeyboardButton(label, callback_data=callback)
+        ])
+
+    # =========================
+    # Add Selected button
+    # =========================
+    if selected:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"➕ Add Selected ({len(selected)})",
+                callback_data="QB_ADD_SELECTED"
+            )
+        ])
+
+    # =========================
+    # Pagination
+    # =========================
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(
+                InlineKeyboardButton("◀ Prev", callback_data="QB_Q_PREV")
+            )
+        nav.append(
+            InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QB_Q_NOP")
+        )
+        if page < pages - 1:
+            nav.append(
+                InlineKeyboardButton("Next ▶", callback_data="QB_Q_NEXT")
+            )
+        keyboard.append(nav)
+
+    # =========================
+    # Back button
+    # =========================
+    keyboard.append([
+        InlineKeyboardButton("⬅️ Back", callback_data="QB_PICK_FOLDER")
+    ])
+
+    return InlineKeyboardMarkup(keyboard)
+
+async def qb_toggle_select_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    qid = int(query.data.split("|")[1])
+
+    selected = context.user_data.setdefault("qb_selected", set())
+
+    if qid in selected:
+        selected.remove(qid)
+    else:
+        selected.add(qid)
+
+    # Rebuild keyboard only
+    reply_markup = build_qb_question_keyboard(context)
+
+    # Edit the SAME message instead of sending a new one
+    await query.edit_message_reply_markup(reply_markup=reply_markup)
+
+async def qb_add_selected_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    quiz_id = context.user_data.get("active_quiz_id")
+    selected = context.user_data.get("qb_selected", set())
+
+    if not quiz_id or not selected:
+        await query.message.reply_text("❌ No questions selected.")
+        return
+
+    # 🔢 Get next position in quiz
+    cur.execute(
+        """
+        SELECT COALESCE(MAX(position), 0)
+        FROM quiz_question_links
+        WHERE quiz_id=?
+        """,
+        (quiz_id,)
+    )
+    position = cur.fetchone()[0]
+
+    added = 0
+
+    for qid in selected:
+        # ❌ Skip duplicates (extra safety)
+        cur.execute(
+            """
+            SELECT 1
+            FROM quiz_question_links
+            WHERE quiz_id=? AND question_id=?
+            """,
+            (quiz_id, qid)
+        )
+        if cur.fetchone():
+            continue
+
+        position += 1
+
+        cur.execute(
+            """
+            INSERT INTO quiz_question_links (quiz_id, question_id, position)
+            VALUES (?, ?, ?)
+            """,
+            (quiz_id, qid, position)
+        )
+        added += 1
+
+    conn.commit()
+
+    # 🧹 Clear selection state
+    context.user_data["qb_selected"] = set()
+    context.user_data.pop("qb_q_page", None)
+
+    # ✅ Confirmation
+    await query.message.reply_text(
+        f"✅ {added} question(s) added to the quiz."
+    )
+
+    # 🔁 Return to quiz question list
+    context.user_data["reset_q_page"] = True
+    await show_questions_from_message(query.message, context)
+
+async def qb_remove_question_from_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    qid = int(query.data.split("|")[1])
+    quiz_id = context.user_data.get("active_quiz_id")
+
+    # Remove question from this quiz ONLY
+    cur.execute(
+        """
+        DELETE FROM quiz_question_links
+        WHERE quiz_id=? AND question_id=?
+        """,
+        (quiz_id, qid)
+    )
+    conn.commit()
+
+    # Update the SAME message (no re-send)
+    reply_markup = build_qb_question_keyboard(context)
+    await query.edit_message_reply_markup(reply_markup=reply_markup)
+
+async def qb_auto_add_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # How many to add (10 / 50 / 100)
+    limit = int(query.data.split("|")[1])
+
+    quiz_id = context.user_data.get("active_quiz_id")
+    folder_name = context.user_data.get("qb_folder_name")
+
+    if not quiz_id or not folder_name:
+        return
+
+    # Resolve folder_id
+    cur.execute(
+        """
+        SELECT id FROM question_bank_folders
+        WHERE owner_id=? AND name=?
+        """,
+        (OWNER_USER_ID, folder_name)
+    )
+    row = cur.fetchone()
+    if not row:
+        return
+
+    folder_id = row[0]
+
+    # Load ALL questions in folder
+    cur.execute(
+        """
+        SELECT id
+        FROM question_bank
+        WHERE folder_id=?
+        """,
+        (folder_id,)
+    )
+    all_questions = {row[0] for row in cur.fetchall()}
+
+    # Load questions already in quiz
+    cur.execute(
+        """
+        SELECT question_id
+        FROM quiz_question_links
+        WHERE quiz_id=?
+        """,
+        (quiz_id,)
+    )
+    existing = {row[0] for row in cur.fetchall()}
+
+    # Candidates = not yet added
+    candidates = list(all_questions - existing)
+
+    if not candidates:
+        return
+
+    import random
+    random.shuffle(candidates)
+
+    to_add = candidates[:limit]
+
+    # Get next position
+    cur.execute(
+        """
+        SELECT COALESCE(MAX(position), 0)
+        FROM quiz_question_links
+        WHERE quiz_id=?
+        """,
+        (quiz_id,)
+    )
+    position = cur.fetchone()[0]
+
+    # Insert links
+    for qid in to_add:
+        position += 1
+        cur.execute(
+            """
+            INSERT INTO quiz_question_links (quiz_id, question_id, position)
+            VALUES (?, ?, ?)
+            """,
+            (quiz_id, qid, position)
+        )
+
+    conn.commit()
+
+    # Refresh SAME message (no resend)
+    await qb_open_folder(update, context)
+
+async def show_quiz_action_menu_by_id(chat_id, message_id, context):
+    quiz_id = context.user_data.get("active_quiz_id")
+    if not quiz_id:
+        return
+
+    cur.execute(
+        "SELECT title, description, timer, shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
+        (quiz_id,)
+    )
+    title, desc, timer, sq, sa = cur.fetchone()
+
+    cur.execute(
+        "SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?",
+        (quiz_id,)
+    )
+    total_questions = cur.fetchone()[0]
+
+    text = f"📘 **{title}**"
+    if desc:
+        text += f"\n📝 _{desc}_"
+
+    text += "\n\n"
+    text += f"📊 Questions: {total_questions}    ⏱ Timer: {timer}s"
+    text += (
+        f"\n🔀 Questions: {'ON' if sq else 'OFF'}"
+        f"   🔀 Options: {'ON' if sa else 'OFF'}"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("▶️ Start this Quiz", callback_data="START_THIS"),
+            InlineKeyboardButton("📤 Post this Quiz", callback_data="POST_QUIZ"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Edit this Quiz", callback_data="EDIT_THIS"),
+            InlineKeyboardButton("📁 Move this Quiz", callback_data="MOVE_QUIZ"),
+        ],
+        [
+            InlineKeyboardButton("🗑 Delete this Quiz", callback_data="DELETE_QUIZ"),
+            InlineKeyboardButton("⬅️ Back", callback_data="BACK_TO_QUIZZES"),
+        ],
+    ]
+
+    await context.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=message_id,
+        text=text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def delete_finish_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # 🧹 Delete the finished quiz message itself
+    try:
+        await query.message.delete()
+    except:
+        pass
+
+    # 🔕 No messages, no redraw, no state changes
+
+async def cancel_edit_question_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+
+    # Delete image edit menu message
+    menu_id = context.user_data.pop("edit_image_menu_msg_id", None)
+    if menu_id:
+        try:
+            await context.bot.delete_message(chat_id, menu_id)
+        except:
+            pass
+
+    # Exit image edit mode
+    context.user_data.pop("edit_q_field", None)
+
+async def apply_new_options_correct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    qid = context.user_data.get("active_question_id")
+    new_options = context.user_data.get("edit_options", [])
+
+    if not qid or len(new_options) != 4:
+        return
+
+    correct_index = int(query.data.split("_")[-1])
+
+    options_text = "||".join(new_options)
+
+    # 🔑 UPDATE SOURCE OF TRUTH
+    cur.execute(
+        """
+        UPDATE question_bank
+        SET options=?, correct=?
+        WHERE id=?
+        """,
+        (options_text, correct_index, qid)
+    )
+    conn.commit()
+
+    chat_id = query.message.chat_id
+
+    # Confirmation message
+    msg = await query.message.reply_text("✅ Options updated.")
+    context.user_data["edit_options_flow_msgs"].append(msg.message_id)
+
+    await asyncio.sleep(1)
+
+    # =========================
+    # FULL DECLUTTER
+    # =========================
+    for mid in context.user_data.get("edit_options_flow_msgs", []):
+        try:
+            await context.bot.delete_message(chat_id, mid)
+        except:
+            pass
+
+    # Clear edit state
+    context.user_data.pop("edit_options_flow_msgs", None)
+    context.user_data.pop("edit_options", None)
+    context.user_data.pop("edit_q_field", None)
+
+    # 🔁 Rebuild clean preview
+    await rebuild_question_preview(chat_id, context)
+
+async def cancel_edit_question_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+
+    for mid in context.user_data.get("edit_options_flow_msgs", []):
+        try:
+            await context.bot.delete_message(chat_id, mid)
+        except:
+            pass
+
+    context.user_data.pop("edit_options_flow_msgs", None)
+    context.user_data.pop("edit_options", None)
+    context.user_data.pop("edit_q_field", None)
+
+async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    # Track /clear message itself
+    context.user_data.setdefault("chat_messages", []).append(update.message.message_id)
+
+    message_ids = context.user_data.get("chat_messages", [])
+
+    # Delete all stored messages
+    for msg_id in message_ids:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except:
+            pass
+
+    # Clear memory safely
+    context.user_data.clear()
+
+async def cancel_edit_question_explanation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+
+    # Delete prompt
+    prompt_id = context.user_data.pop("edit_expl_prompt_id", None)
+    if prompt_id:
+        try:
+            await context.bot.delete_message(chat_id, prompt_id)
+        except:
+            pass
+
+    context.user_data.pop("edit_q_field", None)
+
+async def back_to_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+
+    # 🔥 1️⃣ Delete preview message (photo or text)
+    try:
+        await query.message.delete()
+    except:
+        pass
+
+    # 🔄 2️⃣ Reset question pagination safely
+    context.user_data["reset_q_page"] = True
+
+    # 🔑 3️⃣ Get quiz_id
+    quiz_id = context.user_data.get("active_quiz_id")
+    if not quiz_id:
+        return
+
+    # 🔄 4️⃣ Rebuild question list SAFELY (send new message)
+    await show_questions_from_message(
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Loading..."
+        ),
+        context
+    )
+
+async def move_q_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["move_mode"] = "MOVE"
+    context.user_data["mc_folder_page"] = 0
+    context.user_data["mc_quiz_page"] = 0
+
+    await show_move_copy_folders(query.message, context)
+
+async def copy_q_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["move_mode"] = "COPY"
+    context.user_data["mc_folder_page"] = 0
+    context.user_data["mc_quiz_page"] = 0
+
+    await show_move_copy_folders(query.message, context)
+
+async def show_move_copy_folders(message, context):
+    PER_PAGE = 5
+    page = context.user_data.get("mc_folder_page", 0)
+
+    # 🔑 Load folders (Default first)
+    cur.execute("""
+        SELECT name
+        FROM folders
+        WHERE owner_id=?
+        ORDER BY
+            CASE WHEN name='Default' THEN 0 ELSE 1 END,
+            name COLLATE NOCASE
+    """, (OWNER_USER_ID,))
+
+    folders = [row[0] for row in cur.fetchall()]
+
+    total = len(folders)
+    pages = (total - 1) // PER_PAGE + 1 if total else 1
+    page = max(0, min(page, pages - 1))
+    context.user_data["mc_folder_page"] = page
+
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+    page_items = folders[start:end]
+
+    keyboard = []
+
+    for folder_name in page_items:
+        # 🔢 Count quizzes inside folder
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM quizzes
+            WHERE owner_id=? AND folder=?
+        """, (OWNER_USER_ID, folder_name))
+
+        count = cur.fetchone()[0]
+
+        keyboard.append([
+            InlineKeyboardButton(
+                f"📁 {folder_name} ({count})",
+                callback_data=f"MC_FOLDER|{folder_name}"
+            )
+        ])
+
+    # 🔄 Pagination
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data="MC_FOLDER_PREV"))
+        nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="MC_NOP"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data="MC_FOLDER_NEXT"))
+        keyboard.append(nav)
+
+    keyboard.append([
+        InlineKeyboardButton("⬅️ Back", callback_data="BACK_TO_QUESTIONS")
+    ])
+
+    await safe_edit_message(
+        message,
+        "📂 Select Folder:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def move_copy_open_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # 🔑 Get selected folder
+    folder = query.data.split("|")[1]
+    context.user_data["mc_folder"] = folder
+
+    # 🔄 Reset quiz pagination when opening a new folder
+    context.user_data["mc_quiz_page"] = 0
+
+    # Show quiz list
+    await show_move_copy_quizzes(query.message, context)
+
+async def move_copy_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    target_quiz_id = query.data.split("|")[1]
+
+    current_quiz_id = context.user_data.get("active_quiz_id")
+    qid = context.user_data.get("active_question_id")
+    mode = context.user_data.get("move_mode")
+
+    if not qid or not target_quiz_id:
+        return
+
+    # COPY or MOVE logic
+    if mode == "MOVE":
+        # Remove from current quiz
+        cur.execute(
+            "DELETE FROM quiz_question_links WHERE quiz_id=? AND question_id=?",
+            (current_quiz_id, qid)
+        )
+
+    # Add to target quiz (if not exists)
+    cur.execute(
+        "SELECT 1 FROM quiz_question_links WHERE quiz_id=? AND question_id=?",
+        (target_quiz_id, qid)
+    )
+
+    if not cur.fetchone():
+        cur.execute(
+            """
+            INSERT INTO quiz_question_links (quiz_id, question_id, position)
+            VALUES (?, ?, (
+                SELECT COALESCE(MAX(position), 0) + 1
+                FROM quiz_question_links
+                WHERE quiz_id=?
+            ))
+            """,
+            (target_quiz_id, qid, target_quiz_id)
+        )
+
+    conn.commit()
+
+    confirm_msg = await query.message.reply_text("✅ Operation completed.")
+
+    await asyncio.sleep(2)
+
+    # 🧹 Delete folder/quiz list message
+    try:
+        await query.message.delete()
+    except:
+        pass
+
+    # 🧹 Delete confirmation
+    try:
+        await confirm_msg.delete()
+    except:
+        pass
+
+    context.user_data.pop("move_mode", None)
+    context.user_data.pop("mc_folder_page", None)
+    context.user_data.pop("mc_quiz_page", None)
+    context.user_data.pop("mc_folder", None)
+
+    context.user_data["reset_q_page"] = True
+
+    await show_questions_from_message(
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="Loading..."
+        ),
+        context
+    )
+
+async def safe_edit_message(message, text, reply_markup=None, parse_mode=None):
+    """
+    Safely edits a message whether it is a text message
+    or a media (photo) message.
+    """
+
+    try:
+        # If message has photo → use caption
+        if message.photo:
+            await message.edit_caption(
+                caption=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode
+            )
+        else:
+            await message.edit_text(
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode
+            )
+    except Exception as e:
+        print("⚠️ Safe edit fallback:", e)
+
+async def mc_folder_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["mc_folder_page"] = max(
+        0,
+        context.user_data.get("mc_folder_page", 0) - 1
+    )
+
+    await show_move_copy_folders(query.message, context)
+
+
+async def mc_folder_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["mc_folder_page"] = context.user_data.get("mc_folder_page", 0) + 1
+
+    await show_move_copy_folders(query.message, context)
+
+async def show_move_copy_quizzes(message, context):
+    PER_PAGE = 5
+    page = context.user_data.get("mc_quiz_page", 0)
+    folder = context.user_data.get("mc_folder")
+
+    cur.execute("""
+        SELECT quiz_id, title
+        FROM quizzes
+        WHERE owner_id=? AND folder=?
+        ORDER BY title COLLATE NOCASE
+    """, (OWNER_USER_ID, folder))
+
+    quizzes = cur.fetchall()
+
+    total = len(quizzes)
+    pages = (total - 1) // PER_PAGE + 1 if total else 1
+    page = max(0, min(page, pages - 1))
+    context.user_data["mc_quiz_page"] = page
+
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+    page_items = quizzes[start:end]
+
+    keyboard = []
+
+    for quiz_id, title in page_items:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"📘 {title}",
+                callback_data=f"MC_APPLY|{quiz_id}"
+            )
+        ])
+
+    # 🔄 Pagination
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data="MC_QUIZ_PREV"))
+        nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="MC_NOP"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data="MC_QUIZ_NEXT"))
+        keyboard.append(nav)
+
+    keyboard.append([
+        InlineKeyboardButton("⬅️ Back", callback_data="MOVE_Q_START")
+    ])
+
+    await safe_edit_message(
+        message,
+        f"📁 {folder}\n\nSelect Quiz:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def mc_quiz_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["mc_quiz_page"] = max(
+        0,
+        context.user_data.get("mc_quiz_page", 0) - 1
+    )
+
+    await show_move_copy_quizzes(query.message, context)
+
+
+async def mc_quiz_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["mc_quiz_page"] = context.user_data.get("mc_quiz_page", 0) + 1
+
+    await show_move_copy_quizzes(query.message, context)
 
 # =========================
 # HANDLERS
 # =========================
 # load_owner_from_db()
 ensure_default_folder()
+ensure_default_qb_folder()
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("clear", clear_chat))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-app.add_handler(MessageHandler(filters.Regex(r"^/post_"), post_quiz_command))
+app.add_handler(CommandHandler("post", post_quiz_command))
+# =========================
+# Must Stay on Top of other CallbackQueryHandler
+# =========================
+app.add_handler(CallbackQueryHandler(global_quiz_guard), group=-1)
+# =========================
+app.add_handler(CallbackQueryHandler(mc_quiz_prev, pattern="^MC_QUIZ_PREV$"))
+app.add_handler(CallbackQueryHandler(mc_quiz_next, pattern="^MC_QUIZ_NEXT$"))
+app.add_handler(CallbackQueryHandler(mc_folder_prev, pattern="^MC_FOLDER_PREV$"))
+app.add_handler(CallbackQueryHandler(mc_folder_next, pattern="^MC_FOLDER_NEXT$"))
+app.add_handler(CallbackQueryHandler(move_q_start, pattern="^MOVE_Q_START$"))
+app.add_handler(CallbackQueryHandler(copy_q_start, pattern="^COPY_Q_START$"))
+app.add_handler(CallbackQueryHandler(move_copy_open_folder, pattern="^MC_FOLDER\\|"))
+app.add_handler(CallbackQueryHandler(move_copy_apply, pattern="^MC_APPLY\\|"))
+app.add_handler(CallbackQueryHandler(back_to_questions, pattern="^BACK_TO_QUESTIONS$"))
+app.add_handler(CallbackQueryHandler(cancel_edit_question_explanation, pattern="^CANCEL_EDIT_Q_EXPL$"))
+app.add_handler(CallbackQueryHandler(cancel_edit_question_options,pattern="^CANCEL_EDIT_Q_OPTIONS$"))
+app.add_handler(CallbackQueryHandler(apply_new_options_correct,pattern="^EDIT_OPT_CORRECT_"))
+app.add_handler(CallbackQueryHandler(cancel_edit_question_text, pattern="^CANCEL_EDIT_Q_TEXT$"))
+app.add_handler(CallbackQueryHandler(delete_finish_message, pattern="^DELETE_FINISH_MSG$"))
+app.add_handler(CallbackQueryHandler(qb_auto_add_questions, pattern=r"^QB_AUTO_ADD\|"))
+app.add_handler(CallbackQueryHandler(qb_remove_question_from_quiz,pattern=r"^QB_REMOVE_Q\|"))
+app.add_handler(CallbackQueryHandler(qb_add_selected_questions, pattern="^QB_ADD_SELECTED$"))
+app.add_handler(CallbackQueryHandler(qb_toggle_select_question, pattern="^QB_SELECT_Q\\|"))
+app.add_handler(CallbackQueryHandler(qb_question_prev, pattern="^QB_Q_PREV$"))
+app.add_handler(CallbackQueryHandler(qb_question_next, pattern="^QB_Q_NEXT$"))
+app.add_handler(CallbackQueryHandler(cancel_shuffle_menu, pattern="^CANCEL_SHUFFLE_MENU$"))
+app.add_handler(CallbackQueryHandler(cancel_timer_menu, pattern="^CANCEL_TIMER_MENU$"))
+app.add_handler(CallbackQueryHandler(cancel_edit_question_image, pattern="^CANCEL_EDIT_Q_IMAGE$"))
+app.add_handler(CallbackQueryHandler(shuffle_back, pattern="^SHUFFLE_BACK$"))
+app.add_handler(CallbackQueryHandler(resume_quiz, pattern="^RESUME_QUIZ$"))
+app.add_handler(CallbackQueryHandler(force_stop_quiz, pattern="^FORCE_STOP_QUIZ$"))
+app.add_handler(CallbackQueryHandler(post_quiz_to_group, pattern="^POST_QUIZ$"))
+app.add_handler(CallbackQueryHandler(cancel_create_question, pattern="^CANCEL_CREATE_QUESTION$"))
+app.add_handler(CallbackQueryHandler(qb_move_question, pattern="^QB_MOVE$"))
+app.add_handler(CallbackQueryHandler(qb_move_apply, pattern="^QB_MOVE_TO\\|"))
+app.add_handler(CallbackQueryHandler(qb_move_prev, pattern="^QB_MOVE_PREV$"))
+app.add_handler(CallbackQueryHandler(qb_move_next, pattern="^QB_MOVE_NEXT$"))
+app.add_handler(CallbackQueryHandler(quiz_folder_prev, pattern="^QUIZ_FOLDER_PREV$"))
+app.add_handler(CallbackQueryHandler(quiz_folder_next, pattern="^QUIZ_FOLDER_NEXT$"))
+app.add_handler(CallbackQueryHandler(qb_open_folder, pattern="^QB_OPEN_FOLDER\\|"))
+app.add_handler(CallbackQueryHandler(show_db_questions, pattern="^DB_OPEN\\|"))
+app.add_handler(CallbackQueryHandler(qb_pick_folder_start, pattern="^QB_PICK_FOLDER$"))
+app.add_handler(CallbackQueryHandler(qb_folder_prev, pattern="^QB_FOLDER_PREV$"))
+app.add_handler(CallbackQueryHandler(qb_folder_next, pattern="^QB_FOLDER_NEXT$"))
+app.add_handler(CallbackQueryHandler(home_create_question, pattern="^HOME_CREATE_QUESTION$"))
+app.add_handler(CallbackQueryHandler(home_manage_subscribers, pattern="^HOME_MANAGE_SUBSCRIBERS$"))
+app.add_handler(CallbackQueryHandler(database_add_folder_start, pattern="^DB_ADD$"))
 app.add_handler(CallbackQueryHandler(confirm_delete, pattern="^CONFIRM_DELETE$"))
 app.add_handler(CallbackQueryHandler(cancel_delete, pattern="^CANCEL_DELETE$"))
 app.add_handler(CallbackQueryHandler(copy_question_apply, pattern="^COPY_TO\\|"))
 app.add_handler(CallbackQueryHandler(copy_question_start, pattern="^COPY_Q$"))
 app.add_handler(CallbackQueryHandler(folder_prev, pattern="^FOLDER_PREV\\|"))
 app.add_handler(CallbackQueryHandler(folder_next, pattern="^FOLDER_NEXT\\|"))
-app.add_handler(CallbackQueryHandler(post_quiz_instructions, pattern="^POST_QUIZ$"))
+app.add_handler(CallbackQueryHandler(home_database, pattern="^HOME_DATABASE$"))
+app.add_handler(CallbackQueryHandler(database_prev, pattern="^DB_PREV$"))
+app.add_handler(CallbackQueryHandler(database_next, pattern="^DB_NEXT$"))
 app.add_handler(CallbackQueryHandler(play_start, pattern="^START_THIS$"))
 app.add_handler(CallbackQueryHandler(leaderboard_page_nav, pattern="^LB_PREV\\|"))
 app.add_handler(CallbackQueryHandler(leaderboard_page_nav, pattern="^LB_NEXT\\|"))
-app.add_handler(CallbackQueryHandler(post_quiz_to_group, pattern="^POST_TO_GROUP$"))
 app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^LOCKED$"))
 app.add_handler(CallbackQueryHandler(play_start, pattern="^PLAY_START$"))
 app.add_handler(CallbackQueryHandler(play_answer, pattern="^PLAY_ANSWER_"))
@@ -2414,8 +5908,8 @@ app.add_handler(CallbackQueryHandler(open_folder, pattern="^OPEN_FOLDER\\|"))
 app.add_handler(CallbackQueryHandler(back_to_folders, pattern="^BACK_TO_FOLDERS$"))
 app.add_handler(CallbackQueryHandler(questions_prev, pattern="^QPAGE_PREV$"))
 app.add_handler(CallbackQueryHandler(questions_next, pattern="^QPAGE_NEXT$"))
-app.add_handler(CallbackQueryHandler(preview_question, pattern="^Q_"))
 app.add_handler(CallbackQueryHandler(quiz_action_menu, pattern="^QUIZ_"))
+app.add_handler(CallbackQueryHandler(preview_question, pattern=r"^Q_\d+$"))
 app.add_handler(CallbackQueryHandler(edit_menu, pattern="^EDIT_THIS$"))
 app.add_handler(CallbackQueryHandler(edit_title, pattern="^EDIT_TITLE$"))
 app.add_handler(CallbackQueryHandler(edit_desc, pattern="^EDIT_DESC$"))
@@ -2424,10 +5918,18 @@ app.add_handler(CallbackQueryHandler(set_timer, pattern="^SET_TIMER_"))
 app.add_handler(CallbackQueryHandler(edit_shuffle_menu, pattern="^EDIT_SHUFFLE$"))
 app.add_handler(CallbackQueryHandler(toggle_shuffle, pattern="^TOGGLE_"))
 app.add_handler(CallbackQueryHandler(show_questions, pattern="^EDIT_QUESTIONS$"))
-app.add_handler(CallbackQueryHandler(add_new_question, pattern="^ADD_QUESTION$"))
 app.add_handler(CallbackQueryHandler(back_to_action, pattern="^BACK_TO_ACTION$"))
 app.add_handler(CallbackQueryHandler(edit_correct_answer, pattern="^EDIT_CORRECT$"))
 app.add_handler(CallbackQueryHandler(delete_question, pattern="^DELETE_QUESTION$"))
 
+async def global_error_handler(update, context):
+    print("❌ Unhandled error:", context.error)
+
+app.add_error_handler(global_error_handler)
+
 print("✅ QuizBot Clone is running...")
 app.run_polling()
+############################################################################
+# CODE BY PARTS - END OF CODE
+############################################################################
+
