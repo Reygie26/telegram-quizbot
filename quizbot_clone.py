@@ -43,7 +43,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("❌ BOT_TOKEN environment variable is missing")
 
-OWNER_USER_ID = 6254422846
+OWNER_USER_ID = int(os.getenv("OWNER_USER_ID"))
 BOT_USERNAME = "EucresiaBot"
 DB_FILE = "/var/data/quizbot.db"
 print("📂 Using database file at:", DB_FILE)
@@ -6536,6 +6536,7 @@ app.run_polling()
 ####################################################################################################################################################################################################################################
 # CODE BY PARTS - END OF CODE
 ####################################################################################################################################################################################################################################
+
 
 
 
