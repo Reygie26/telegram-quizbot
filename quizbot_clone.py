@@ -1,7 +1,7 @@
 ####################################################################################################################################################################################################################################
 # CODE BY PARTS - PART 1 (START OF CODE)
 ####################################################################################################################################################################################################################################
-# quizbot_clone.py
+# TeleQuiz.py
 # FULL STABLE VERSION – TIMER & SHUFFLE FIXED
 # All Edit buttons now open real menus
 
@@ -35,18 +35,46 @@ from telegram.ext import (
 from telegram.ext import InlineQueryHandler
 from telegram import InlineQueryResultArticle, InputTextMessageContent
 
-# =========================
-# CONFIG
-# =========================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
+
+##### =============================================================================================
+##### BOT TOKEN TO USE
+##### =============================================================================================
+##### BOT TOKEN TO USE FOR GITHUB    - BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("❌ BOT_TOKEN environment variable is missing")
 
+##### =============================================================================================
+##### OWNER USER ID TO USE
+##### =============================================================================================
+##### OWNER USER ID FOR GITHUB       - OWNER_USER_ID = int(os.getenv("OWNER_USER_ID"))
 OWNER_USER_ID = int(os.getenv("OWNER_USER_ID"))
+
+##### =============================================================================================
+##### BOT USERNAME TO USE
+##### =============================================================================================
+##### BOT USERNAME FOR TEST BOT      - BOT_USERNAME = "EnginerdBot"
+##### BOT USERNAME FOR GITHUB        - BOT_USERNAME = "EucresiaBot"
 BOT_USERNAME = "EucresiaBot"
+
+##### =============================================================================================
+##### DB_FILE TO USE
+##### =============================================================================================
+##### DB_FILE TO USE FOR TEST BOT    - DB_FILE = os.path.join(os.getcwd(), "quizbot.db")
+##### DB_FILE TO USE FOR GITHUB      - DB_FILE = "/var/data/quizbot.db"
 DB_FILE = "/var/data/quizbot.db"
+
+##### =============================================================================================
+##### print("📂 Using database file at:", DB_FILE)
+##### =============================================================================================
+##### FOR TEST BOT                   - (empty)
+##### FOR GITHUB                     - print("📂 Using database file at:", DB_FILE)
 print("📂 Using database file at:", DB_FILE)
+
+##### =============================================================================================
+##### CONFIGURATION
+##### =============================================================================================
 QUESTIONS_PER_PAGE = 10
 QUIZ_FOLDERS_PER_PAGE = 5
 PLACEHOLDER_IMAGE_URL = "https://via.placeholder.com/1x1.png"
@@ -113,7 +141,7 @@ def make_leaderboard_key(quiz_id: str, token: str) -> str:
 # =========================
 def is_quiz_active(context):
     return "play" in context.user_data
-    
+
 # =========================
 # GROUP QUIZ STATE (IN-MEMORY)
 # =========================
@@ -132,6 +160,7 @@ GROUP_LB_MESSAGES = {}   # quiz_id -> {
                          #   "message_id": int,
                          #   "page": int
                          # }
+
 USER_RATE_LIMIT = {}
 RATE_LIMIT_SECONDS = 1
 
@@ -358,7 +387,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     msg = await update.message.reply_text(
-        "🧠 **Welcome to Quiz Bot (Admin Panel)**\n\nPlease choose an option:",
+        "🧠 **Welcome to TeleQuiz a Telegram Quiz Bot personally created by Engr. Reygie M. Gorgonio to provide review solutions (Admin Panel)**\n\nPlease choose an option:",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
@@ -377,35 +406,40 @@ async def create_quiz(update_or_message, context: ContextTypes.DEFAULT_TYPE):
 
     # ✅ CORRECT HANDLING FOR BUTTON OR MESSAGE
     if isinstance(update_or_message, Update):
-        # Called from a normal message (/start or text)
         user_id = update_or_message.effective_user.id
         message = update_or_message.message
+        original_message = update_or_message.message
     else:
-        # Called from inline button (CallbackQuery)
         query = update_or_message
         user_id = query.from_user.id
         message = query.message
-
-    # 🔑 AUTO-SET OWNER
-    #if OWNER_USER_ID is None:
-    #   OWNER_USER_ID = None
+        original_message = query.message
 
     # 🔒 OWNER-ONLY CHECK
     if user_id != OWNER_USER_ID:
         await message.reply_text("❌ Only the bot owner can create quizzes.")
         return
 
+    # ⚠️ DO NOT CLEAR EVERYTHING blindly (safer reset)
     context.user_data.clear()
+
     context.user_data["quiz_id"] = str(uuid.uuid4())
     context.user_data["state"] = "WAIT_TITLE"
 
-    await message.reply_text("📝 Send quiz title:")
+    # 📝 Send prompt and STORE its ID
+    prompt_msg = await message.reply_text("📝 Send quiz title:")
 
+    context.user_data["create_quiz_prompt_id"] = prompt_msg.message_id
+
+    # 🔑 Store original message for safe editing later
+    context.user_data["quiz_overview_msg_id"] = original_message.message_id
 
 # =========================
 # TEXT HANDLER
 # =========================
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("add_q_state"):
+        context.user_data.setdefault("question_flow_msgs", []).append(update.message.message_id)
 
     # ================= EDIT QUESTION IMAGE (QUESTION BANK) =================
     if context.user_data.get("edit_q_field") == "IMAGE":
@@ -478,17 +512,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_question"]["image"] = file_id
     context.user_data["add_q_state"] = "NEW_Q_OPTION_1"
 
-    await update.message.reply_text("➡️ Send option 1:")
+    msg = await update.message.reply_text("➡️ Send option 1:")
+    context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
+
+    return
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     # Track user message
     context.user_data.setdefault("chat_messages", []).append(update.message.message_id)
-
 
     # ================= DATABASE TEXT FLOW (HARD ISOLATION) =================
     state = context.user_data.get("state")
     text = update.message.text.strip()
+
+    # 🔑 Track user messages during question creation
+    if context.user_data.get("add_q_state"):
+        context.user_data.setdefault("question_flow_msgs", []).append(update.message.message_id)
 
     if state == "DB_ADD_FOLDER":
         folder = text.strip()
@@ -652,10 +691,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⏭ Skip image", callback_data="SKIP_Q_IMAGE")]
         ])
 
-        await update.message.reply_text(
+        msg = await update.message.reply_text(
             "🖼 Send image for this question:",
             reply_markup=keyboard
         )
+        context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
         return
 
     # ================= OPTIONS FLOW (NEW QUESTION — DO NOT CHANGE) =================
@@ -663,19 +703,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q_state == "NEW_Q_OPTION_1":
         context.user_data["new_question"]["options"].append(text)
         context.user_data["add_q_state"] = "NEW_Q_OPTION_2"
-        await update.message.reply_text("➡️ Send option 2:")
+        msg = await update.message.reply_text("➡️ Send option 2:")
+        context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
         return
 
     if q_state == "NEW_Q_OPTION_2":
         context.user_data["new_question"]["options"].append(text)
         context.user_data["add_q_state"] = "NEW_Q_OPTION_3"
-        await update.message.reply_text("➡️ Send option 3:")
+        msg = await update.message.reply_text("➡️ Send option 3:")
+        context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
         return
 
     if q_state == "NEW_Q_OPTION_3":
         context.user_data["new_question"]["options"].append(text)
         context.user_data["add_q_state"] = "NEW_Q_OPTION_4"
-        await update.message.reply_text("➡️ Send option 4:")
+        msg = await update.message.reply_text("➡️ Send option 4:")
+        context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
         return
 
     if q_state == "NEW_Q_OPTION_4":
@@ -691,10 +734,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(f"4️⃣ {opts[3]}", callback_data="CORRECT_3")],
         ])
 
-        await update.message.reply_text(
+        msg = await update.message.reply_text(
             "✅ Choose the correct answer:",
             reply_markup=keyboard
         )
+
+        context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
         return
 
     # ================= EDIT QUESTION OPTIONS =================
@@ -778,37 +823,83 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_quiz_action_menu(update.message, context)
         return
 
-    # ================= ADD EMPTY FOLDER =================
+    # ================= ADD FOLDER =================
     if state == "ADD_FOLDER":
-        folder = text
+        chat_id = update.effective_chat.id
+        user_msg_id = update.message.message_id
+        folder_name = text.strip()
 
-        if folder == "Default":
-            await update.message.reply_text("❌ 'Default' folder already exists.")
+        if folder_name == "Default":
+            await update.message.reply_text("❌ You cannot create a folder named Default.")
             return
 
+        # Check duplicate
         cur.execute(
             "SELECT 1 FROM folders WHERE owner_id=? AND name=?",
-            (OWNER_USER_ID, folder)
+            (OWNER_USER_ID, folder_name)
         )
         if cur.fetchone():
             await update.message.reply_text("❌ Folder already exists.")
             return
 
-        cur.execute(
-            "INSERT INTO folders (owner_id, name) VALUES (?, ?)",
-            (OWNER_USER_ID, folder)
-        )
-        conn.commit()
+        try:
+            async with DB_LOCK:
+                cur.execute(
+                    "INSERT INTO folders (owner_id, name) VALUES (?, ?)",
+                    (OWNER_USER_ID, folder_name)
+                )
+                conn.commit()
+        except Exception as e:
+            print("⚠️ Failed to create folder:", e)
+            await flash_message(context.bot, chat_id, "❌ Folder creation failed.")
+            return
 
+        # 🧹 DELETE prompt message
+        prompt_id = context.user_data.pop("add_folder_prompt_id", None)
+        if prompt_id:
+            try:
+                await context.bot.delete_message(chat_id, prompt_id)
+            except:
+                pass
+
+        # 🧹 DELETE user message
+        try:
+            await context.bot.delete_message(chat_id, user_msg_id)
+        except:
+            pass
+
+        # ✅ Send confirmation
+        confirm_msg = await context.bot.send_message(
+            chat_id,
+            f'✅ Folder "{folder_name}" created.'
+        )
+
+        # 🧹 Clear state
         context.user_data["state"] = None
-        await update.message.reply_text(f"✅ Folder '{folder}' created.")
-        await my_quizzes(update, context)
+
+        # ⏳ Wait 2 seconds
+        await asyncio.sleep(2)
+
+        # 🧹 Delete confirmation
+        try:
+            await confirm_msg.delete()
+        except:
+            pass
+
+        # 🔁 Refresh folder list CLEANLY (edit-based)
+        await show_quiz_folders(
+            context.user_data.get("folder_screen_message_object"),
+            context
+        )
         return
 
     # ================= RENAME FOLDER =================
     if state == "RENAME_FOLDER":
+        chat_id = update.effective_chat.id
+        user_msg_id = update.message.message_id
+
         old = context.user_data["rename_folder"]
-        new = text
+        new = text.strip()
 
         if new == "Default":
             await update.message.reply_text("❌ You cannot rename a folder to Default.")
@@ -823,56 +914,114 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ A folder with this name already exists.")
             return
 
-        # Rename folder in folders table
-        cur.execute(
-            "UPDATE folders SET name=? WHERE owner_id=? AND name=?",
-            (new, OWNER_USER_ID, old)
-        )
+        try:
+            async with DB_LOCK:
+                # Rename folder in folders table
+                cur.execute(
+                    "UPDATE folders SET name=? WHERE owner_id=? AND name=?",
+                    (new, OWNER_USER_ID, old)
+                )
 
-        # Rename folder in quizzes table
-        cur.execute(
-            "UPDATE quizzes SET folder=? WHERE owner_id=? AND folder=?",
-            (new, OWNER_USER_ID, old)
-        )
+                # Rename folder in quizzes table
+                cur.execute(
+                    "UPDATE quizzes SET folder=? WHERE owner_id=? AND folder=?",
+                    (new, OWNER_USER_ID, old)
+                )
 
-        conn.commit()
+                conn.commit()
+        except Exception as e:
+            print("⚠️ Rename failed:", e)
+            await flash_message(context.bot, chat_id, "❌ Rename failed.")
+            return
 
+        # 🧹 DELETE rename prompt
+        prompt_id = context.user_data.pop("rename_prompt_msg_id", None)
+        if prompt_id:
+            try:
+                await context.bot.delete_message(chat_id, prompt_id)
+            except:
+                pass
+
+        # 🧹 DELETE user's typed message
+        try:
+            await context.bot.delete_message(chat_id, user_msg_id)
+        except:
+            pass
+
+        # 🧹 Clear state
         context.user_data["state"] = None
         context.user_data.pop("rename_folder", None)
 
-        await update.message.reply_text(
-            f"✅ Folder renamed to **{new}**.",
-            parse_mode="Markdown"
+        # 🔁 Refresh folder list cleanly (edit-based)
+        await show_quiz_folders(
+            context.user_data.get("folder_screen_message_object"),
+            context
         )
 
-        await show_quiz_folders(update.message, context)
         return
 
     # ================= CREATE QUIZ =================
-    if state == "WAIT_TITLE":
-        cur.execute(
-            "INSERT INTO quizzes VALUES (?, ?, ?, NULL, ?, 1, 1, 15)",
-            (
-                context.user_data["quiz_id"],
-                OWNER_USER_ID,
-                text,
-                context.user_data.get("current_folder", "Default")
-            )
-        )
-        conn.commit()
-    
-        # 🔑 SET ACTIVE QUIZ (IMPORTANT)
+    if state == "CREATE_QUIZ":
+        chat_id = update.effective_chat.id
+        user_msg_id = update.message.message_id
+        title = text.strip()
+
+        try:
+            async with DB_LOCK:
+                cur.execute(
+                    "INSERT INTO quizzes VALUES (?, ?, ?, NULL, ?, 1, 1, 15)",
+                    (
+                        context.user_data["quiz_id"],
+                        OWNER_USER_ID,
+                        title,
+                        context.user_data.get("current_folder", "Default")
+                    )
+                )
+                conn.commit()
+        except Exception as e:
+            print("⚠️ Quiz creation failed:", e)
+            await flash_message(context.bot, chat_id, "❌ Failed to create quiz.")
+            return
+
+        # 🔑 Set active quiz
         context.user_data["active_quiz_id"] = context.user_data["quiz_id"]
         context.user_data["state"] = None
-    
-        await update.message.reply_text("✅ Quiz created.")
-     
-        # 🚀 AUTO-OPEN QUIZ ACTION MENU
+
+        # 🧹 STEP 1 — Delete prompt message
+        prompt_id = context.user_data.pop("create_quiz_prompt_id", None)
+        if prompt_id:
+            try:
+                await context.bot.delete_message(chat_id, prompt_id)
+            except:
+                pass
+
+        # 🧹 STEP 2 — Delete user's typed title
+        try:
+            await context.bot.delete_message(chat_id, user_msg_id)
+        except:
+            pass
+
+        # ✅ STEP 3 — Send confirmation
+        confirm_msg = await context.bot.send_message(
+            chat_id,
+            "✅ Quiz created."
+        )
+
+        # ⏳ STEP 4 — Wait 2 seconds
+        await asyncio.sleep(2)
+
+        # 🧹 STEP 5 — Delete confirmation
+        try:
+            await confirm_msg.delete()
+        except:
+            pass
+
+        # 🚀 STEP 6 — Open Quiz Action Menu cleanly
         overview_id = context.user_data.get("quiz_overview_msg_id")
 
         if overview_id:
             await show_quiz_action_menu_by_id(
-                chat_id=update.effective_chat.id,
+                chat_id=chat_id,
                 message_id=overview_id,
                 context=context
             )
@@ -1398,10 +1547,18 @@ async def qb_pick_folder_menu(message, context):
 # =========================
 
 async def show_quizzes_in_folder(message, context, folder):
-    cur.execute(
-        "SELECT quiz_id, title FROM quizzes WHERE owner_id=? AND folder=?",
-        (OWNER_USER_ID, folder)
-    )
+
+    # Store the folder screen message reference
+    context.user_data["folder_screen_message_object"] = message
+    context.user_data["last_folder_screen_msg_id"] = message.message_id
+
+    cur.execute("""
+        SELECT quiz_id, title
+        FROM quizzes
+        WHERE owner_id=? AND folder=?
+        ORDER BY title COLLATE NOCASE
+    """, (OWNER_USER_ID, folder))
+
     rows = cur.fetchall()
 
     # 🔢 Pagination state
@@ -1468,12 +1625,16 @@ async def rename_folder_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     folder = query.data.split("|", 1)[1]
+
     context.user_data["rename_folder"] = folder
     context.user_data["state"] = "RENAME_FOLDER"
 
-    await query.message.reply_text(
+    # Send prompt and store its message ID
+    msg = await query.message.reply_text(
         f"✏️ Send new name for folder:\n\n📁 {folder}"
     )
+
+    context.user_data["rename_prompt_msg_id"] = msg.message_id
 
 async def add_folder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1481,9 +1642,20 @@ async def add_folder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["state"] = "ADD_FOLDER"
 
-    await query.message.reply_text(
-        "➕ Send the new folder name:"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_ADD_FOLDER")]
+    ])
+
+    msg = await query.message.reply_text(
+        "📁 Send new folder name:",
+        reply_markup=keyboard
     )
+
+    # 🔑 Store prompt ID for deletion
+    context.user_data["add_folder_prompt_id"] = msg.message_id
+
+    # 🔑 Store original folder screen message (important for refresh later)
+    context.user_data["folder_screen_message_object"] = query.message
 
 async def my_quizzes(update_or_message, context: ContextTypes.DEFAULT_TYPE):
     # Accept Message or CallbackQuery
@@ -2089,8 +2261,26 @@ async def home_create_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    # Reuse existing logic
-    await create_quiz(query, context)
+    # 🔑 Generate quiz_id FIRST
+    context.user_data["quiz_id"] = str(uuid.uuid4())
+
+    # 🔑 Then set state
+    context.user_data["state"] = "CREATE_QUIZ"
+
+    # 📝 Send prompt and store its ID
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUIZ")]
+    ])
+
+    prompt_msg = await query.message.reply_text(
+        "📝 Send quiz title:",
+        reply_markup=keyboard
+    )
+
+    context.user_data["create_quiz_prompt_id"] = prompt_msg.message_id
+
+    # 🔑 Store the menu message so we can edit it later
+    context.user_data["quiz_overview_msg_id"] = query.message.message_id
 
 async def back_to_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2161,6 +2351,9 @@ async def home_create_question(update: Update, context: ContextTypes.DEFAULT_TYP
     # 🔒 Clear any quiz-specific state
     context.user_data.pop("active_quiz_id", None)
 
+    # 🔑 Initialize Question Flow Tracker
+    context.user_data["question_flow_msgs"] = []
+
     # ✅ Start pure Question Bank creation flow
     context.user_data["add_q_state"] = "NEW_Q_TEXT"
     context.user_data["new_question"] = {"options": []}
@@ -2169,10 +2362,13 @@ async def home_create_question(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
     ])
 
-    await query.message.reply_text(
+    msg = await query.message.reply_text(
         "❓ Create a Question\n\n📝 Send question text:",
         reply_markup=keyboard
     )
+
+    # 🔑 Track the FIRST prompt message
+    context.user_data["question_flow_msgs"].append(msg.message_id)
 
 async def home_manage_subscribers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2425,6 +2621,8 @@ async def choose_correct_answer(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
 
+    message = query.message  # 🔑 ALWAYS use this in callbacks
+
     # Extract index (0–3)
     correct_index = int(query.data.replace("CORRECT_", ""))
 
@@ -2437,10 +2635,13 @@ async def choose_correct_answer(update: Update, context: ContextTypes.DEFAULT_TY
         [InlineKeyboardButton("⏭ Skip explanation", callback_data="SKIP_Q_EXPLANATION")]
     ])
 
-    await query.message.reply_text(
-        "🧾 Send explanation (optional):",
+    msg = await message.reply_text(
+        "📝 Send explanation:",
         reply_markup=keyboard
     )
+
+    # 🔑 Track explanation prompt
+    context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
 
 async def save_new_question(message, context):
     q = context.user_data["new_question"]
@@ -2490,7 +2691,24 @@ async def save_new_question(message, context):
     context.user_data.pop("add_q_state", None)
     context.user_data.pop("new_question", None)
 
-    await message.reply_text("✅ Question saved to Question Bank.")
+    # ✅ Send confirmation and track it
+    confirm = await message.reply_text("✅ Question saved to Question Bank.")
+
+    context.user_data.setdefault("question_flow_msgs", []).append(confirm.message_id)
+
+    await asyncio.sleep(2)
+
+    chat_id = message.chat_id
+
+    # 🧹 DELETE ALL QUESTION FLOW MESSAGES
+    for msg_id in context.user_data.get("question_flow_msgs", []):
+        try:
+            await context.bot.delete_message(chat_id, msg_id)
+        except:
+            pass
+
+    # 🧹 Clear tracker
+    context.user_data.pop("question_flow_msgs", None)
 
     # =========================
     # CONTEXT-AWARE RETURN
@@ -2507,13 +2725,16 @@ async def save_new_question(message, context):
         [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
     ])
 
+    context.user_data["question_flow_msgs"] = []
     context.user_data["add_q_state"] = "NEW_Q_TEXT"
     context.user_data["new_question"] = {"options": []}
 
-    await message.reply_text(
+    msg = await message.reply_text(
         "❓ Create a Question\n\n📝 Send question text:",
         reply_markup=keyboard
     )
+
+    context.user_data["question_flow_msgs"].append(msg.message_id)
 
 async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -4236,31 +4457,28 @@ async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ======================================================
     elif dtype == "FOLDER":
         folder = value
+        chat_id = query.message.chat_id
 
         try:
             async with DB_LOCK:
 
-                # Load quizzes inside folder
                 cur.execute(
                     "SELECT quiz_id FROM quizzes WHERE folder=?",
                     (folder,)
                 )
                 quiz_ids = [row[0] for row in cur.fetchall()]
 
-                # Delete quiz links
                 for qid in quiz_ids:
                     cur.execute(
                         "DELETE FROM quiz_question_links WHERE quiz_id=?",
                         (qid,)
                     )
 
-                # Delete quizzes
                 cur.execute(
                     "DELETE FROM quizzes WHERE folder=?",
                     (folder,)
                 )
 
-                # Delete folder record
                 cur.execute(
                     "DELETE FROM folders WHERE name=?",
                     (folder,)
@@ -4270,11 +4488,39 @@ async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             print("⚠️ Failed to delete folder:", e)
-            await flash_message(context.bot, query.message.chat_id, "❌ Folder delete failed.")
+            await flash_message(context.bot, chat_id, "❌ Folder delete failed.")
             return
 
-        await flash_message(context.bot, query.message.chat_id, "🗑 Folder deleted.")
-        await show_quiz_folders(query.message, context)
+        # 🧹 STEP 1: Delete confirmation dialog
+        try:
+            await query.message.delete()
+        except:
+            pass
+
+        # 🔁 STEP 2: Edit the ORIGINAL folder screen message
+        # The original message is the one BEFORE confirmation dialog.
+        # We access it via context.user_data.
+        folder_msg_id = context.user_data.get("last_folder_screen_msg_id")
+
+        if folder_msg_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=folder_msg_id,
+                    text="📂 Quiz Folders",
+                    reply_markup=None
+                )
+            except:
+                pass
+
+        # 🔁 STEP 3: Properly redraw folder list on same message
+        # IMPORTANT: Use a dummy Message object reference from context
+        await show_quiz_folders(
+            message=context.user_data.get("folder_screen_message_object"),
+            context=context
+        )
+
+        return
 
     # ======================================================
     # ❗ QUESTION DELETE REMOVED
@@ -4875,12 +5121,21 @@ async def cancel_create_question(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
 
-    # 🔒 Exit question creation cleanly
+    chat_id = query.message.chat_id
+
+    # 🧹 Delete the prompt message (with Cancel button)
+    try:
+        await query.message.delete()
+    except:
+        pass
+
+    # 🧹 Clear question creation state
     context.user_data.pop("add_q_state", None)
     context.user_data.pop("new_question", None)
+    context.user_data.pop("question_flow_msgs", None)
 
-    # 🔁 Return to Home menu
-    await go_home(update, context)
+    # 🚫 DO NOT redraw Home
+    # 🚫 DO NOT send any new message
 
 async def cancel_timer_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -6394,6 +6649,57 @@ async def move_folder_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await show_move_quiz_folders(query.message, context)
 
+async def cancel_create_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+
+    # 🧹 Delete the prompt message (with inline button)
+    prompt_id = context.user_data.pop("create_quiz_prompt_id", None)
+    if prompt_id:
+        try:
+            await context.bot.delete_message(chat_id, prompt_id)
+        except:
+            pass
+
+    # 🧹 Clear state safely
+    context.user_data.pop("state", None)
+    context.user_data.pop("quiz_id", None)
+
+    # ✅ Send temporary cancel confirmation
+    msg = await context.bot.send_message(
+        chat_id,
+        "❌ Quiz creation cancelled."
+    )
+
+    await asyncio.sleep(1.5)
+
+    try:
+        await msg.delete()
+    except:
+        pass
+
+async def cancel_add_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+
+    # 🧹 Delete the prompt message (with Cancel button)
+    prompt_id = context.user_data.pop("add_folder_prompt_id", None)
+    if prompt_id:
+        try:
+            await context.bot.delete_message(chat_id, prompt_id)
+        except:
+            pass
+
+    # 🧹 Clear state
+    context.user_data.pop("state", None)
+
+    # 🚫 Do NOT redraw anything
+    # 🚫 Do NOT send Home
+
 # =========================
 # HANDLERS
 # =========================
@@ -6414,6 +6720,8 @@ app.add_handler(CommandHandler("post", post_quiz_command))
 # =========================
 app.add_handler(CallbackQueryHandler(global_quiz_guard), group=-1)
 # =========================
+app.add_handler(CallbackQueryHandler(cancel_add_folder, pattern="^CANCEL_ADD_FOLDER$"))
+app.add_handler(CallbackQueryHandler(cancel_create_quiz, pattern="^CANCEL_CREATE_QUIZ$"))
 app.add_handler(CallbackQueryHandler(move_folder_prev, pattern="^MOVE_FOLDER_PREV$"))
 app.add_handler(CallbackQueryHandler(move_folder_next, pattern="^MOVE_FOLDER_NEXT$"))
 app.add_handler(CallbackQueryHandler(qb_clear_selected, pattern="^QB_CLEAR_SELECTED$"))
@@ -6531,13 +6839,8 @@ async def global_error_handler(update, context):
 
 app.add_error_handler(global_error_handler)
 
-print("✅ QuizBot Clone is running...")
+print("✅ TeleQuiz Clone is running...")
 app.run_polling()
 ####################################################################################################################################################################################################################################
 # CODE BY PARTS - END OF CODE
 ####################################################################################################################################################################################################################################
-
-
-
-
-
