@@ -54,14 +54,12 @@ OWNER_USER_ID = int(os.getenv("OWNER_USER_ID"))
 ##### =============================================================================================
 ##### BOT USERNAME TO USE
 ##### =============================================================================================
-##### BOT USERNAME FOR TEST BOT      - BOT_USERNAME = "EnginerdBot"
 ##### BOT USERNAME FOR GITHUB        - BOT_USERNAME = "EucresiaBot"
 BOT_USERNAME = "EucresiaBot"
 
 ##### =============================================================================================
 ##### DB_FILE TO USE
 ##### =============================================================================================
-##### DB_FILE TO USE FOR TEST BOT    - DB_FILE = os.path.join(os.getcwd(), "quizbot.db")
 ##### DB_FILE TO USE FOR GITHUB      - DB_FILE = "/var/data/quizbot.db"
 DB_FILE = "/var/data/quizbot.db"
 
@@ -682,9 +680,66 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # 📝 Question text (NEW QUESTION — DO NOT CHANGE)
+    # 📝 Question text (NEW QUESTION — WITH DUPLICATE CHECK)
     if q_state == "NEW_Q_TEXT":
-        context.user_data["new_question"]["text"] = text
+
+        context.user_data["last_user_question_msg_id"] = update.message.message_id
+
+        from difflib import SequenceMatcher
+
+        new_text = text.strip()
+        similar_matches = []
+
+        # 🔎 Load existing questions
+        cur.execute("SELECT id, question FROM question_bank")
+        existing_questions = cur.fetchall()
+
+        for qid, existing_text in existing_questions:
+            similarity = SequenceMatcher(
+                None,
+                new_text.lower(),
+                existing_text.lower()
+            ).ratio()
+
+            if similarity >= 0.80:  # 🔥 Adjust threshold if needed
+                similar_matches.append((similarity, existing_text))
+
+        # Sort by highest similarity
+        similar_matches.sort(reverse=True, key=lambda x: x[0])
+
+        if similar_matches:
+            top_matches = similar_matches[:5]
+
+            warning_text = "⚠️ *Similar question(s) found:*\n\n"
+
+            for i, (_, q_text) in enumerate(top_matches, 1):
+                warning_text += f"{i}. {q_text[:80]}\n"
+
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Create Anyway", callback_data="DUP_CREATE_ANYWAY"),
+                    InlineKeyboardButton("✏️ Edit Question", callback_data="DUP_EDIT"),
+                ],
+                [
+                    InlineKeyboardButton("❌ Cancel", callback_data="DUP_CANCEL")
+                ]
+            ])
+
+            # Store pending question text
+            context.user_data["pending_duplicate_text"] = new_text
+            context.user_data["add_q_state"] = "CONFIRM_DUPLICATE_Q"
+
+            msg = await update.message.reply_text(
+                warning_text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+
+            context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
+            return
+
+        # ✅ No duplicate → continue normally
+        context.user_data["new_question"]["text"] = new_text
         context.user_data["add_q_state"] = "NEW_Q_IMAGE"
 
         keyboard = InlineKeyboardMarkup([
@@ -695,6 +750,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🖼 Send image for this question:",
             reply_markup=keyboard
         )
+
         context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
         return
 
@@ -2351,6 +2407,11 @@ async def home_create_question(update: Update, context: ContextTypes.DEFAULT_TYP
     # 🔒 Clear any quiz-specific state
     context.user_data.pop("active_quiz_id", None)
 
+    # 🧹 Clear any leftover duplicate tracking (safety)
+    context.user_data.pop("create_q_prompt_msg_id", None)
+    context.user_data.pop("last_user_question_msg_id", None)
+    context.user_data.pop("pending_duplicate_text", None)
+
     # 🔑 Initialize Question Flow Tracker
     context.user_data["question_flow_msgs"] = []
 
@@ -2367,8 +2428,11 @@ async def home_create_question(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=keyboard
     )
 
-    # 🔑 Track the FIRST prompt message
+    # 🔑 Track the FIRST prompt message (existing system)
     context.user_data["question_flow_msgs"].append(msg.message_id)
+
+    # 🔑 Track specifically for duplicate cancel cleanup
+    context.user_data["create_q_prompt_msg_id"] = msg.message_id
 
 async def home_manage_subscribers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2601,10 +2665,25 @@ async def skip_question_image(update: Update, context: ContextTypes.DEFAULT_TYPE
     if context.user_data.get("add_q_state") != "NEW_Q_IMAGE":
         return
 
+    chat_id = query.message.chat_id
+
+    # 🧹 CLEAN previous creation prompts
+    for mid in context.user_data.get("question_flow_msgs", []):
+        try:
+            await context.bot.delete_message(chat_id, mid)
+        except:
+            pass
+
+    context.user_data["question_flow_msgs"] = []
+
+    # Proceed to Option 1
     context.user_data["new_question"]["image"] = None
     context.user_data["add_q_state"] = "NEW_Q_OPTION_1"
 
-    await query.message.reply_text("➡️ Send option 1:")
+    msg = await query.message.reply_text("➡️ Send option 1:")
+
+    # Track message for future declutter
+    context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
 
 async def skip_question_explanation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3396,13 +3475,13 @@ async def play_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🔒 Lock immediately
     play["locked"] = True
 
-    # ⛔ CANCEL TIMER TASK (SYMMETRY WITH TIMEOUT)
+    # ⛔ CANCEL TIMER TASK
     task = play.get("timer_task")
     if task:
         task.cancel()
     play["timer_task"] = None
 
-    # 🧹 DELETE ALL TIMER MESSAGES (🔴 FIX)
+    # 🧹 DELETE ALL TIMER MESSAGES
     for timer_msg_id in play.get("timer_message_ids", []):
         try:
             await context.bot.delete_message(
@@ -3418,11 +3497,11 @@ async def play_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = play["questions"][play["index"]]
     correct_index = q["correct"]
 
-    # ✅ Score
+    # ✅ Score update
     if chosen_index == correct_index:
         play["score"] += 1
 
-    # 🎨 Build feedback buttons
+    # 🎨 Build feedback buttons (NO explanation inline button)
     labels = ["A", "B", "C", "D"]
 
     buttons = [[
@@ -3434,12 +3513,6 @@ async def play_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i in range(len(q["options"]))
     ]]
 
-    explanation = q.get("explanation")
-    if explanation:
-        buttons.append([
-            InlineKeyboardButton(explanation, callback_data="LOCKED")
-        ])
-
     # 🔒 Finalize UI
     try:
         await query.message.edit_reply_markup(
@@ -3448,10 +3521,35 @@ async def play_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-    # 🔴 HARD ASYNC BOUNDARY (CRITICAL)
+    # =========================
+    # 📖 SEND EXPLANATION AS TEXT (PERSISTENT)
+    # =========================
+    explanation = q.get("explanation")
+
+    if explanation:
+        try:
+            expl_msg = await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text=f"📖 *Explanation:*\n\n{explanation}",
+                parse_mode="Markdown"
+            )
+
+            # 🔥 CRITICAL:
+            # Add explanation message to bulk cleanup list
+            play.setdefault("question_message_ids", []).append(
+                expl_msg.message_id
+            )
+
+        except:
+            pass
+
+    # ⏳ Wait 2 seconds before next question
+    await asyncio.sleep(2)
+
+    # 🔴 HARD ASYNC BOUNDARY
     await asyncio.sleep(0)
 
-    # ▶️ Advance quiz SAFELY
+    # ▶️ Advance quiz safely
     await advance_quiz(query.from_user.id, context)
 
 async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3628,82 +3726,136 @@ async def send_next_question(user_id, context):
     )
 
 async def countdown_timer(user_id, context, seconds, play):
-    if not play.get("timer_message_ids"):
-        return
+    try:
+        # Always re-fetch live play reference
+        play = context.user_data.get("play")
+        if not play:
+            return
 
-    timer_msg_id = play["timer_message_ids"][-1]
+        # Ensure timer message exists
+        timer_ids = play.get("timer_message_ids")
+        if not timer_ids:
+            return
 
-    # ⏱ Countdown loop
-    for remaining in range(seconds - 1, -1, -1):
-        await asyncio.sleep(1)
+        timer_msg_id = timer_ids[-1]
 
-        # User answered → exit cleanly
-        if play.get("locked"):
+        # =========================
+        # ⏱ Countdown Loop
+        # =========================
+        for remaining in range(seconds - 1, -1, -1):
+
+            await asyncio.sleep(1)
+
+            play = context.user_data.get("play")
+            if not play:
+                return
+
+            if play.get("locked") or play.get("ended"):
+                return
+
+            if "questions" not in play or "index" not in play:
+                return
+
+            try:
+                if remaining > 0:
+                    await context.bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=timer_msg_id,
+                        text=f"⏱ Time left: {remaining}s"
+                    )
+                else:
+                    await context.bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=timer_msg_id,
+                        text="⏳ Time’s up!"
+                    )
+            except:
+                pass
+
+        # =========================
+        # ⏰ TIME EXPIRED
+        # =========================
+
+        play = context.user_data.get("play")
+        if not play:
+            return
+
+        if play.get("locked") or play.get("ended"):
+            return
+
+        if "questions" not in play or "index" not in play:
+            return
+
+        play["locked"] = True
+        play["timer_task"] = None
+
+        if play["index"] >= len(play["questions"]):
+            return
+
+        q = play["questions"][play["index"]]
+        correct_index = q["correct"]
+        labels = ["A", "B", "C", "D"]
+
+        # ⏱ SKIPPED CASE — show correct/incorrect marks
+        buttons = [[
+            InlineKeyboardButton(
+                f"{labels[i]}{' ✅' if i == correct_index else ' ❌'}",
+                callback_data="LOCKED"
+            )
+            for i in range(len(q["options"]))
+        ]]
+
+        msg_id = play.get("current_question_message_id")
+        if not msg_id:
             return
 
         try:
-            if remaining > 0:
-                await context.bot.edit_message_text(
-                    chat_id=user_id,
-                    message_id=timer_msg_id,
-                    text=f"⏱ Time left: {remaining}s"
-                )
-            else:
-                await context.bot.edit_message_text(
-                    chat_id=user_id,
-                    message_id=timer_msg_id,
-                    text="⏳ Time’s up!"
-                )
+            await context.bot.edit_message_reply_markup(
+                chat_id=user_id,
+                message_id=msg_id,
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
         except:
             pass
 
-    # 🔒 TIME IS UP
-    if play.get("locked"):
+        # =========================
+        # 📖 SEND EXPLANATION AS TEXT (PERSISTENT)
+        # =========================
+        explanation = q.get("explanation")
+
+        if explanation:
+            try:
+                expl_msg = await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"📖 *Explanation:*\n\n{explanation}",
+                    parse_mode="Markdown"
+                )
+
+                # 🔥 Add to bulk cleanup list
+                play.setdefault("question_message_ids", []).append(
+                    expl_msg.message_id
+                )
+
+            except:
+                pass
+
+        # ⏳ Wait 2 seconds before advancing
+        await asyncio.sleep(2)
+
+        # =========================
+        # ▶️ Advance Safely
+        # =========================
+        if play["index"] >= len(play["questions"]) - 1:
+            await finish_quiz(user_id, context)
+        else:
+            await advance_quiz(user_id, context)
+
+    except asyncio.CancelledError:
+        # Proper cancellation handling
         return
-
-    play["locked"] = True
-
-    # ⚠️ DO NOT cancel this task — we ARE the task
-    play["timer_task"] = None
-
-    q = play["questions"][play["index"]]
-    correct_index = q["correct"]
-
-    labels = ["A", "B", "C", "D"]
-
-    buttons = [[
-        InlineKeyboardButton(
-            f"{labels[i]}{' ✅' if i == correct_index else ' ✖️'}",
-            callback_data="LOCKED"
-        )
-        for i in range(len(q["options"]))
-    ]]
-
-    explanation = q.get("explanation")
-    if explanation:
-        buttons.append([
-            InlineKeyboardButton(explanation, callback_data="LOCKED")
-        ])
-
-    # 🔑 Edit the correct question message
-    msg_id = play.get("current_question_message_id")
-    if not msg_id:
+    except Exception as e:
+        print("⚠️ Timer error:", e)
         return
-
-    try:
-        await context.bot.edit_message_reply_markup(
-            chat_id=user_id,
-            message_id=msg_id,
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-    except:
-        pass
-
-    # ▶️ Advance quiz
-    if play["index"] >= len(play["questions"]) - 1:
-        await finish_quiz(user_id, context)
-    else:
-        await advance_quiz(user_id, context)
 
 ####################################################################################################################################################################################################################################
 # CODE BY PARTS - PART 3
@@ -3981,7 +4133,41 @@ async def update_group_leaderboard(leaderboard_key, context):
             parse_mode="Markdown"
         )
     except Exception as e:
-        print("⚠️ Failed to edit leaderboard message:", e)
+        error_text = str(e).lower()
+
+        # 🚨 If group quiz message was deleted
+        if "message to edit not found" in error_text:
+            print("🧹 Group quiz message deleted. Cleaning leaderboard:", leaderboard_key)
+
+            # 🔑 Remove memory references
+            GROUP_LEADERBOARDS.pop(leaderboard_key, None)
+            GROUP_LB_MESSAGES.pop(leaderboard_key, None)
+
+            # 🔐 Remove database records safely
+            try:
+                async with DB_LOCK:
+                    # Delete leaderboard rows
+                    cur.execute(
+                        "DELETE FROM group_leaderboard WHERE leaderboard_key=?",
+                        (leaderboard_key,)
+                    )
+
+                    # Delete post token (prevents future PLAY)
+                    quiz_id, token = leaderboard_key.split(":", 1)
+
+                    cur.execute(
+                        "DELETE FROM quiz_post_tokens WHERE token=? AND quiz_id=?",
+                        (token, quiz_id)
+                    )
+
+                    conn.commit()
+
+            except Exception as db_error:
+                print("⚠️ Failed to clean DB leaderboard:", db_error)
+
+        else:
+            # Other harmless errors
+            print("⚠️ Failed to edit leaderboard message:", e)
 
 async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -4565,7 +4751,7 @@ async def end_quiz(user_id, context):
 async def stop_active_quiz(user_id, context):
     """
     Safely stops an ongoing quiz immediately
-    and CLEANS all quiz-related messages.
+    and CLEANS all quiz-related messages instantly.
     """
     play = context.user_data.get("play")
     if not play:
@@ -4576,35 +4762,58 @@ async def stop_active_quiz(user_id, context):
     play["finished"] = True
     play["ended"] = True
 
-    # ⛔ STEP 1: CANCEL TIMER TASK
+    # ⛔ STEP 1: CANCEL TIMER TASK SAFELY
     task = play.get("timer_task")
     current = asyncio.current_task()
+
     if task and task is not current:
         task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
     play["timer_task"] = None
 
-    # ⏱ STEP 2: DELETE ALL TIMER MESSAGES (FIX)
+    # =========================
+    # ⚡ STEP 2: INSTANT BULK DELETE
+    # =========================
+    delete_tasks = []
+
+    # Timer messages
     for timer_msg_id in play.get("timer_message_ids", []):
-        try:
-            await context.bot.delete_message(
+        delete_tasks.append(
+            context.bot.delete_message(
                 chat_id=user_id,
                 message_id=timer_msg_id
             )
-        except Exception:
-            pass
-    play["timer_message_ids"] = []
+        )
 
-    # 🧹 STEP 3: DELETE ALL QUESTION MESSAGES
+    # Question messages
     for msg_id in play.get("question_message_ids", []):
-        try:
-            await context.bot.delete_message(
+        delete_tasks.append(
+            context.bot.delete_message(
                 chat_id=user_id,
                 message_id=msg_id
             )
-        except Exception:
-            pass
+        )
 
-    # 🧹 STEP 4: FINAL CLEANUP
+    # Warning message (if exists)
+    warning_id = play.get("warning_message_id")
+    if warning_id:
+        delete_tasks.append(
+            context.bot.delete_message(
+                chat_id=user_id,
+                message_id=warning_id
+            )
+        )
+
+    if delete_tasks:
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+    # =========================
+    # 🧼 STEP 3: CLEAN MEMORY
+    # =========================
     play.clear()
     context.user_data.pop("play", None)
     context.user_data.pop("play_quiz_id", None)
@@ -4676,26 +4885,23 @@ async def finish_quiz(user_id, context):
                     print("⚠️ Leaderboard update failed:", e)
 
     # =========================
-    # 🧹 CLEAN PREVIOUS QUIZ MESSAGES
+    # 🧹 INSTANT BULK DELETE
     # =========================
 
+    delete_tasks = []
+
     for msg_id in play.get("question_message_ids", []):
-        try:
-            await context.bot.delete_message(
-                chat_id=user_id,
-                message_id=msg_id
-            )
-        except Exception:
-            pass
+        delete_tasks.append(
+            context.bot.delete_message(chat_id=user_id, message_id=msg_id)
+        )
 
     for timer_msg_id in play.get("timer_message_ids", []):
-        try:
-            await context.bot.delete_message(
-                chat_id=user_id,
-                message_id=timer_msg_id
-            )
-        except Exception:
-            pass
+        delete_tasks.append(
+            context.bot.delete_message(chat_id=user_id, message_id=timer_msg_id)
+        )
+
+    if delete_tasks:
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
 
     # =========================
     # 📘 LOAD QUIZ META (READ ONLY – NO LOCK NEEDED)
@@ -5209,14 +5415,11 @@ async def force_stop_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # =========================
     answered_questions = play.get("index", 0)
     MIN_REQUIRED = 3
-
     leaderboard_key = context.user_data.get("leaderboard_key")
 
-    # Only count score if user answered enough questions
     if answered_questions >= MIN_REQUIRED and leaderboard_key:
         GROUP_LEADERBOARDS.setdefault(leaderboard_key, {})
 
-        # Save score only once (MEMORY)
         if user_id not in GROUP_LEADERBOARDS[leaderboard_key]:
 
             # 1️⃣ Save to MEMORY
@@ -5225,7 +5428,7 @@ async def force_stop_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "score": play["score"],
             }
 
-            # 2️⃣ Save to DATABASE (persistent)
+            # 2️⃣ Save to DATABASE
             try:
                 async with DB_LOCK:
                     cur.execute("""
@@ -5248,48 +5451,59 @@ async def force_stop_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 print("⚠️ Leaderboard update failed on stop:", e)
 
-    # 🛑 Mark quiz as ended
+    # =========================
+    # 🛑 LOCK QUIZ STATE
+    # =========================
     play["locked"] = True
     play["finished"] = True
     play["ended"] = True
 
-    # ⛔ Cancel timer task safely
+    # ⛔ Cancel timer safely
     task = play.get("timer_task")
     current = asyncio.current_task()
     if task and task is not current:
         task.cancel()
     play["timer_task"] = None
 
-    # 🧹 Delete timer messages
-    for msg_id in play.get("timer_message_ids", []):
-        try:
-            await context.bot.delete_message(user_id, msg_id)
-        except:
-            pass
+    # =========================
+    # 🧹 INSTANT BULK DELETE
+    # =========================
+    delete_tasks = []
 
-    # 🧹 Delete question messages
+    # Question messages
     for msg_id in play.get("question_message_ids", []):
-        try:
-            await context.bot.delete_message(user_id, msg_id)
-        except:
-            pass
+        delete_tasks.append(
+            context.bot.delete_message(chat_id=user_id, message_id=msg_id)
+        )
 
-    # 🧹 Delete warning message
+    # Timer messages
+    for msg_id in play.get("timer_message_ids", []):
+        delete_tasks.append(
+            context.bot.delete_message(chat_id=user_id, message_id=msg_id)
+        )
+
+    # Warning message
     warning_id = play.get("warning_message_id")
     if warning_id:
-        try:
-            await context.bot.delete_message(user_id, warning_id)
-        except:
-            pass
+        delete_tasks.append(
+            context.bot.delete_message(chat_id=user_id, message_id=warning_id)
+        )
 
-    # 🧹 FULL CLEANUP
+    if delete_tasks:
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+    # =========================
+    # 🧼 CLEAN MEMORY
+    # =========================
     play.clear()
     context.user_data.pop("play", None)
     context.user_data.pop("play_quiz_id", None)
 
+    # =========================
     # ✅ Confirmation (auto-clean)
+    # =========================
     msg = await query.message.reply_text("🛑 Quiz stopped. You may continue.")
-    await asyncio.sleep(2)
+    await asyncio.sleep(1.5)
     try:
         await msg.delete()
     except:
@@ -6700,6 +6914,108 @@ async def cancel_add_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🚫 Do NOT redraw anything
     # 🚫 Do NOT send Home
 
+async def duplicate_create_anyway(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+
+    new_text = context.user_data.get("pending_duplicate_text")
+    if not new_text:
+        return
+
+    # Save question text
+    context.user_data["new_question"]["text"] = new_text
+    context.user_data.pop("pending_duplicate_text", None)
+
+    # Clean warning message
+    try:
+        await query.message.delete()
+    except:
+        pass
+
+    context.user_data["add_q_state"] = "NEW_Q_IMAGE"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ Skip image", callback_data="SKIP_Q_IMAGE")]
+    ])
+
+    msg = await context.bot.send_message(
+        chat_id,
+        "🖼 Send image for this question:",
+        reply_markup=keyboard
+    )
+
+    context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
+
+async def duplicate_edit_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+    delete_tasks = []
+
+    # 1️⃣ Delete duplicate warning message
+    delete_tasks.append(
+        context.bot.delete_message(chat_id, query.message.message_id)
+    )
+
+    # 2️⃣ Delete user's previous question text
+    user_msg_id = context.user_data.get("last_user_question_msg_id")
+    if user_msg_id:
+        delete_tasks.append(
+            context.bot.delete_message(chat_id, user_msg_id)
+        )
+
+    if delete_tasks:
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+    # Reset state to allow retyping
+    context.user_data["add_q_state"] = "NEW_Q_TEXT"
+
+async def duplicate_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+    delete_tasks = []
+
+    # 1️⃣ Delete duplicate warning message
+    delete_tasks.append(
+        context.bot.delete_message(chat_id, query.message.message_id)
+    )
+
+    # 2️⃣ Delete user's question message
+    user_msg_id = context.user_data.get("last_user_question_msg_id")
+    if user_msg_id:
+        delete_tasks.append(
+            context.bot.delete_message(chat_id, user_msg_id)
+        )
+
+    # 3️⃣ Delete initial "Create Question" prompt
+    prompt_id = context.user_data.get("create_q_prompt_msg_id")
+    if prompt_id:
+        delete_tasks.append(
+            context.bot.delete_message(chat_id, prompt_id)
+        )
+
+    # 4️⃣ Delete any flow messages
+    for mid in context.user_data.get("question_flow_msgs", []):
+        delete_tasks.append(
+            context.bot.delete_message(chat_id, mid)
+        )
+
+    if delete_tasks:
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+    # 🧹 Clear all related state
+    context.user_data.pop("pending_duplicate_text", None)
+    context.user_data.pop("new_question", None)
+    context.user_data.pop("add_q_state", None)
+    context.user_data.pop("question_flow_msgs", None)
+    context.user_data.pop("last_user_question_msg_id", None)
+    context.user_data.pop("create_q_prompt_msg_id", None)
+
 # =========================
 # HANDLERS
 # =========================
@@ -6720,6 +7036,9 @@ app.add_handler(CommandHandler("post", post_quiz_command))
 # =========================
 app.add_handler(CallbackQueryHandler(global_quiz_guard), group=-1)
 # =========================
+app.add_handler(CallbackQueryHandler(duplicate_create_anyway, pattern="^DUP_CREATE_ANYWAY$"))
+app.add_handler(CallbackQueryHandler(duplicate_edit_question, pattern="^DUP_EDIT$"))
+app.add_handler(CallbackQueryHandler(duplicate_cancel, pattern="^DUP_CANCEL$"))
 app.add_handler(CallbackQueryHandler(cancel_add_folder, pattern="^CANCEL_ADD_FOLDER$"))
 app.add_handler(CallbackQueryHandler(cancel_create_quiz, pattern="^CANCEL_CREATE_QUIZ$"))
 app.add_handler(CallbackQueryHandler(move_folder_prev, pattern="^MOVE_FOLDER_PREV$"))
@@ -6839,7 +7158,7 @@ async def global_error_handler(update, context):
 
 app.add_error_handler(global_error_handler)
 
-print("✅ TeleQuiz Clone is running...")
+print("✅ TeleQuiz is running...")
 app.run_polling()
 ####################################################################################################################################################################################################################################
 # CODE BY PARTS - END OF CODE
