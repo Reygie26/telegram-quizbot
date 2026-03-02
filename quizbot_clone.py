@@ -4173,16 +4173,16 @@ async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
 
-    quiz_id = context.user_data.get("active_quiz_id")
-    if not quiz_id:
-        await flash_message(context.bot, query.message.chat_id, "❌ No quiz selected.")
+    try:
+        quiz_id = query.data.split("|", 1)[1]
+    except:
+        await flash_message(context.bot, query.message.chat_id, "❌ Invalid quiz.")
         return
 
-    # 🔑 Generate a unique token every time
+    # 🔑 Generate unique token
     token = secrets.token_urlsafe(8)
     timestamp = int(time.time())
 
-    # 💾 Save token safely (WRITE LOCK)
     try:
         async with DB_LOCK:
             cur.execute(
@@ -4198,17 +4198,15 @@ async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await flash_message(context.bot, query.message.chat_id, "❌ Failed to generate post link.")
         return
 
-    # 📤 Send unique post command to admin
     msg = await query.message.reply_text(
         f"/post {quiz_id}_{token}"
     )
 
-    # ⏳ Auto-delete the message after 5 seconds
     async def delete_later():
         await asyncio.sleep(5)
         try:
             await msg.delete()
-        except Exception:
+        except:
             pass
 
     asyncio.create_task(delete_later())
@@ -5966,7 +5964,7 @@ async def show_quiz_action_menu_by_id(chat_id, message_id, context):
     keyboard = [
         [
             InlineKeyboardButton("▶️ Start this Quiz", callback_data="START_THIS"),
-            InlineKeyboardButton("📤 Post this Quiz", callback_data="POST_QUIZ"),
+            InlineKeyboardButton("📤 Post this Quiz", callback_data=f"POST_QUIZ|{quiz_id}"),
         ],
         [
             InlineKeyboardButton("✏️ Edit this Quiz", callback_data="EDIT_THIS"),
@@ -7078,7 +7076,7 @@ app.add_handler(CallbackQueryHandler(cancel_edit_question_image, pattern="^CANCE
 app.add_handler(CallbackQueryHandler(shuffle_back, pattern="^SHUFFLE_BACK$"))
 app.add_handler(CallbackQueryHandler(resume_quiz, pattern="^RESUME_QUIZ$"))
 app.add_handler(CallbackQueryHandler(force_stop_quiz, pattern="^FORCE_STOP_QUIZ$"))
-app.add_handler(CallbackQueryHandler(post_quiz_to_group, pattern="^POST_QUIZ$"))
+app.add_handler(CallbackQueryHandler(post_quiz_to_group, pattern="^POST_QUIZ\\|"))
 app.add_handler(CallbackQueryHandler(cancel_create_question, pattern="^CANCEL_CREATE_QUESTION$"))
 app.add_handler(CallbackQueryHandler(qb_move_question, pattern="^QB_MOVE$"))
 app.add_handler(CallbackQueryHandler(qb_move_apply, pattern="^QB_MOVE_TO\\|"))
@@ -7165,4 +7163,5 @@ app.run_polling()
 ####################################################################################################################################################################################################################################
 # CODE BY PARTS - END OF CODE
 ####################################################################################################################################################################################################################################
+
 
