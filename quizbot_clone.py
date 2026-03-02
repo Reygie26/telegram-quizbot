@@ -7018,7 +7018,7 @@ app.add_handler(CommandHandler("post", post_quiz_command))
 # =========================
 # Must Stay on Top of other CallbackQueryHandler
 # =========================
-app.add_handler(CallbackQueryHandler(global_quiz_guard), group=-1)
+# app.add_handler(CallbackQueryHandler(global_quiz_guard), group=-1)
 # =========================
 app.add_handler(CallbackQueryHandler(duplicate_create_anyway, pattern="^DUP_CREATE_ANYWAY$"))
 app.add_handler(CallbackQueryHandler(duplicate_edit_question, pattern="^DUP_EDIT$"))
@@ -7147,6 +7147,7 @@ app.run_polling()
 ####################################################################################################################################################################################################################################
 # CODE BY PARTS - END OF CODE
 ####################################################################################################################################################################################################################################
+
 
 
 
