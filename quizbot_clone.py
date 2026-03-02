@@ -3885,7 +3885,7 @@ async def show_leaderboard(chat_id, quiz_id, bot):
         parse_mode="Markdown"
     )
 
-async def send_quiz_to_group(chat_id, quiz_id, token, context):
+async def send_quiz_to_group(chat_id, quiz_id, context, token):
     # =========================
     # BUILD LEADERBOARD KEY
     # =========================
@@ -4173,16 +4173,16 @@ async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
 
-    try:
-        quiz_id = query.data.split("|", 1)[1]
-    except:
-        await flash_message(context.bot, query.message.chat_id, "❌ Invalid quiz.")
+    quiz_id = context.user_data.get("active_quiz_id")
+    if not quiz_id:
+        await flash_message(context.bot, query.message.chat_id, "❌ No quiz selected.")
         return
 
-    # 🔑 Generate unique token
+    # 🔑 Generate a unique token every time
     token = secrets.token_urlsafe(8)
     timestamp = int(time.time())
 
+    # 💾 Save token safely (WRITE LOCK)
     try:
         async with DB_LOCK:
             cur.execute(
@@ -4198,45 +4198,50 @@ async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await flash_message(context.bot, query.message.chat_id, "❌ Failed to generate post link.")
         return
 
+    # 📤 Send unique post command to admin
     msg = await query.message.reply_text(
         f"/post {quiz_id}_{token}"
     )
 
+    # ⏳ Auto-delete the message after 5 seconds
     async def delete_later():
         await asyncio.sleep(5)
         try:
             await msg.delete()
-        except:
+        except Exception:
             pass
 
     asyncio.create_task(delete_later())
 
 async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     if not update.message:
         return
-
-    user_id = update.effective_user.id
-    print("User ID:", user_id)
-    print("OWNER_USER_ID:", OWNER_USER_ID)
 
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
         return
 
+    user_id = update.effective_user.id
     args = context.args
+
     if not args:
         await update.message.reply_text("❌ Missing quiz post token.")
         return
 
     payload = args[0]
 
+    # =========================
+    # PARSE: /post <quiz_id>_<token>
+    # =========================
     try:
         quiz_id, token = payload.rsplit("_", 1)
     except ValueError:
         await update.message.reply_text("❌ Invalid post command format.")
         return
 
+    # =========================
+    # OWNER-ONLY PROTECTION
+    # =========================
     if user_id != OWNER_USER_ID:
         warn_msg = await update.message.reply_text(
             "❌ Only the bot owner can post quizzes."
@@ -4256,6 +4261,9 @@ async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(delete_later())
         return
 
+    # =========================
+    # TOKEN VALIDATION
+    # =========================
     cur.execute(
         """
         SELECT token
@@ -4285,9 +4293,17 @@ async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(delete_later())
         return
 
-    # ✅ Correct parameter order
-    await send_quiz_to_group(chat.id, quiz_id, token, context)
+    # =========================
+    # POST QUIZ TO GROUP
+    # =========================
+    await send_quiz_to_group(chat.id, quiz_id, context, token)
 
+    # =========================
+    # MARK TOKEN AS USED FOR POSTING (OPTIONAL)
+    # =========================
+    # ⚠️ DO NOT DELETE TOKEN — it is still needed for PLAY links
+    # If you want to prevent re-posting, add a `used_for_post` column later
+    # 🧹 Clean up the /post command message in group
     try:
         await update.message.delete()
     except:
@@ -5948,7 +5964,7 @@ async def show_quiz_action_menu_by_id(chat_id, message_id, context):
     keyboard = [
         [
             InlineKeyboardButton("▶️ Start this Quiz", callback_data="START_THIS"),
-            InlineKeyboardButton("📤 Post this Quiz", callback_data=f"POST_QUIZ|{quiz_id}"),
+            InlineKeyboardButton("📤 Post this Quiz", callback_data="POST_QUIZ"),
         ],
         [
             InlineKeyboardButton("✏️ Edit this Quiz", callback_data="EDIT_THIS"),
@@ -7003,7 +7019,7 @@ async def duplicate_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 # HANDLERS
 # =========================
-load_owner_from_db()
+# load_owner_from_db()
 ensure_default_folder()
 ensure_default_qb_folder()
 ensure_indexes()
@@ -7018,7 +7034,7 @@ app.add_handler(CommandHandler("post", post_quiz_command))
 # =========================
 # Must Stay on Top of other CallbackQueryHandler
 # =========================
-# app.add_handler(CallbackQueryHandler(global_quiz_guard), group=-1)
+app.add_handler(CallbackQueryHandler(global_quiz_guard), group=-1)
 # =========================
 app.add_handler(CallbackQueryHandler(duplicate_create_anyway, pattern="^DUP_CREATE_ANYWAY$"))
 app.add_handler(CallbackQueryHandler(duplicate_edit_question, pattern="^DUP_EDIT$"))
@@ -7060,7 +7076,7 @@ app.add_handler(CallbackQueryHandler(cancel_edit_question_image, pattern="^CANCE
 app.add_handler(CallbackQueryHandler(shuffle_back, pattern="^SHUFFLE_BACK$"))
 app.add_handler(CallbackQueryHandler(resume_quiz, pattern="^RESUME_QUIZ$"))
 app.add_handler(CallbackQueryHandler(force_stop_quiz, pattern="^FORCE_STOP_QUIZ$"))
-app.add_handler(CallbackQueryHandler(post_quiz_to_group, pattern="^POST_QUIZ\\|"))
+app.add_handler(CallbackQueryHandler(post_quiz_to_group, pattern="^POST_QUIZ$"))
 app.add_handler(CallbackQueryHandler(cancel_create_question, pattern="^CANCEL_CREATE_QUESTION$"))
 app.add_handler(CallbackQueryHandler(qb_move_question, pattern="^QB_MOVE$"))
 app.add_handler(CallbackQueryHandler(qb_move_apply, pattern="^QB_MOVE_TO\\|"))
@@ -7142,14 +7158,9 @@ async def global_error_handler(update, context):
 
 app.add_error_handler(global_error_handler)
 
-print("✅ TeleQuiz is running. Update Fix to: Post this Quiz ")
+print("✅ TeleQuiz is running...")
 app.run_polling()
 ####################################################################################################################################################################################################################################
 # CODE BY PARTS - END OF CODE
 ####################################################################################################################################################################################################################################
-
-
-
-
-
 
