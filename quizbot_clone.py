@@ -4214,6 +4214,8 @@ async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     asyncio.create_task(delete_later())
 
 async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print("User ID:", user_id)
+    print("OWNER_USER_ID:", OWNER_USER_ID)
     if not update.message:
         return
 
@@ -7019,7 +7021,7 @@ async def duplicate_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 # HANDLERS
 # =========================
-# load_owner_from_db()
+load_owner_from_db()
 ensure_default_folder()
 ensure_default_qb_folder()
 ensure_indexes()
@@ -7163,3 +7165,4 @@ app.run_polling()
 ####################################################################################################################################################################################################################################
 # CODE BY PARTS - END OF CODE
 ####################################################################################################################################################################################################################################
+
