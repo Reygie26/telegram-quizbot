@@ -4212,36 +4212,31 @@ async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     asyncio.create_task(delete_later())
 
 async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("User ID:", user_id)
-    print("OWNER_USER_ID:", OWNER_USER_ID)
+
     if not update.message:
         return
+
+    user_id = update.effective_user.id
+    print("User ID:", user_id)
+    print("OWNER_USER_ID:", OWNER_USER_ID)
 
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
         return
 
-    user_id = update.effective_user.id
     args = context.args
-
     if not args:
         await update.message.reply_text("❌ Missing quiz post token.")
         return
 
     payload = args[0]
 
-    # =========================
-    # PARSE: /post <quiz_id>_<token>
-    # =========================
     try:
         quiz_id, token = payload.rsplit("_", 1)
     except ValueError:
         await update.message.reply_text("❌ Invalid post command format.")
         return
 
-    # =========================
-    # OWNER-ONLY PROTECTION
-    # =========================
     if user_id != OWNER_USER_ID:
         warn_msg = await update.message.reply_text(
             "❌ Only the bot owner can post quizzes."
@@ -4261,9 +4256,6 @@ async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(delete_later())
         return
 
-    # =========================
-    # TOKEN VALIDATION
-    # =========================
     cur.execute(
         """
         SELECT token
@@ -4293,17 +4285,9 @@ async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(delete_later())
         return
 
-    # =========================
-    # POST QUIZ TO GROUP
-    # =========================
-    await send_quiz_to_group(chat.id, quiz_id, context, token)
+    # ✅ Correct parameter order
+    await send_quiz_to_group(chat.id, quiz_id, token, context)
 
-    # =========================
-    # MARK TOKEN AS USED FOR POSTING (OPTIONAL)
-    # =========================
-    # ⚠️ DO NOT DELETE TOKEN — it is still needed for PLAY links
-    # If you want to prevent re-posting, add a `used_for_post` column later
-    # 🧹 Clean up the /post command message in group
     try:
         await update.message.delete()
     except:
@@ -7163,5 +7147,6 @@ app.run_polling()
 ####################################################################################################################################################################################################################################
 # CODE BY PARTS - END OF CODE
 ####################################################################################################################################################################################################################################
+
 
 
