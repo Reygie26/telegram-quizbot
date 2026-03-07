@@ -575,6 +575,93 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_database_menu(update.message, context)
         return
 
+    # ================= DB RENAME FOLDER =================
+    if state == "DB_RENAME_FOLDER":
+        chat_id = update.effective_chat.id
+        user_msg_id = update.message.message_id
+
+        old_name = context.user_data.get("db_rename_folder_name")
+        new_name = text.strip()
+
+        # ❌ Empty name
+        if not new_name:
+            await update.message.reply_text("❌ Folder name cannot be empty.")
+            return
+
+        # ❌ Default is reserved
+        if new_name.lower() == "default":
+            await update.message.reply_text("❌ You cannot rename a folder to Default.")
+            return
+
+        # ❌ Check duplicate (case-insensitive)
+        cur.execute(
+            """
+            SELECT 1
+            FROM question_bank_folders
+            WHERE owner_id=?
+              AND LOWER(name) = LOWER(?)
+            """,
+            (OWNER_USER_ID, new_name)
+        )
+        if cur.fetchone():
+            await update.message.reply_text("❌ A folder with this name already exists.")
+            return
+
+        # ✅ Rename folder
+        try:
+            async with DB_LOCK:
+                cur.execute(
+                    "UPDATE question_bank_folders SET name=? WHERE owner_id=? AND name=?",
+                    (new_name, OWNER_USER_ID, old_name)
+                )
+                conn.commit()
+        except Exception as e:
+            print("⚠️ DB folder rename failed:", e)
+            await flash_message(context.bot, chat_id, "❌ Rename failed.")
+            return
+
+        # 🧹 Delete prompt message
+        prompt_id = context.user_data.pop("db_rename_prompt_id", None)
+        if prompt_id:
+            try:
+                await context.bot.delete_message(chat_id, prompt_id)
+            except:
+                pass
+
+        # 🧹 Delete user's typed message
+        try:
+            await context.bot.delete_message(chat_id, user_msg_id)
+        except:
+            pass
+
+        # 🧹 Clear state
+        context.user_data.pop("state", None)
+        context.user_data.pop("db_rename_folder_name", None)
+
+        # ✅ Update db_folder_name so the refreshed view shows the new name
+        context.user_data["db_folder_name"] = new_name
+
+        # 🔔 Confirmation
+        confirm_msg = await context.bot.send_message(
+            chat_id,
+            f"✅ Folder renamed to **{new_name}**.",
+            parse_mode="Markdown"
+        )
+
+        await asyncio.sleep(2)
+
+        try:
+            await confirm_msg.delete()
+        except:
+            pass
+
+        # 🔁 Refresh the folder question list with new name
+        await show_db_questions_from_message(
+            context.user_data.get("db_rename_menu_message"),
+            context
+        )
+        return
+
     # ================= ADD QUESTION FLOW =================
     q_state = context.user_data.get("add_q_state")
 
@@ -601,7 +688,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.delete_message(chat_id, prompt_id)
             except:
                 pass
-    
+
         # Exit edit mode
         context.user_data.pop("edit_q_field", None)
 
@@ -639,32 +726,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data.pop("edit_q_field", None)
 
-        # =========================
-        # STEP 1 — Confirmation
-        # =========================
         confirm_msg = await update.message.reply_text("✅ Question text updated.")
 
         await asyncio.sleep(2)
 
         chat_id = update.effective_chat.id
 
-        # =========================
-        # STEP 2 — Cleanup
-        # =========================
-
-        # Delete confirmation
         try:
             await confirm_msg.delete()
         except:
             pass
 
-        # Delete user's typed message
         try:
             await update.message.delete()
         except:
             pass
 
-        # Delete "Send new question text" prompt
         prompt_id = context.user_data.pop("edit_text_prompt_id", None)
         if prompt_id:
             try:
@@ -672,9 +749,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
 
-        # =========================
-        # STEP 3 — Replace preview safely
-        # =========================
         chat_id = update.effective_chat.id
         await rebuild_question_preview(chat_id, context)
 
@@ -690,7 +764,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_text = text.strip()
         similar_matches = []
 
-        # 🔎 Load existing questions
         cur.execute("SELECT id, question FROM question_bank")
         existing_questions = cur.fetchall()
 
@@ -701,10 +774,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 existing_text.lower()
             ).ratio()
 
-            if similarity >= 0.80:  # 🔥 Adjust threshold if needed
+            if similarity >= 0.80:
                 similar_matches.append((similarity, existing_text))
 
-        # Sort by highest similarity
         similar_matches.sort(reverse=True, key=lambda x: x[0])
 
         if similar_matches:
@@ -725,7 +797,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]
             ])
 
-            # Store pending question text
             context.user_data["pending_duplicate_text"] = new_text
             context.user_data["add_q_state"] = "CONFIRM_DUPLICATE_Q"
 
@@ -738,7 +809,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
             return
 
-        # ✅ No duplicate → continue normally
         context.user_data["new_question"]["text"] = new_text
         context.user_data["add_q_state"] = "NEW_Q_IMAGE"
 
@@ -816,9 +886,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             flow_msgs.append(next_msg.message_id)
             return
 
-        # =========================
-        # AFTER OPTION 4
-        # =========================
         context.user_data["edit_q_field"] = "OPTIONS_CORRECT"
 
         new_opts = context.user_data["edit_options"]
@@ -889,7 +956,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ You cannot create a folder named Default.")
             return
 
-        # Check duplicate
         cur.execute(
             "SELECT 1 FROM folders WHERE owner_id=? AND name=?",
             (OWNER_USER_ID, folder_name)
@@ -910,7 +976,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await flash_message(context.bot, chat_id, "❌ Folder creation failed.")
             return
 
-        # 🧹 DELETE prompt message
         prompt_id = context.user_data.pop("add_folder_prompt_id", None)
         if prompt_id:
             try:
@@ -918,31 +983,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
 
-        # 🧹 DELETE user message
         try:
             await context.bot.delete_message(chat_id, user_msg_id)
         except:
             pass
 
-        # ✅ Send confirmation
         confirm_msg = await context.bot.send_message(
             chat_id,
             f'✅ Folder "{folder_name}" created.'
         )
 
-        # 🧹 Clear state
         context.user_data["state"] = None
 
-        # ⏳ Wait 2 seconds
         await asyncio.sleep(2)
 
-        # 🧹 Delete confirmation
         try:
             await confirm_msg.delete()
         except:
             pass
 
-        # 🔁 Refresh folder list CLEANLY (edit-based)
         await show_quiz_folders(
             context.user_data.get("folder_screen_message_object"),
             context
@@ -961,7 +1020,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ You cannot rename a folder to Default.")
             return
 
-        # Check if new name already exists
         cur.execute(
             "SELECT 1 FROM folders WHERE owner_id=? AND name=?",
             (OWNER_USER_ID, new)
@@ -972,25 +1030,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             async with DB_LOCK:
-                # Rename folder in folders table
                 cur.execute(
                     "UPDATE folders SET name=? WHERE owner_id=? AND name=?",
                     (new, OWNER_USER_ID, old)
                 )
-
-                # Rename folder in quizzes table
                 cur.execute(
                     "UPDATE quizzes SET folder=? WHERE owner_id=? AND folder=?",
                     (new, OWNER_USER_ID, old)
                 )
-
                 conn.commit()
         except Exception as e:
             print("⚠️ Rename failed:", e)
             await flash_message(context.bot, chat_id, "❌ Rename failed.")
             return
 
-        # 🧹 DELETE rename prompt
         prompt_id = context.user_data.pop("rename_prompt_msg_id", None)
         if prompt_id:
             try:
@@ -998,17 +1051,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
 
-        # 🧹 DELETE user's typed message
         try:
             await context.bot.delete_message(chat_id, user_msg_id)
         except:
             pass
 
-        # 🧹 Clear state
         context.user_data["state"] = None
         context.user_data.pop("rename_folder", None)
 
-        # 🔁 Refresh folder list cleanly (edit-based)
         await show_quiz_folders(
             context.user_data.get("folder_screen_message_object"),
             context
@@ -1039,11 +1089,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await flash_message(context.bot, chat_id, "❌ Failed to create quiz.")
             return
 
-        # 🔑 Set active quiz
         context.user_data["active_quiz_id"] = context.user_data["quiz_id"]
         context.user_data["state"] = None
 
-        # 🧹 STEP 1 — Delete prompt message
         prompt_id = context.user_data.pop("create_quiz_prompt_id", None)
         if prompt_id:
             try:
@@ -1051,30 +1099,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
 
-        # 🧹 STEP 2 — Delete user's typed title
         try:
             await context.bot.delete_message(chat_id, user_msg_id)
         except:
             pass
 
-        # ✅ STEP 3 — Send confirmation
-        confirm_msg = await context.bot.send_message(
-            chat_id,
-            "✅ Quiz created."
-        )
+        confirm_msg = await context.bot.send_message(chat_id, "✅ Quiz created.")
 
-        # ⏳ STEP 4 — Wait 2 seconds
         await asyncio.sleep(2)
 
-        # 🧹 STEP 5 — Delete confirmation
         try:
             await confirm_msg.delete()
         except:
             pass
 
-        # 🚀 STEP 6 — Open Quiz Action Menu cleanly
         overview_id = context.user_data.get("quiz_overview_msg_id")
-
         if overview_id:
             await show_quiz_action_menu_by_id(
                 chat_id=chat_id,
@@ -1090,10 +1129,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not quiz_id:
             return
 
-        # 🔑 Store user message ID (new title)
         user_msg_id = update.message.message_id
 
-        # Update title
         cur.execute(
             "UPDATE quizzes SET title=? WHERE quiz_id=?",
             (text, quiz_id)
@@ -1102,34 +1139,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data["state"] = None
 
-        # 🔔 Temporary confirmation
         confirm_msg = await update.message.reply_text("✅ Title updated.")
 
-        # =========================
-        # 🧹 CLEANUP UI MESSAGES
-        # =========================
         prompt_id = context.user_data.pop("edit_title_prompt_id", None)
-
-        # Delete "Send new title" message
         if prompt_id:
             try:
                 await context.bot.delete_message(update.effective_chat.id, prompt_id)
             except:
                 pass
 
-        # Delete user's typed title
         try:
             await context.bot.delete_message(update.effective_chat.id, user_msg_id)
         except:
             pass
 
-        # Delete "Title updated" message
         try:
             await confirm_msg.delete()
         except:
             pass
 
-        # ✅ Show updated quiz overview ONLY
         overview_id = context.user_data.get("quiz_overview_msg_id")
         if overview_id:
             await show_quiz_action_menu_by_id(
@@ -1146,10 +1174,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not quiz_id:
             return
 
-        # 🔑 Store user message ID (new description)
         user_msg_id = update.message.message_id
 
-        # Update description
         if text.upper() == "CLEAR":
             cur.execute(
                 "UPDATE quizzes SET description=NULL WHERE quiz_id=?",
@@ -1162,18 +1188,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         conn.commit()
 
-        # Exit edit state
         context.user_data["state"] = None
 
-        # 🔔 Temporary confirmation
         confirm_msg = await update.message.reply_text("✅ Description updated.")
 
-        # =========================
-        # 🧹 CLEANUP UI MESSAGES
-        # =========================
         prompt_id = context.user_data.pop("edit_desc_prompt_id", None)
-
-        # Delete "Send new Quiz description" prompt
         if prompt_id:
             try:
                 await context.bot.delete_message(
@@ -1183,7 +1202,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
 
-        # Delete user's typed description
         try:
             await context.bot.delete_message(
                 chat_id=update.effective_chat.id,
@@ -1192,17 +1210,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-        # Delete "Description updated" confirmation
         try:
             await confirm_msg.delete()
         except:
             pass
 
-        # =========================
-        # ✅ REFRESH QUIZ OVERVIEW (SAFE & CORRECT)
-        # =========================
         overview_id = context.user_data.get("quiz_overview_msg_id")
-
         if overview_id:
             await show_quiz_action_menu_by_id(
                 chat_id=update.effective_chat.id,
@@ -1442,7 +1455,6 @@ async def show_database_menu(message, context):
 async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     # Only update folder_name and reset page when triggered by DB_OPEN
     if query.data.startswith("DB_OPEN|"):
         folder_name = query.data.split("|", 1)[1]
@@ -1450,16 +1462,12 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["db_q_page"] = 0
     else:
         folder_name = context.user_data.get("db_folder_name")
-
     if not folder_name:
         await query.answer("❌ Folder context lost.", show_alert=True)
         return
-
     context.user_data["preview_mode"] = "DATABASE"
-
     PER_PAGE = 10
     page = context.user_data.get("db_q_page", 0)
-
     # Resolve folder_id
     cur.execute(
         """
@@ -1473,9 +1481,7 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not row:
         await flash_message(context.bot, query.message.chat_id, "❌ Folder not found.")
         return
-
     folder_id = row[0]
-
     # Load all questions in this folder
     cur.execute(
         """
@@ -1487,19 +1493,14 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (folder_id,)
     )
     rows = cur.fetchall()
-
     keyboard = []
-
     # Empty folder case
     if not rows:
         if folder_name != "Default":
             keyboard.append([
-                InlineKeyboardButton(
-                    "📥 Move Questions In",
-                    callback_data=f"DB_MOVE_IN|{folder_name}"
-                )
+                InlineKeyboardButton("✏️ Rename", callback_data=f"DB_RENAME_FOLDER|{folder_name}"),
+                InlineKeyboardButton("📥 Move Questions In", callback_data=f"DB_MOVE_IN|{folder_name}")
             ])
-
         if folder_name != "Default":
             keyboard.append([
                 InlineKeyboardButton("🗑 Delete Folder", callback_data=f"DB_DELETE_FOLDER|{folder_name}"),
@@ -1509,30 +1510,25 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append([
                 InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
             ])
-
         await query.message.edit_text(
             f"📁 **{folder_name}**\n\n_No questions in this folder yet._",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
         return
-
     # Pagination
     total = len(rows)
     pages = (total - 1) // PER_PAGE + 1
     page = max(0, min(page, pages - 1))
     context.user_data["db_q_page"] = page
-
     start = page * PER_PAGE
     end = start + PER_PAGE
     page_rows = rows[start:end]
-
     # Question buttons
     for qid, text in page_rows:
         keyboard.append([
             InlineKeyboardButton(text[:50], callback_data=f"Q_{qid}")
         ])
-
     # Pagination controls
     if pages > 1:
         nav = []
@@ -1542,16 +1538,12 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if page < pages - 1:
             nav.append(InlineKeyboardButton("Next ▶", callback_data="DB_Q_NEXT"))
         keyboard.append(nav)
-
-    # Move In button (non-Default only)
+    # Rename + Move In row (non-Default only)
     if folder_name != "Default":
         keyboard.append([
-            InlineKeyboardButton(
-                "📥 Move Questions In",
-                callback_data=f"DB_MOVE_IN|{folder_name}"
-            )
+            InlineKeyboardButton("✏️ Rename", callback_data=f"DB_RENAME_FOLDER|{folder_name}"),
+            InlineKeyboardButton("📥 Move Questions In", callback_data=f"DB_MOVE_IN|{folder_name}")
         ])
-
     # Delete + Back row
     if folder_name != "Default":
         keyboard.append([
@@ -1562,7 +1554,6 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([
             InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
         ])
-
     await query.message.edit_text(
         f"📁 **{folder_name}**\n\nSelect a question:",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -3532,7 +3523,6 @@ def build_group_message_link(chat_id: int, message_id: int) -> str:
 
 async def play_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-
     try:
         await query.answer()
     except Exception:
@@ -3544,6 +3534,34 @@ async def play_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 🔒 Lock immediately
     play["locked"] = True
+
+    # 📌 Parse answer
+    chosen_index = int(query.data.replace("PLAY_ANSWER_", ""))
+    q = play["questions"][play["index"]]
+    correct_index = q["correct"]
+
+    # 🎨 Build feedback buttons instantly
+    labels = ["A", "B", "C", "D"]
+    buttons = [[
+        InlineKeyboardButton(
+            f"{labels[i]}"
+            f"{' ✅' if i == correct_index else ' ❌' if i == chosen_index else ' ✖️'}",
+            callback_data="LOCKED"
+        )
+        for i in range(len(q["options"]))
+    ]]
+
+    # ⚡ UPDATE BUTTONS INSTANTLY — before anything else
+    try:
+        await query.message.edit_reply_markup(
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    except:
+        pass
+
+    # ✅ Score update
+    if chosen_index == correct_index:
+        play["score"] += 1
 
     # ⛔ CANCEL TIMER TASK
     task = play.get("timer_task")
@@ -3562,40 +3580,10 @@ async def play_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     play["timer_message_ids"] = []
 
-    # 📌 Parse answer
-    chosen_index = int(query.data.replace("PLAY_ANSWER_", ""))
-    q = play["questions"][play["index"]]
-    correct_index = q["correct"]
-
-    # ✅ Score update
-    if chosen_index == correct_index:
-        play["score"] += 1
-
-    # 🎨 Build feedback buttons (NO explanation inline button)
-    labels = ["A", "B", "C", "D"]
-
-    buttons = [[
-        InlineKeyboardButton(
-            f"{labels[i]}"
-            f"{' ✅' if i == correct_index else ' ❌' if i == chosen_index else ' ✖️'}",
-            callback_data="LOCKED"
-        )
-        for i in range(len(q["options"]))
-    ]]
-
-    # 🔒 Finalize UI
-    try:
-        await query.message.edit_reply_markup(
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-    except:
-        pass
-
     # =========================
     # 📖 SEND EXPLANATION AS TEXT (PERSISTENT)
     # =========================
     explanation = q.get("explanation")
-
     if explanation:
         try:
             safe_explanation = explanation
@@ -3604,13 +3592,11 @@ async def play_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=f"📖 *Explanation:*\n_{safe_explanation}_",
                 parse_mode="Markdown"
             )
-
             # 🔥 CRITICAL:
             # Add explanation message to bulk cleanup list
             play.setdefault("question_message_ids", []).append(
                 expl_msg.message_id
             )
-
         except:
             pass
 
@@ -6241,10 +6227,8 @@ async def show_db_questions_from_message(message, context):
     folder_name = context.user_data.get("db_folder_name")
     if not folder_name:
         return
-
     page = context.user_data.get("db_q_page", 0)
     PER_PAGE = 10
-
     # Resolve folder_id
     cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
@@ -6253,9 +6237,7 @@ async def show_db_questions_from_message(message, context):
     row = cur.fetchone()
     if not row:
         return
-
     folder_id = row[0]
-
     # Load questions
     cur.execute(
         """
@@ -6267,17 +6249,13 @@ async def show_db_questions_from_message(message, context):
         (folder_id,)
     )
     rows = cur.fetchall()
-
     keyboard = []
-
     # Empty folder case
     if not rows:
         if folder_name != "Default":
             keyboard.append([
-                InlineKeyboardButton(
-                    "📥 Move Questions In",
-                    callback_data=f"DB_MOVE_IN|{folder_name}"
-                )
+                InlineKeyboardButton("✏️ Rename", callback_data=f"DB_RENAME_FOLDER|{folder_name}"),
+                InlineKeyboardButton("📥 Move Questions In", callback_data=f"DB_MOVE_IN|{folder_name}")
             ])
         if folder_name != "Default":
             keyboard.append([
@@ -6294,22 +6272,18 @@ async def show_db_questions_from_message(message, context):
             parse_mode="Markdown"
         )
         return
-
     # Pagination
     total = len(rows)
     pages = (total - 1) // PER_PAGE + 1
     page = max(0, min(page, pages - 1))
     context.user_data["db_q_page"] = page
-
     start = page * PER_PAGE
     end = start + PER_PAGE
     page_rows = rows[start:end]
-
     for qid, text in page_rows:
         keyboard.append([
             InlineKeyboardButton(text[:50], callback_data=f"Q_{qid}")
         ])
-
     # Pagination controls
     if pages > 1:
         nav = []
@@ -6319,15 +6293,11 @@ async def show_db_questions_from_message(message, context):
         if page < pages - 1:
             nav.append(InlineKeyboardButton("Next ▶", callback_data="DB_Q_NEXT"))
         keyboard.append(nav)
-
     if folder_name != "Default":
         keyboard.append([
-            InlineKeyboardButton(
-                "📥 Move Questions In",
-                callback_data=f"DB_MOVE_IN|{folder_name}"
-            )
+            InlineKeyboardButton("✏️ Rename", callback_data=f"DB_RENAME_FOLDER|{folder_name}"),
+            InlineKeyboardButton("📥 Move Questions In", callback_data=f"DB_MOVE_IN|{folder_name}")
         ])
-
     if folder_name != "Default":
         keyboard.append([
             InlineKeyboardButton("🗑 Delete Folder", callback_data=f"DB_DELETE_FOLDER|{folder_name}"),
@@ -6337,7 +6307,6 @@ async def show_db_questions_from_message(message, context):
         keyboard.append([
             InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
         ])
-
     await message.edit_text(
         f"📁 **{folder_name}**\n\nSelect a question:",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -7564,6 +7533,27 @@ async def db_q_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["db_q_page"] = context.user_data.get("db_q_page", 0) + 1
     await show_db_questions(update, context)
 
+async def db_rename_folder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    folder_name = query.data.split("|", 1)[1]
+
+    context.user_data["state"] = "DB_RENAME_FOLDER"
+    context.user_data["db_rename_folder_name"] = folder_name
+    context.user_data["db_rename_menu_message"] = query.message
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"DB_OPEN|{folder_name}")]
+    ])
+
+    msg = await query.message.reply_text(
+        f"✏️ Send new name for folder:\n\n📁 {folder_name}",
+        reply_markup=keyboard
+    )
+
+    context.user_data["db_rename_prompt_id"] = msg.message_id
+
 # =========================
 # HANDLERS
 # =========================
@@ -7594,6 +7584,7 @@ app.add_handler(CommandHandler("post", post_quiz_command))
 # =========================
 app.add_handler(CallbackQueryHandler(global_quiz_guard), group=-1)
 # =========================
+app.add_handler(CallbackQueryHandler(db_rename_folder_start, pattern="^DB_RENAME_FOLDER\\|"))  # ← NEW
 app.add_handler(CallbackQueryHandler(db_delete_folder, pattern="^DB_DELETE_FOLDER\\|"))
 app.add_handler(CallbackQueryHandler(db_delete_folder_confirm, pattern="^DB_DELETE_FOLDER_CONFIRM$"))
 app.add_handler(CallbackQueryHandler(duplicate_create_anyway, pattern="^DUP_CREATE_ANYWAY$"))
@@ -7620,12 +7611,12 @@ app.add_handler(CallbackQueryHandler(mc_quiz_next, pattern="^MC_QUIZ_NEXT$"))
 app.add_handler(CallbackQueryHandler(mc_folder_prev, pattern="^MC_FOLDER_PREV$"))
 app.add_handler(CallbackQueryHandler(mc_folder_next, pattern="^MC_FOLDER_NEXT$"))
 app.add_handler(CallbackQueryHandler(cancel_edit_question_explanation, pattern="^CANCEL_EDIT_Q_EXPL$"))
-app.add_handler(CallbackQueryHandler(cancel_edit_question_options,pattern="^CANCEL_EDIT_Q_OPTIONS$"))
-app.add_handler(CallbackQueryHandler(apply_new_options_correct,pattern="^EDIT_OPT_CORRECT_"))
+app.add_handler(CallbackQueryHandler(cancel_edit_question_options, pattern="^CANCEL_EDIT_Q_OPTIONS$"))
+app.add_handler(CallbackQueryHandler(apply_new_options_correct, pattern="^EDIT_OPT_CORRECT_"))
 app.add_handler(CallbackQueryHandler(cancel_edit_question_text, pattern="^CANCEL_EDIT_Q_TEXT$"))
 app.add_handler(CallbackQueryHandler(delete_finish_message, pattern="^DELETE_FINISH_MSG$"))
 app.add_handler(CallbackQueryHandler(qb_auto_add_questions, pattern=r"^QB_AUTO_ADD\|"))
-app.add_handler(CallbackQueryHandler(qb_remove_question_from_quiz,pattern=r"^QB_REMOVE_Q\|"))
+app.add_handler(CallbackQueryHandler(qb_remove_question_from_quiz, pattern=r"^QB_REMOVE_Q\|"))
 app.add_handler(CallbackQueryHandler(qb_add_selected_questions, pattern="^QB_ADD_SELECTED$"))
 app.add_handler(CallbackQueryHandler(qb_toggle_select_question, pattern="^QB_SELECT_Q\\|"))
 app.add_handler(CallbackQueryHandler(qb_question_prev, pattern="^QB_Q_PREV$"))
