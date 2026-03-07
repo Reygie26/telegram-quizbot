@@ -1443,11 +1443,24 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    folder_name = query.data.split("|", 1)[1]
+    # Only update folder_name and reset page when triggered by DB_OPEN
+    if query.data.startswith("DB_OPEN|"):
+        folder_name = query.data.split("|", 1)[1]
+        context.user_data["db_folder_name"] = folder_name
+        context.user_data["db_q_page"] = 0
+    else:
+        folder_name = context.user_data.get("db_folder_name")
+
+    if not folder_name:
+        await query.answer("❌ Folder context lost.", show_alert=True)
+        return
 
     context.user_data["preview_mode"] = "DATABASE"
 
-    # Get folder_id
+    PER_PAGE = 10
+    page = context.user_data.get("db_q_page", 0)
+
+    # Resolve folder_id
     cur.execute(
         """
         SELECT id
@@ -1457,14 +1470,13 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (OWNER_USER_ID, folder_name)
     )
     row = cur.fetchone()
-
     if not row:
         await flash_message(context.bot, query.message.chat_id, "❌ Folder not found.")
         return
 
     folder_id = row[0]
 
-    # Load questions in this folder
+    # Load all questions in this folder
     cur.execute(
         """
         SELECT id, question
@@ -1476,26 +1488,80 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     rows = cur.fetchall()
 
+    keyboard = []
+
+    # Empty folder case
     if not rows:
-        await query.message.reply_text(
+        if folder_name != "Default":
+            keyboard.append([
+                InlineKeyboardButton(
+                    "📥 Move Questions In",
+                    callback_data=f"DB_MOVE_IN|{folder_name}"
+                )
+            ])
+
+        if folder_name != "Default":
+            keyboard.append([
+                InlineKeyboardButton("🗑 Delete Folder", callback_data=f"DB_DELETE_FOLDER|{folder_name}"),
+                InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
+            ])
+        else:
+            keyboard.append([
+                InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
+            ])
+
+        await query.message.edit_text(
             f"📁 **{folder_name}**\n\n_No questions in this folder yet._",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
         return
 
-    keyboard = []
+    # Pagination
+    total = len(rows)
+    pages = (total - 1) // PER_PAGE + 1
+    page = max(0, min(page, pages - 1))
+    context.user_data["db_q_page"] = page
 
-    for qid, text in rows:
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+    page_rows = rows[start:end]
+
+    # Question buttons
+    for qid, text in page_rows:
+        keyboard.append([
+            InlineKeyboardButton(text[:50], callback_data=f"Q_{qid}")
+        ])
+
+    # Pagination controls
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data="DB_Q_PREV"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="DB_Q_NOP"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data="DB_Q_NEXT"))
+        keyboard.append(nav)
+
+    # Move In button (non-Default only)
+    if folder_name != "Default":
         keyboard.append([
             InlineKeyboardButton(
-                text[:50],
-                callback_data=f"Q_{qid}"
+                "📥 Move Questions In",
+                callback_data=f"DB_MOVE_IN|{folder_name}"
             )
         ])
 
-    keyboard.append([
-        InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
-    ])
+    # Delete + Back row
+    if folder_name != "Default":
+        keyboard.append([
+            InlineKeyboardButton("🗑 Delete Folder", callback_data=f"DB_DELETE_FOLDER|{folder_name}"),
+            InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
+        ])
+    else:
+        keyboard.append([
+            InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
+        ])
 
     await query.message.edit_text(
         f"📁 **{folder_name}**\n\nSelect a question:",
@@ -2779,12 +2845,13 @@ async def save_new_question(message, context):
 
     chat_id = message.chat_id
 
-    # 🧹 DELETE ALL QUESTION FLOW MESSAGES
-    for msg_id in context.user_data.get("question_flow_msgs", []):
-        try:
-            await context.bot.delete_message(chat_id, msg_id)
-        except:
-            pass
+    # 🧹 BULK DELETE ALL QUESTION FLOW MESSAGES
+    delete_tasks = [
+        context.bot.delete_message(chat_id, msg_id)
+        for msg_id in context.user_data.get("question_flow_msgs", [])
+    ]
+    if delete_tasks:
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
 
     # 🧹 Clear tracker
     context.user_data.pop("question_flow_msgs", None)
@@ -2861,7 +2928,8 @@ async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"{marker} {opt}\n"
 
     if explanation:
-        text += f"\n🧾 _{explanation}_"
+        safe_explanation = explanation.replace("_", "\\_").replace("*", "\\*")
+        text += f"\n🧾 _{safe_explanation}_"
 
     preview_mode = context.user_data.get("preview_mode", "QUIZ")
 
@@ -2942,7 +3010,8 @@ async def rebuild_question_preview(chat_id, context):
         text += f"{marker} {opt}\n"
 
     if explanation:
-        text += f"\n🧾 _{explanation}_"
+        safe_explanation = explanation.replace("_", "\\_").replace("*", "\\*")
+        text += f"\n🧾 _{safe_explanation}_"
 
     # 🎛 4️⃣ Build preview buttons
     keyboard = InlineKeyboardMarkup([
@@ -3009,7 +3078,8 @@ async def show_question_preview_by_id(chat_id, context):
         text += f"{marker} {opt}\n"
 
     if explanation:
-        text += f"\n🧾 _{explanation}_"
+        safe_explanation = explanation.replace("_", "\\_").replace("*", "\\*")
+        text += f"\n🧾 _{safe_explanation}_"
 
     keyboard = InlineKeyboardMarkup([
         [
@@ -3528,9 +3598,10 @@ async def play_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if explanation:
         try:
+            safe_explanation = explanation
             expl_msg = await context.bot.send_message(
                 chat_id=query.from_user.id,
-                text=f"📖 *Explanation:*\n\n{explanation}",
+                text=f"📖 *Explanation:*\n_{safe_explanation}_",
                 parse_mode="Markdown"
             )
 
@@ -3825,9 +3896,10 @@ async def countdown_timer(user_id, context, seconds, play):
 
         if explanation:
             try:
+                safe_explanation = explanation
                 expl_msg = await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"📖 *Explanation:*\n\n{explanation}",
+                    text=f"📖 *Explanation:*\n_{safe_explanation}_",
                     parse_mode="Markdown"
                 )
 
@@ -6123,6 +6195,7 @@ async def back_to_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     chat_id = query.message.chat_id
+    preview_mode = context.user_data.get("preview_mode")
 
     # 🔹 Delete the preview message (photo or text)
     try:
@@ -6132,19 +6205,144 @@ async def back_to_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 🔹 Clean stored preview ID
     context.user_data.pop("question_preview_msg_id", None)
-    context.user_data.pop("preview_mode", None)
 
-    # Reset pagination
+    # =========================
+    # DATABASE MODE → return to folder question list
+    # =========================
+    if preview_mode == "DATABASE":
+        context.user_data.pop("preview_mode", None)
+
+        folder_name = context.user_data.get("db_folder_name")
+        if not folder_name:
+            # Fallback to database menu if folder context is lost
+            new_msg = await context.bot.send_message(chat_id=chat_id, text="Loading...")
+            await show_database_menu(new_msg, context)
+            return
+
+        # Rebuild folder question list cleanly
+        new_msg = await context.bot.send_message(chat_id=chat_id, text="Loading...")
+        await show_db_questions_from_message(new_msg, context)
+        return
+
+    # =========================
+    # QUIZ MODE → return to quiz question list
+    # =========================
+    context.user_data.pop("preview_mode", None)
     context.user_data["reset_q_page"] = True
 
-    # 🔹 Send new placeholder message
-    new_msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text="Loading..."
-    )
-
-    # 🔹 Build quiz question list on that message
+    new_msg = await context.bot.send_message(chat_id=chat_id, text="Loading...")
     await show_questions_from_message(new_msg, context)
+
+async def show_db_questions_from_message(message, context):
+    """
+    Rebuilds the database folder question list on an existing message object.
+    Used by back_to_questions when returning from a DATABASE preview.
+    """
+    folder_name = context.user_data.get("db_folder_name")
+    if not folder_name:
+        return
+
+    page = context.user_data.get("db_q_page", 0)
+    PER_PAGE = 10
+
+    # Resolve folder_id
+    cur.execute(
+        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
+        (OWNER_USER_ID, folder_name)
+    )
+    row = cur.fetchone()
+    if not row:
+        return
+
+    folder_id = row[0]
+
+    # Load questions
+    cur.execute(
+        """
+        SELECT id, question
+        FROM question_bank
+        WHERE folder_id=?
+        ORDER BY question COLLATE NOCASE
+        """,
+        (folder_id,)
+    )
+    rows = cur.fetchall()
+
+    keyboard = []
+
+    # Empty folder case
+    if not rows:
+        if folder_name != "Default":
+            keyboard.append([
+                InlineKeyboardButton(
+                    "📥 Move Questions In",
+                    callback_data=f"DB_MOVE_IN|{folder_name}"
+                )
+            ])
+        if folder_name != "Default":
+            keyboard.append([
+                InlineKeyboardButton("🗑 Delete Folder", callback_data=f"DB_DELETE_FOLDER|{folder_name}"),
+                InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
+            ])
+        else:
+            keyboard.append([
+                InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
+            ])
+        await message.edit_text(
+            f"📁 **{folder_name}**\n\n_No questions in this folder yet._",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return
+
+    # Pagination
+    total = len(rows)
+    pages = (total - 1) // PER_PAGE + 1
+    page = max(0, min(page, pages - 1))
+    context.user_data["db_q_page"] = page
+
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+    page_rows = rows[start:end]
+
+    for qid, text in page_rows:
+        keyboard.append([
+            InlineKeyboardButton(text[:50], callback_data=f"Q_{qid}")
+        ])
+
+    # Pagination controls
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data="DB_Q_PREV"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="DB_Q_NOP"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data="DB_Q_NEXT"))
+        keyboard.append(nav)
+
+    if folder_name != "Default":
+        keyboard.append([
+            InlineKeyboardButton(
+                "📥 Move Questions In",
+                callback_data=f"DB_MOVE_IN|{folder_name}"
+            )
+        ])
+
+    if folder_name != "Default":
+        keyboard.append([
+            InlineKeyboardButton("🗑 Delete Folder", callback_data=f"DB_DELETE_FOLDER|{folder_name}"),
+            InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
+        ])
+    else:
+        keyboard.append([
+            InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
+        ])
+
+    await message.edit_text(
+        f"📁 **{folder_name}**\n\nSelect a question:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
 
 async def move_q_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -7017,6 +7215,356 @@ async def duplicate_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("create_q_prompt_msg_id", None)
 
 # =========================
+# DB MOVE QUESTIONS INTO FOLDER
+# =========================
+
+async def db_move_in_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Opens the Default Folder question list with checkboxes,
+    so user can pick questions to move into the current folder.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    target_folder = query.data.split("|", 1)[1]
+    context.user_data["db_move_target_folder"] = target_folder
+    context.user_data["db_move_selected"] = set()
+    context.user_data["db_move_page"] = 0
+
+    await show_db_move_question_list(query.message, context)
+
+
+async def show_db_move_question_list(message, context):
+    """
+    Shows questions from Default Folder with checkboxes.
+    Already-in-target questions are hidden.
+    """
+    target_folder = context.user_data.get("db_move_target_folder")
+    selected = context.user_data.setdefault("db_move_selected", set())
+    page = context.user_data.get("db_move_page", 0)
+    PER_PAGE = 10
+
+    # Resolve Default folder_id
+    cur.execute(
+        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name='Default'",
+        (OWNER_USER_ID,)
+    )
+    default_row = cur.fetchone()
+    if not default_row:
+        await message.edit_text("❌ Default folder not found.")
+        return
+    default_folder_id = default_row[0]
+
+    # Resolve target folder_id
+    cur.execute(
+        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
+        (OWNER_USER_ID, target_folder)
+    )
+    target_row = cur.fetchone()
+    if not target_row:
+        await message.edit_text("❌ Target folder not found.")
+        return
+    target_folder_id = target_row[0]
+
+    # Load all questions in Default folder
+    cur.execute(
+        """
+        SELECT id, question
+        FROM question_bank
+        WHERE folder_id=?
+        ORDER BY question COLLATE NOCASE
+        """,
+        (default_folder_id,)
+    )
+    all_questions = cur.fetchall()
+
+    # Load questions already in target folder (to hide them)
+    cur.execute(
+        "SELECT id FROM question_bank WHERE folder_id=?",
+        (target_folder_id,)
+    )
+    already_in_target = {row[0] for row in cur.fetchall()}
+
+    # Filter: only show questions NOT yet in target
+    available = [(qid, text) for qid, text in all_questions if qid not in already_in_target]
+
+    if not available:
+        await message.edit_text(
+            f"📁 **{target_folder}**\n\n✅ All Default Folder questions are already in this folder.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Back", callback_data=f"DB_OPEN|{target_folder}")]
+            ]),
+            parse_mode="Markdown"
+        )
+        return
+
+    total = len(available)
+    pages = (total - 1) // PER_PAGE + 1
+    page = max(0, min(page, pages - 1))
+    context.user_data["db_move_page"] = page
+
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+    page_items = available[start:end]
+
+    keyboard = []
+
+    for qid, text in page_items:
+        checked = "☑" if qid in selected else "⬜"
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{checked} {text[:45]}",
+                callback_data=f"DB_MOVE_TOGGLE|{qid}"
+            )
+        ])
+
+    # Pagination
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data="DB_MOVE_PREV"))
+        nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="DB_MOVE_NOP"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data="DB_MOVE_NEXT"))
+        keyboard.append(nav)
+
+    # Action row
+    keyboard.append([
+        InlineKeyboardButton(
+            f"✅ Move Selected ({len(selected)})",
+            callback_data="DB_MOVE_CONFIRM"
+        ),
+        InlineKeyboardButton("⬅️ Cancel", callback_data=f"DB_OPEN|{target_folder}")
+    ])
+
+    await message.edit_text(
+        f"📥 Move into **{target_folder}**\n\n"
+        f"_Showing questions from Default Folder._\n\n"
+        f"Select questions to move:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def db_move_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    qid = int(query.data.split("|", 1)[1])
+    selected = context.user_data.setdefault("db_move_selected", set())
+
+    if qid in selected:
+        selected.remove(qid)
+    else:
+        selected.add(qid)
+
+    await show_db_move_question_list(query.message, context)
+
+
+async def db_move_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["db_move_page"] = max(0, context.user_data.get("db_move_page", 0) - 1)
+    await show_db_move_question_list(query.message, context)
+
+
+async def db_move_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["db_move_page"] = context.user_data.get("db_move_page", 0) + 1
+    await show_db_move_question_list(query.message, context)
+
+
+async def db_move_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    target_folder = context.user_data.get("db_move_target_folder")
+    selected = context.user_data.get("db_move_selected", set())
+
+    if not selected:
+        await query.answer("⚠️ No questions selected.", show_alert=True)
+        return
+
+    # Resolve target folder_id
+    cur.execute(
+        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
+        (OWNER_USER_ID, target_folder)
+    )
+    row = cur.fetchone()
+    if not row:
+        await query.answer("❌ Target folder not found.", show_alert=True)
+        return
+
+    target_folder_id = row[0]
+
+    try:
+        async with DB_LOCK:
+            for qid in selected:
+                cur.execute(
+                    "UPDATE question_bank SET folder_id=? WHERE id=?",
+                    (target_folder_id, qid)
+                )
+            conn.commit()
+    except Exception as e:
+        print("⚠️ Failed to move questions:", e)
+        await query.answer("❌ Move failed.", show_alert=True)
+        return
+
+    moved = len(selected)
+
+    # Clean up state
+    context.user_data.pop("db_move_selected", None)
+    context.user_data.pop("db_move_page", None)
+    context.user_data.pop("db_move_target_folder", None)
+
+    await flash_message(
+        context.bot,
+        query.message.chat_id,
+        f"✅ {moved} question(s) moved to 📁 {target_folder}"
+    )
+
+    # Return to the target folder's question list
+    # Reuse show_db_questions logic by simulating the folder open
+    cur.execute(
+        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
+        (OWNER_USER_ID, target_folder)
+    )
+    folder_row = cur.fetchone()
+    folder_id = folder_row[0]
+
+    cur.execute(
+        "SELECT id, question FROM question_bank WHERE folder_id=? ORDER BY question COLLATE NOCASE",
+        (folder_id,)
+    )
+    rows = cur.fetchall()
+
+    keyboard = []
+    for qid, text in rows:
+        keyboard.append([
+            InlineKeyboardButton(text[:50], callback_data=f"Q_{qid}")
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton("📥 Move Questions In", callback_data=f"DB_MOVE_IN|{target_folder}")
+    ])
+    keyboard.append([
+        InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
+    ])
+
+    await query.message.edit_text(
+        f"📁 **{target_folder}**\n\nSelect a question:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def db_delete_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    folder_name = query.data.split("|", 1)[1]
+
+    if folder_name == "Default":
+        await query.answer("❌ Cannot delete the Default folder.", show_alert=True)
+        return
+
+    # Resolve folder_id
+    cur.execute(
+        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
+        (OWNER_USER_ID, folder_name)
+    )
+    row = cur.fetchone()
+    if not row:
+        await query.answer("❌ Folder not found.", show_alert=True)
+        return
+
+    folder_id = row[0]
+
+    # Resolve Default folder_id
+    cur.execute(
+        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name='Default'",
+        (OWNER_USER_ID,)
+    )
+    default_row = cur.fetchone()
+    if not default_row:
+        await query.answer("❌ Default folder not found.", show_alert=True)
+        return
+
+    default_folder_id = default_row[0]
+
+    # Store for confirmation
+    context.user_data["db_delete_folder_id"] = folder_id
+    context.user_data["db_delete_folder_name"] = folder_name
+    context.user_data["db_delete_default_folder_id"] = default_folder_id
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Yes, Delete", callback_data="DB_DELETE_FOLDER_CONFIRM"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"DB_OPEN|{folder_name}"),
+        ]
+    ])
+
+    await query.message.edit_text(
+        f"🗑 Delete folder **{folder_name}**?\n\n"
+        f"All questions inside will be moved to **Default Folder**.",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+
+async def db_delete_folder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    folder_id = context.user_data.pop("db_delete_folder_id", None)
+    folder_name = context.user_data.pop("db_delete_folder_name", None)
+    default_folder_id = context.user_data.pop("db_delete_default_folder_id", None)
+
+    if not folder_id or not default_folder_id:
+        await query.answer("❌ Delete state lost. Please try again.", show_alert=True)
+        return
+
+    try:
+        async with DB_LOCK:
+            # Move all questions to Default
+            cur.execute(
+                "UPDATE question_bank SET folder_id=? WHERE folder_id=?",
+                (default_folder_id, folder_id)
+            )
+            # Delete the folder
+            cur.execute(
+                "DELETE FROM question_bank_folders WHERE id=?",
+                (folder_id,)
+            )
+            conn.commit()
+    except Exception as e:
+        print("⚠️ Failed to delete DB folder:", e)
+        await query.answer("❌ Delete failed.", show_alert=True)
+        return
+
+    await flash_message(
+        context.bot,
+        query.message.chat_id,
+        f"✅ Folder '{folder_name}' deleted. Questions moved to Default Folder."
+    )
+
+    # Refresh Database menu
+    await show_database_menu(query.message, context)
+
+async def db_q_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["db_q_page"] = max(0, context.user_data.get("db_q_page", 0) - 1)
+    await show_db_questions(update, context)
+
+
+async def db_q_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["db_q_page"] = context.user_data.get("db_q_page", 0) + 1
+    await show_db_questions(update, context)
+
+# =========================
 # HANDLERS
 # =========================
 # load_owner_from_db()
@@ -7024,7 +7572,17 @@ ensure_default_folder()
 ensure_default_qb_folder()
 ensure_indexes()
 
-app = ApplicationBuilder().token(BOT_TOKEN).build()
+from telegram.ext import ApplicationBuilder
+
+app = (
+    ApplicationBuilder()
+    .token(BOT_TOKEN)
+    .connect_timeout(30)
+    .read_timeout(30)
+    .write_timeout(30)
+    .pool_timeout(30)
+    .build()
+)
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("clear", clear_chat))
@@ -7036,6 +7594,8 @@ app.add_handler(CommandHandler("post", post_quiz_command))
 # =========================
 app.add_handler(CallbackQueryHandler(global_quiz_guard), group=-1)
 # =========================
+app.add_handler(CallbackQueryHandler(db_delete_folder, pattern="^DB_DELETE_FOLDER\\|"))
+app.add_handler(CallbackQueryHandler(db_delete_folder_confirm, pattern="^DB_DELETE_FOLDER_CONFIRM$"))
 app.add_handler(CallbackQueryHandler(duplicate_create_anyway, pattern="^DUP_CREATE_ANYWAY$"))
 app.add_handler(CallbackQueryHandler(duplicate_edit_question, pattern="^DUP_EDIT$"))
 app.add_handler(CallbackQueryHandler(duplicate_cancel, pattern="^DUP_CANCEL$"))
@@ -7086,6 +7646,15 @@ app.add_handler(CallbackQueryHandler(quiz_folder_prev, pattern="^QUIZ_FOLDER_PRE
 app.add_handler(CallbackQueryHandler(quiz_folder_next, pattern="^QUIZ_FOLDER_NEXT$"))
 app.add_handler(CallbackQueryHandler(qb_open_folder, pattern="^QB_OPEN_FOLDER\\|"))
 app.add_handler(CallbackQueryHandler(show_db_questions, pattern="^DB_OPEN\\|"))
+app.add_handler(CallbackQueryHandler(db_q_prev, pattern="^DB_Q_PREV$"))
+app.add_handler(CallbackQueryHandler(db_q_next, pattern="^DB_Q_NEXT$"))
+app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^DB_Q_NOP$"))
+app.add_handler(CallbackQueryHandler(db_move_in_start, pattern="^DB_MOVE_IN\\|"))
+app.add_handler(CallbackQueryHandler(db_move_toggle, pattern="^DB_MOVE_TOGGLE\\|"))
+app.add_handler(CallbackQueryHandler(db_move_confirm, pattern="^DB_MOVE_CONFIRM$"))
+app.add_handler(CallbackQueryHandler(db_move_prev, pattern="^DB_MOVE_PREV$"))
+app.add_handler(CallbackQueryHandler(db_move_next, pattern="^DB_MOVE_NEXT$"))
+app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^DB_MOVE_NOP$"))
 app.add_handler(CallbackQueryHandler(qb_pick_folder_start, pattern="^QB_PICK_FOLDER$"))
 app.add_handler(CallbackQueryHandler(qb_folder_prev, pattern="^QB_FOLDER_PREV$"))
 app.add_handler(CallbackQueryHandler(qb_folder_next, pattern="^QB_FOLDER_NEXT$"))
@@ -7159,8 +7728,12 @@ async def global_error_handler(update, context):
 app.add_error_handler(global_error_handler)
 
 print("✅ TeleQuiz is running...")
-app.run_polling()
+app.run_polling(
+    poll_interval=1.0,
+    timeout=30,
+    drop_pending_updates=True,
+    close_loop=False
+)
 ####################################################################################################################################################################################################################################
 # CODE BY PARTS - END OF CODE
 ####################################################################################################################################################################################################################################
-
