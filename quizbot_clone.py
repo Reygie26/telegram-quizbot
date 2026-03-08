@@ -528,6 +528,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.setdefault("question_flow_msgs", []).append(update.message.message_id)
 
     if state == "DB_ADD_FOLDER":
+        chat_id = update.effective_chat.id
+        user_msg_id = update.message.message_id
         folder = text.strip()
 
         # ❌ Empty name
@@ -535,7 +537,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Folder name cannot be empty.")
             return
 
-        # Normalize name (capitalization only for display)
         normalized = folder.strip()
 
         # ❌ Default is reserved
@@ -558,21 +559,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ✅ Create folder
-        cur.execute(
-            "INSERT INTO question_bank_folders (owner_id, name) VALUES (?, ?)",
-            (OWNER_USER_ID, normalized)
-        )
-        conn.commit()
+        try:
+            async with DB_LOCK:
+                cur.execute(
+                    "INSERT INTO question_bank_folders (owner_id, name) VALUES (?, ?)",
+                    (OWNER_USER_ID, normalized)
+                )
+                conn.commit()
+        except Exception as e:
+            print("⚠️ DB folder create failed:", e)
+            await update.message.reply_text("❌ Failed to create folder.")
+            return
 
         # 🔑 EXIT DB MODE IMMEDIATELY
         context.user_data.pop("state", None)
 
-        await update.message.reply_text(
+        # ✅ Confirmation message
+        confirm_msg = await update.message.reply_text(
             f"📁 Database folder **{normalized}** created.",
             parse_mode="Markdown"
         )
 
-        await show_database_menu(update.message, context)
+        await asyncio.sleep(2)
+
+        # 🧹 Bulk declutter: prompt + user message + confirmation
+        prompt_id = context.user_data.pop("db_add_folder_prompt_id", None)
+        delete_tasks = []
+        if prompt_id:
+            delete_tasks.append(context.bot.delete_message(chat_id, prompt_id))
+        delete_tasks.append(context.bot.delete_message(chat_id, user_msg_id))
+        delete_tasks.append(context.bot.delete_message(chat_id, confirm_msg.message_id))
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+        # 🔄 Menu replacement: edit the original database menu message
+        db_menu_msg = context.user_data.get("db_menu_message_object")
+        if db_menu_msg:
+            await show_database_menu(db_menu_msg, context)
         return
 
     # ================= DB RENAME FOLDER =================
@@ -913,7 +935,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ================= MOVE + CREATE FOLDER =================
     if state == "MOVE_ADD_FOLDER":
-        folder = text
+        chat_id = update.effective_chat.id
+        user_msg_id = update.message.message_id
+        folder = text.strip()
 
         if folder == "Default":
             await update.message.reply_text("❌ 'Default' folder already exists.")
@@ -942,8 +966,31 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
 
         context.user_data["state"] = None
-        await update.message.reply_text(f"✅ Folder '{folder}' created and quiz moved.")
-        await show_quiz_action_menu(update.message, context)
+
+        # ✅ Confirmation message
+        confirm_msg = await update.message.reply_text(
+            f"✅ Folder '{folder}' created and quiz moved."
+        )
+
+        await asyncio.sleep(2)
+
+        # 🧹 Bulk declutter: prompt + user message + confirmation
+        prompt_id = context.user_data.pop("move_create_folder_prompt_id", None)
+        delete_tasks = []
+        if prompt_id:
+            delete_tasks.append(context.bot.delete_message(chat_id, prompt_id))
+        delete_tasks.append(context.bot.delete_message(chat_id, user_msg_id))
+        delete_tasks.append(context.bot.delete_message(chat_id, confirm_msg.message_id))
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+        # 🔄 Return to quiz action menu
+        overview_id = context.user_data.get("quiz_overview_msg_id")
+        if overview_id:
+            await show_quiz_action_menu_by_id(
+                chat_id=chat_id,
+                message_id=overview_id,
+                context=context
+            )
         return
 
     # ================= ADD FOLDER =================
@@ -1936,23 +1983,29 @@ async def move_create_folder_start(update: Update, context: ContextTypes.DEFAULT
     # Remember we are creating a folder for moving a quiz
     context.user_data["state"] = "MOVE_ADD_FOLDER"
 
-    await query.message.reply_text(
+    msg = await query.message.reply_text(
         "➕ Send the new folder name for this quiz:"
     )
+
+    # 🔑 Store prompt ID for cleanup
+    context.user_data["move_create_folder_prompt_id"] = msg.message_id
 
 async def database_add_folder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    # 🔒 HARD RESET: exit all other text-driven flows
-    context.user_data.clear()
-
-    # ✅ Enter Database folder creation mode
+    # ✅ Enter Database folder creation mode (do NOT hard clear — preserve menu reference)
     context.user_data["state"] = "DB_ADD_FOLDER"
 
-    await query.message.reply_text(
+    # 🔑 Store the database menu message for later replacement
+    context.user_data["db_menu_message_object"] = query.message
+
+    msg = await query.message.reply_text(
         "➕ Send the name of the new Database folder:"
     )
+
+    # 🔑 Store prompt ID for cleanup
+    context.user_data["db_add_folder_prompt_id"] = msg.message_id
 
 async def move_quiz_to_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -7737,8 +7790,9 @@ async def db_rename_folder_start(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data["db_rename_folder_name"] = folder_name
     context.user_data["db_rename_menu_message"] = query.message
 
+    # 🔑 Cancel goes to a clean handler — NOT DB_OPEN (which sends a new preview)
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Cancel", callback_data=f"DB_OPEN|{folder_name}")]
+        [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_DB_RENAME_FOLDER")]
     ])
 
     msg = await query.message.reply_text(
@@ -7747,6 +7801,27 @@ async def db_rename_folder_start(update: Update, context: ContextTypes.DEFAULT_T
     )
 
     context.user_data["db_rename_prompt_id"] = msg.message_id
+
+async def cancel_db_rename_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+
+    # 🧹 Delete ONLY the rename prompt message
+    prompt_id = context.user_data.pop("db_rename_prompt_id", None)
+    if prompt_id:
+        try:
+            await context.bot.delete_message(chat_id, prompt_id)
+        except:
+            pass
+
+    # 🔒 Clear rename state
+    context.user_data.pop("state", None)
+    context.user_data.pop("db_rename_folder_name", None)
+    context.user_data.pop("db_rename_menu_message", None)
+
+    # 🔕 Do NOT send any new message — existing folder preview remains visible
 
 # =========================
 # HANDLERS
@@ -7779,6 +7854,7 @@ app.add_handler(CommandHandler("post", post_quiz_command))
 app.add_handler(CallbackQueryHandler(global_quiz_guard), group=-1)
 # =========================
 app.add_handler(CallbackQueryHandler(db_rename_folder_start, pattern="^DB_RENAME_FOLDER\\|"))
+app.add_handler(CallbackQueryHandler(cancel_db_rename_folder, pattern="^CANCEL_DB_RENAME_FOLDER$"))
 app.add_handler(CallbackQueryHandler(db_delete_folder, pattern="^DB_DELETE_FOLDER\\|"))
 app.add_handler(CallbackQueryHandler(db_delete_folder_confirm, pattern="^DB_DELETE_FOLDER_CONFIRM$"))
 app.add_handler(CallbackQueryHandler(duplicate_create_anyway, pattern="^DUP_CREATE_ANYWAY$"))
