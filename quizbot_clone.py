@@ -1075,12 +1075,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             async with DB_LOCK:
                 cur.execute(
-                    "INSERT INTO quizzes VALUES (?, ?, ?, NULL, ?, 1, 1, 15)",
+                    "INSERT INTO quizzes VALUES (?, ?, ?, NULL, 'Default', 1, 1, 15)",
                     (
                         context.user_data["quiz_id"],
                         OWNER_USER_ID,
                         title,
-                        context.user_data.get("current_folder", "Default")
                     )
                 )
                 conn.commit()
@@ -7933,4 +7932,3 @@ app.run_polling(
 ####################################################################################################################################################################################################################################
 # CODE BY PARTS - END OF CODE
 ####################################################################################################################################################################################################################################
-
