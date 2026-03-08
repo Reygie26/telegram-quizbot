@@ -40,39 +40,35 @@ from telegram import InlineQueryResultArticle, InputTextMessageContent
 ##### =============================================================================================
 ##### BOT TOKEN TO USE
 ##### =============================================================================================
-##### BOT TOKEN TO USE FOR TEST BOT  - BOT_TOKEN = "8482093736:AAFqaEt1fwXIyuAH5nIJtkao1xwP9QdAUPk"
 ##### BOT TOKEN TO USE FOR GITHUB    - BOT_TOKEN = os.environ.get("BOT_TOKEN")
-BOT_TOKEN = "8482093736:AAFqaEt1fwXIyuAH5nIJtkao1xwP9QdAUPk"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("❌ BOT_TOKEN environment variable is missing")
 
 ##### =============================================================================================
 ##### OWNER USER ID TO USE
 ##### =============================================================================================
-##### OWNER USER ID FOR TEST BOT     - OWNER_USER_ID = 6254422846
 ##### OWNER USER ID FOR GITHUB       - OWNER_USER_ID = int(os.getenv("OWNER_USER_ID"))
-OWNER_USER_ID = 6254422846
+OWNER_USER_ID = int(os.getenv("OWNER_USER_ID"))
 
 ##### =============================================================================================
 ##### BOT USERNAME TO USE
 ##### =============================================================================================
-##### BOT USERNAME FOR TEST BOT      - BOT_USERNAME = "EnginerdBot"
 ##### BOT USERNAME FOR GITHUB        - BOT_USERNAME = "EucresiaBot"
-BOT_USERNAME = "EnginerdBot"
+BOT_USERNAME = "EucresiaBot"
 
 ##### =============================================================================================
 ##### DB_FILE TO USE
 ##### =============================================================================================
-##### DB_FILE TO USE FOR TEST BOT    - DB_FILE = os.path.join(os.getcwd(), "quizbot.db")
 ##### DB_FILE TO USE FOR GITHUB      - DB_FILE = "/var/data/quizbot.db"
-DB_FILE = os.path.join(os.getcwd(), "quizbot.db")
+DB_FILE = "/var/data/quizbot.db"
 
 ##### =============================================================================================
 ##### print("📂 Using database file at:", DB_FILE)
 ##### =============================================================================================
 ##### FOR TEST BOT                   - (empty)
 ##### FOR GITHUB                     - print("📂 Using database file at:", DB_FILE)
-
+print("📂 Using database file at:", DB_FILE)
 
 ##### =============================================================================================
 ##### CONFIGURATION
@@ -7937,3 +7933,4 @@ app.run_polling(
 ####################################################################################################################################################################################################################################
 # CODE BY PARTS - END OF CODE
 ####################################################################################################################################################################################################################################
+
