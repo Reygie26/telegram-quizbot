@@ -161,6 +161,7 @@ GROUP_LB_MESSAGES = {}   # quiz_id -> {
 
 USER_RATE_LIMIT = {}
 RATE_LIMIT_SECONDS = 1
+SIX_MONTHS_SECONDS = 180 * 24 * 3600  # 6-month token validity
 
 # =========================
 # DATABASE
@@ -316,11 +317,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 🔑 Build leaderboard key
         leaderboard_key = make_leaderboard_key(quiz_id, token)
 
-        # 🔍 Verify leaderboard exists
+        # 🔍 Verify token exists in DB and is within 6 months
+        cur.execute(
+            "SELECT created_at FROM quiz_post_tokens WHERE token=? AND quiz_id=?",
+            (token, quiz_id)
+        )
+        token_row = cur.fetchone()
+
+        now = int(time.time())
+
+        if not token_row or (now - token_row[0]) > SIX_MONTHS_SECONDS:
+            msg = await update.message.reply_text("❌ This quiz link is no longer valid.")
+            async def _delete_invalid():
+                await asyncio.sleep(5)
+                try:
+                    await msg.delete()
+                except:
+                    pass
+            asyncio.create_task(_delete_invalid())
+            return
+
+        # 🔍 Verify leaderboard exists in memory
         lb_info = GROUP_LB_MESSAGES.get(leaderboard_key)
         if not lb_info:
             msg = await update.message.reply_text("❌ This quiz link is no longer valid.")
-            context.user_data.setdefault("chat_messages", []).append(msg.message_id)
+            async def _delete_invalid():
+                await asyncio.sleep(5)
+                try:
+                    await msg.delete()
+                except:
+                    pass
+            asyncio.create_task(_delete_invalid())
             return
 
         # 🔒 Reset user state completely
@@ -684,6 +711,40 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ================= DB SEARCH =================
+    if state == "DB_SEARCH":
+        chat_id = update.effective_chat.id
+        user_msg_id = update.message.message_id
+        keyword = text.strip()
+
+        if not keyword:
+            await update.message.reply_text("❌ Please enter a keyword.")
+            return
+
+        # 🧹 Delete prompt
+        prompt_id = context.user_data.pop("db_search_prompt_id", None)
+        if prompt_id:
+            try:
+                await context.bot.delete_message(chat_id, prompt_id)
+            except:
+                pass
+
+        # 🧹 Delete user's typed message
+        try:
+            await context.bot.delete_message(chat_id, user_msg_id)
+        except:
+            pass
+
+        context.user_data.pop("state", None)
+        context.user_data["db_search_keyword"] = keyword
+        context.user_data["db_search_page"] = 0
+
+        # 🔄 Replace the database menu message with search results
+        menu_msg = context.user_data.get("db_search_menu_message")
+        if menu_msg:
+            await show_db_search_results(menu_msg, context)
+        return
+
     # ================= ADD QUESTION FLOW =================
     q_state = context.user_data.get("add_q_state")
 
@@ -807,15 +868,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             warning_text = "⚠️ *Similar question(s) found:*\n\n"
 
             for i, (_, q_text) in enumerate(top_matches, 1):
-                warning_text += f"{i}. {q_text[:80]}\n"
+                # Fetch options and correct answer for this question
+                cur.execute(
+                    "SELECT options, correct FROM question_bank WHERE question=? LIMIT 1",
+                    (q_text,)
+                )
+                q_row = cur.fetchone()
+                if q_row:
+                    opts = q_row[0].split("||")
+                    correct_idx = q_row[1]
+                    correct_text = opts[correct_idx] if 0 <= correct_idx < len(opts) else "—"
+                    warning_text += f"{i}. {q_text[:80]}\n    ✅ _{correct_text}_\n\n"
+                else:
+                    warning_text += f"{i}. {q_text[:80]}\n\n"
 
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("✅ Create Anyway", callback_data="DUP_CREATE_ANYWAY"),
-                    InlineKeyboardButton("✏️ Edit Question", callback_data="DUP_EDIT"),
+                    InlineKeyboardButton("✏️ Change Question", callback_data="DUP_EDIT"),
                 ],
                 [
-                    InlineKeyboardButton("❌ Cancel", callback_data="DUP_CANCEL")
+                    InlineKeyboardButton("❌ Cancel Question Creation", callback_data="DUP_CANCEL")
                 ]
             ])
 
@@ -1453,6 +1526,9 @@ async def show_database_menu(message, context):
     default_count = cur.fetchone()[0]
 
     keyboard.append([
+        InlineKeyboardButton("🔍 Search Questions", callback_data="DB_SEARCH_START")
+    ])
+    keyboard.append([
         InlineKeyboardButton(
             f"📁 Default Folder ({default_count})",
             callback_data="DB_OPEN|Default"
@@ -1700,6 +1776,182 @@ async def qb_pick_folder_menu(message, context):
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
+
+async def db_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["state"] = "DB_SEARCH"
+    context.user_data["db_search_menu_message"] = query.message
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="DB_SEARCH_CANCEL")]
+    ])
+
+    msg = await query.message.reply_text(
+        "🔍 Search Questions\n\n📝 Send keyword(s) to search:",
+        reply_markup=keyboard
+    )
+
+    context.user_data["db_search_prompt_id"] = msg.message_id
+
+async def db_search_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+
+    # 🧹 Delete prompt
+    prompt_id = context.user_data.pop("db_search_prompt_id", None)
+    if prompt_id:
+        try:
+            await context.bot.delete_message(chat_id, prompt_id)
+        except:
+            pass
+
+    context.user_data.pop("state", None)
+    context.user_data.pop("db_search_menu_message", None)
+
+async def show_db_search_results(message, context):
+    keyword = context.user_data.get("db_search_keyword", "")
+    page = context.user_data.get("db_search_page", 0)
+    PER_PAGE = 10
+
+    # Search question_bank for keyword (case-insensitive)
+    cur.execute(
+        """
+        SELECT qb.id, qb.question, qb.options, qb.correct
+        FROM question_bank qb
+        JOIN question_bank_folders f ON f.id = qb.folder_id
+        WHERE f.owner_id = ?
+          AND LOWER(qb.question) LIKE LOWER(?)
+        ORDER BY qb.question COLLATE NOCASE
+        """,
+        (OWNER_USER_ID, f"%{keyword}%")
+    )
+    rows = cur.fetchall()
+
+    keyboard = []
+
+    if not rows:
+        keyboard.append([
+            InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
+        ])
+        await message.edit_text(
+            f"🔍 Search: *{keyword}*\n\n_No questions found._",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return
+
+    total = len(rows)
+    pages = (total - 1) // PER_PAGE + 1
+    page = max(0, min(page, pages - 1))
+    context.user_data["db_search_page"] = page
+
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+    page_rows = rows[start:end]
+
+    for qid, q_text, options_raw, correct in page_rows:
+        opts = options_raw.split("||")
+        correct_text = opts[correct] if 0 <= correct < len(opts) else "—"
+        label = f"{q_text[:38]}… ✅ {correct_text[:20]}"
+        keyboard.append([
+            InlineKeyboardButton(label, callback_data=f"DB_SEARCH_Q|{qid}")
+        ])
+
+    # Pagination
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data="DB_SEARCH_PREV"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="DB_SEARCH_NOP"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data="DB_SEARCH_NEXT"))
+        keyboard.append(nav)
+
+    keyboard.append([
+        InlineKeyboardButton("🔍 New Search", callback_data="DB_SEARCH_START"),
+        InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
+    ])
+
+    await message.edit_text(
+        f"🔍 *{keyword}* — {total} result(s):",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def db_search_preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+    qid = int(query.data.split("|", 1)[1])
+    context.user_data["active_question_id"] = qid
+    context.user_data["preview_mode"] = "DATABASE"
+    context.user_data["preview_return"] = "DB_SEARCH"
+
+    cur.execute(
+        """
+        SELECT question, image_file_id, options, correct, explanation
+        FROM question_bank
+        WHERE id=?
+        """,
+        (qid,)
+    )
+    row = cur.fetchone()
+    if not row:
+        await query.answer("❌ Question not found.", show_alert=True)
+        return
+
+    question, image, options, correct, explanation = row
+    options = options.split("||")
+
+    text = f"📝 **{question}**\n\n"
+    for i, opt in enumerate(options):
+        marker = "✅" if i == correct else "◻️"
+        text += f"{marker} {opt}\n"
+
+    if explanation:
+        safe_exp = explanation.replace("_", "\\_").replace("*", "\\*")
+        text += f"\n🧾 _{safe_exp}_"
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Edit", callback_data="EDIT_Q"),
+            InlineKeyboardButton("⚙️ Manage", callback_data="MANAGE_Q"),
+        ],
+        [
+            InlineKeyboardButton("🗑 Delete", callback_data="DELETE_Q_FROM_DB"),
+            InlineKeyboardButton("↩️ Return", callback_data="RETURN_TO_QUESTIONS"),
+        ]
+    ])
+
+    # Delete current menu message first
+    try:
+        await query.message.delete()
+    except:
+        pass
+
+    if image:
+        msg = await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=image,
+            caption=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    else:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+
+    context.user_data["question_preview_msg_id"] = msg.message_id
+    context.user_data["db_search_list_deleted"] = True
 
 # =========================
 # MY QUIZZES
@@ -2774,16 +3026,7 @@ async def skip_question_image(update: Update, context: ContextTypes.DEFAULT_TYPE
     if context.user_data.get("add_q_state") != "NEW_Q_IMAGE":
         return
 
-    chat_id = query.message.chat_id
-
-    # 🧹 CLEAN previous creation prompts
-    for mid in context.user_data.get("question_flow_msgs", []):
-        try:
-            await context.bot.delete_message(chat_id, mid)
-        except:
-            pass
-
-    context.user_data["question_flow_msgs"] = []
+    # ✅ NO early bulk delete here — mass declutter happens at the end in save_new_question
 
     # Proceed to Option 1
     context.user_data["new_question"]["image"] = None
@@ -2791,7 +3034,7 @@ async def skip_question_image(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     msg = await query.message.reply_text("➡️ Send option 1:")
 
-    # Track message for future declutter
+    # Track message for final mass declutter
     context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
 
 async def skip_question_explanation(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6250,14 +6493,20 @@ async def back_to_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if preview_mode == "DATABASE":
         context.user_data.pop("preview_mode", None)
 
+        # 🔍 Return to search results if came from search
+        if context.user_data.get("preview_return") == "DB_SEARCH":
+            context.user_data.pop("preview_return", None)
+            context.user_data.pop("db_search_list_deleted", None)
+            new_msg = await context.bot.send_message(chat_id=chat_id, text="Loading...")
+            await show_db_search_results(new_msg, context)
+            return
+
         folder_name = context.user_data.get("db_folder_name")
         if not folder_name:
-            # Fallback to database menu if folder context is lost
             new_msg = await context.bot.send_message(chat_id=chat_id, text="Loading...")
             await show_database_menu(new_msg, context)
             return
 
-        # Rebuild folder question list cleanly
         new_msg = await context.bot.send_message(chat_id=chat_id, text="Loading...")
         await show_db_questions_from_message(new_msg, context)
         return
@@ -7823,6 +8072,18 @@ async def cancel_db_rename_folder(update: Update, context: ContextTypes.DEFAULT_
 
     # 🔕 Do NOT send any new message — existing folder preview remains visible
 
+async def db_search_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["db_search_page"] = max(0, context.user_data.get("db_search_page", 0) - 1)
+    await show_db_search_results(query.message, context)
+
+async def db_search_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["db_search_page"] = context.user_data.get("db_search_page", 0) + 1
+    await show_db_search_results(query.message, context)
+
 # =========================
 # HANDLERS
 # =========================
@@ -7926,6 +8187,12 @@ app.add_handler(CallbackQueryHandler(db_move_prev, pattern="^DB_MOVE_PREV$"))
 app.add_handler(CallbackQueryHandler(db_move_next, pattern="^DB_MOVE_NEXT$"))
 app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^DB_MOVE_NOP$"))
 # =========================
+app.add_handler(CallbackQueryHandler(db_search_start, pattern="^DB_SEARCH_START$"))
+app.add_handler(CallbackQueryHandler(db_search_cancel, pattern="^DB_SEARCH_CANCEL$"))
+app.add_handler(CallbackQueryHandler(db_search_preview_question, pattern="^DB_SEARCH_Q\\|"))
+app.add_handler(CallbackQueryHandler(db_search_prev, pattern="^DB_SEARCH_PREV$"))
+app.add_handler(CallbackQueryHandler(db_search_next, pattern="^DB_SEARCH_NEXT$"))
+app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^DB_SEARCH_NOP$"))
 app.add_handler(CallbackQueryHandler(qb_pick_folder_start, pattern="^QB_PICK_FOLDER$"))
 app.add_handler(CallbackQueryHandler(qb_folder_prev, pattern="^QB_FOLDER_PREV$"))
 app.add_handler(CallbackQueryHandler(qb_folder_next, pattern="^QB_FOLDER_NEXT$"))
