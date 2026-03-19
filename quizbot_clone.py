@@ -87,23 +87,6 @@ DB_LOCK = asyncio.Lock()
 ## HELPERS
 ## =========================
 
-def escape_markdown(text: str) -> str:
-    """Escapes Telegram Markdown v1 special characters."""
-    if not text:
-        return ""
-    for ch in ['_', '*', '`', '[']:
-        text = text.replace(ch, f'\\{ch}')
-    return text
-
-import re
-
-def natural_sort_key(s):
-    """Sort strings with embedded numbers naturally: Quiz 2 < Quiz 10."""
-    return [
-        int(part) if part.isdigit() else part.lower()
-        for part in re.split(r'(\d+)', s)
-    ]
-
 async def send_tracked_message(update, context, text, **kwargs):
     msg = await update.effective_chat.send_message(text=text, **kwargs)
 
@@ -140,6 +123,19 @@ def format_user_name(user):
         return last
     else:
         return "Unknown"
+
+
+import re
+
+def natural_sort_key(s):
+    """
+    Splits a string into text and integer chunks so that
+    'Quiz 2' sorts before 'Quiz 10'.
+    """
+    return [
+        int(chunk) if chunk.isdigit() else chunk.lower()
+        for chunk in re.split(r'(\d+)', s)
+    ]
 
 # =========================
 # LEADERBOARD KEY HELPER
@@ -1902,13 +1898,13 @@ async def show_db_search_results(message, context):
 async def db_search_preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
     chat_id = query.message.chat_id
- 
     qid = int(query.data.split("|", 1)[1])
     context.user_data["active_question_id"] = qid
     context.user_data["preview_mode"] = "DATABASE"
     context.user_data["preview_return"] = "DB_SEARCH"
- 
+
     cur.execute(
         """
         SELECT question, image_file_id, options, correct, explanation
@@ -1921,20 +1917,19 @@ async def db_search_preview_question(update: Update, context: ContextTypes.DEFAU
     if not row:
         await query.answer("❌ Question not found.", show_alert=True)
         return
- 
+
     question, image, options, correct, explanation = row
     options = options.split("||")
- 
-    safe_question = escape_markdown(question)
-    text = f"📝 *{safe_question}*\n\n"
+
+    text = f"📝 **{question}**\n\n"
     for i, opt in enumerate(options):
         marker = "✅" if i == correct else "◻️"
-        safe_opt = escape_markdown(opt)
-        text += f"{marker} {safe_opt}\n"
+        text += f"{marker} {opt}\n"
+
     if explanation:
-        safe_explanation = escape_markdown(explanation)
-        text += f"\n🧾 _{safe_explanation}_"
- 
+        safe_exp = explanation.replace("_", "\\_").replace("*", "\\*")
+        text += f"\n🧾 _{safe_exp}_"
+
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✏️ Edit", callback_data="EDIT_Q"),
@@ -1945,52 +1940,29 @@ async def db_search_preview_question(update: Update, context: ContextTypes.DEFAU
             InlineKeyboardButton("↩️ Return", callback_data="RETURN_TO_QUESTIONS"),
         ]
     ])
- 
-    # Delete the search results list message
+
+    # Delete current menu message first
     try:
         await query.message.delete()
-    except Exception:
+    except:
         pass
- 
-    # Clear any stale preview from a previous question
-    old_preview_id = context.user_data.get("question_preview_msg_id")
-    if old_preview_id:
-        try:
-            await context.bot.delete_message(chat_id, old_preview_id)
-        except Exception:
-            pass
-        context.user_data.pop("question_preview_msg_id", None)
- 
-    try:
-        if image:
-            msg = await context.bot.send_photo(
-                chat_id=chat_id, photo=image,
-                caption=text, reply_markup=keyboard,
-                parse_mode="Markdown"
-            )
-        else:
-            msg = await context.bot.send_message(
-                chat_id=chat_id, text=text,
-                reply_markup=keyboard, parse_mode="Markdown"
-            )
-    except Exception as e:
-        print(f"⚠️ db_search_preview_question Markdown failed, retrying plain: {e}")
-        plain = text.replace("*", "").replace("_", "").replace("\\", "")
-        try:
-            if image:
-                msg = await context.bot.send_photo(
-                    chat_id=chat_id, photo=image,
-                    caption=plain, reply_markup=keyboard
-                )
-            else:
-                msg = await context.bot.send_message(
-                    chat_id=chat_id, text=plain, reply_markup=keyboard
-                )
-        except Exception as e2:
-            print(f"⚠️ db_search_preview_question plain fallback failed: {e2}")
-            return
- 
-    # ✅ Store message_id so rebuild_question_preview can edit it in-place
+
+    if image:
+        msg = await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=image,
+            caption=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    else:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+
     context.user_data["question_preview_msg_id"] = msg.message_id
     context.user_data["db_search_list_deleted"] = True
 
@@ -2007,21 +1979,21 @@ async def show_quizzes_in_folder(message, context, folder):
         FROM quizzes
         WHERE owner_id=? AND folder=?
     """, (OWNER_USER_ID, folder))
-
     rows = cur.fetchall()
 
-    # 🔑 Natural sort (Quiz 2 before Quiz 10)
+    # ── Natural sort ──────────────────────────────────────
     rows = sorted(rows, key=lambda r: natural_sort_key(r[1]))
 
     page_key = f"folder_page_{folder}"
     page = context.user_data.get(page_key, 0)
+
     PER_PAGE = 5
     total = len(rows)
     pages = (total - 1) // PER_PAGE + 1 if total else 1
     page = max(0, min(page, pages - 1))
 
     start = page * PER_PAGE
-    end = start + PER_PAGE
+    end   = start + PER_PAGE
     page_rows = rows[start:end]
 
     keyboard = []
@@ -2043,18 +2015,17 @@ async def show_quizzes_in_folder(message, context, folder):
     if folder != "Default":
         keyboard.append([
             InlineKeyboardButton("✏️ Rename", callback_data=f"RENAME_FOLDER|{folder}"),
-            InlineKeyboardButton("🗑 Delete", callback_data=f"DELETE_FOLDER|{folder}"),
-            InlineKeyboardButton("⬅️ Back", callback_data="BACK_TO_FOLDERS")
+            InlineKeyboardButton("🗑 Delete",  callback_data=f"DELETE_FOLDER|{folder}"),
+            InlineKeyboardButton("⬅️ Back",   callback_data="BACK_TO_FOLDERS")
         ])
     else:
         keyboard.append([
             InlineKeyboardButton("⬅️ Back", callback_data="BACK_TO_FOLDERS")
         ])
 
-    title_text = "All Quizzes" if folder == "Default" else folder
-
+    title_label = "All Quizzes" if folder == "Default" else folder
     await message.edit_text(
-        f"📁 {title_text}",
+        f"📁 {title_label}",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -2310,16 +2281,9 @@ async def move_quiz_to_folder(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     conn.commit()
 
-    confirm_msg = await flash_message(context.bot, query.message.chat_id, 
+    await flash_message(context.bot, query.message.chat_id,
         f"✅ Quiz moved to 📁 {folder}"
     )
-
-    await asyncio.sleep(2)
-
-    try:
-        await confirm_msg.delete()
-    except:
-        pass
 
     await show_quiz_action_menu(query.message, context)
 
@@ -3207,26 +3171,26 @@ async def save_new_question(message, context):
 async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
     chat_id = query.message.chat_id
- 
-    # Delete any stale preview from a PREVIOUS question (different qid)
+
+    # 🔥 HARD CLEAN: delete previous preview if exists
     old_preview_id = context.user_data.get("question_preview_msg_id")
     if old_preview_id:
         try:
             await context.bot.delete_message(chat_id, old_preview_id)
-        except Exception:
+        except:
             pass
-        context.user_data.pop("question_preview_msg_id", None)
- 
-    # Delete the question list/menu message that was tapped
+
+    # Remove previous list/menu message
     try:
         await query.message.delete()
-    except Exception:
+    except:
         pass
- 
+
     qid = int(query.data.replace("Q_", ""))
     context.user_data["active_question_id"] = qid
- 
+
     cur.execute(
         """
         SELECT question, image_file_id, options, correct, explanation
@@ -3239,23 +3203,27 @@ async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not row:
         await context.bot.send_message(chat_id, "❌ Question not found.")
         return
- 
+
     question, image, options, correct, explanation = row
     options = options.split("||")
- 
-    safe_question = escape_markdown(question)
-    text = f"📝 *{safe_question}*\n\n"
+
+    text = f"📝 **{question}**\n\n"
+
     for i, opt in enumerate(options):
         marker = "✅" if i == correct else "◻️"
-        safe_opt = escape_markdown(opt)
-        text += f"{marker} {safe_opt}\n"
+        text += f"{marker} {opt}\n"
+
     if explanation:
-        safe_explanation = escape_markdown(explanation)
+        safe_explanation = explanation.replace("_", "\\_").replace("*", "\\*")
         text += f"\n🧾 _{safe_explanation}_"
- 
+
     preview_mode = context.user_data.get("preview_mode", "QUIZ")
-    delete_callback = "DELETE_Q_FROM_DB" if preview_mode == "DATABASE" else "DELETE_Q_FROM_QUIZ"
- 
+
+    if preview_mode == "DATABASE":
+        delete_callback = "DELETE_Q_FROM_DB"
+    else:
+        delete_callback = "DELETE_Q_FROM_QUIZ"
+
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✏️ Edit", callback_data="EDIT_Q"),
@@ -3266,60 +3234,33 @@ async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("↩️ Return", callback_data="RETURN_TO_QUESTIONS"),
         ]
     ])
- 
-    try:
-        if image:
-            msg = await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=image,
-                caption=text,
-                reply_markup=keyboard,
-                parse_mode="Markdown"
-            )
-        else:
-            msg = await context.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_markup=keyboard,
-                parse_mode="Markdown"
-            )
-    except Exception as e:
-        print(f"⚠️ preview_question Markdown failed, retrying plain: {e}")
-        plain = text.replace("*", "").replace("_", "").replace("\\", "")
-        try:
-            if image:
-                msg = await context.bot.send_photo(
-                    chat_id=chat_id, photo=image,
-                    caption=plain, reply_markup=keyboard
-                )
-            else:
-                msg = await context.bot.send_message(
-                    chat_id=chat_id, text=plain, reply_markup=keyboard
-                )
-        except Exception as e2:
-            print(f"⚠️ preview_question plain fallback failed: {e2}")
-            return
- 
-    # ✅ Store message_id — all subsequent Edit/Delete/Manage buttons share this
+
+    # ✅ TRUE MEDIA LOGIC
+    if image:
+        msg = await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=image,
+            caption=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    else:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+
     context.user_data["question_preview_msg_id"] = msg.message_id
 
 async def rebuild_question_preview(chat_id, context):
-    """
-    Rebuilds the question preview.
-    ALWAYS tries to EDIT the existing message in-place first.
-    Only deletes + re-sends when the media type changes (text ↔ photo).
-    """
     qid = context.user_data.get("active_question_id")
     if not qid:
         return
  
-    # 1. Load latest question data from DB
     cur.execute(
-        """
-        SELECT question, image_file_id, options, correct, explanation
-        FROM question_bank
-        WHERE id=?
-        """,
+        "SELECT question, image_file_id, options, correct, explanation FROM question_bank WHERE id=?",
         (qid,)
     )
     row = cur.fetchone()
@@ -3329,20 +3270,19 @@ async def rebuild_question_preview(chat_id, context):
     question, image, options, correct, explanation = row
     options = options.split("||")
  
-    # 2. Build preview text
-    safe_question = escape_markdown(question)
-    text = f"📝 *{safe_question}*\n\n"
+    text = f"📝 **{question}**\n\n"
     for i, opt in enumerate(options):
         marker = "✅" if i == correct else "◻️"
-        safe_opt = escape_markdown(opt)
-        text += f"{marker} {safe_opt}\n"
+        text += f"{marker} {opt}\n"
     if explanation:
-        safe_explanation = escape_markdown(explanation)
-        text += f"\n🧾 _{safe_explanation}_"
+        safe_exp = explanation.replace("_", "\\_").replace("*", "\\*")
+        text += f"\n🧾 _{safe_exp}_"
  
-    # 3. Correct delete callback for preview mode
     preview_mode = context.user_data.get("preview_mode", "QUIZ")
-    delete_callback = "DELETE_Q_FROM_DB" if preview_mode == "DATABASE" else "DELETE_Q_FROM_QUIZ"
+    if preview_mode == "DATABASE":
+        delete_callback = "DELETE_Q_FROM_DB"
+    else:
+        delete_callback = "DELETE_Q_FROM_QUIZ"
  
     keyboard = InlineKeyboardMarkup([
         [
@@ -3357,10 +3297,11 @@ async def rebuild_question_preview(chat_id, context):
  
     existing_msg_id = context.user_data.get("question_preview_msg_id")
  
-    # 4. Try to EDIT in-place
+    # ── Try editing in place first ──────────────────────────
     if existing_msg_id:
         try:
             if image:
+                # Existing message might be a photo — try edit_caption
                 await context.bot.edit_message_caption(
                     chat_id=chat_id,
                     message_id=existing_msg_id,
@@ -3369,6 +3310,7 @@ async def rebuild_question_preview(chat_id, context):
                     parse_mode="Markdown"
                 )
             else:
+                # Existing message is text — try edit_text
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=existing_msg_id,
@@ -3376,112 +3318,129 @@ async def rebuild_question_preview(chat_id, context):
                     reply_markup=keyboard,
                     parse_mode="Markdown"
                 )
-            return  # ✅ Edited in-place — done
-        except Exception as e:
-            err = str(e).lower()
-            # Markdown parse error → retry plain
-            if ("can't parse" in err or "parse" in err) and "message to edit not found" not in err:
-                try:
-                    plain = text.replace("*", "").replace("_", "").replace("\\", "")
-                    if image:
-                        await context.bot.edit_message_caption(
-                            chat_id=chat_id,
-                            message_id=existing_msg_id,
-                            caption=plain,
-                            reply_markup=keyboard
-                        )
-                    else:
-                        await context.bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=existing_msg_id,
-                            text=plain,
-                            reply_markup=keyboard
-                        )
-                    return  # ✅ Edited in-place (plain) — done
-                except Exception:
-                    pass  # fall through to delete + resend
- 
-        # Media type changed or message not found → delete old, resend
-        try:
-            await context.bot.delete_message(chat_id, existing_msg_id)
+            return  # ✅ edited in place — done
         except Exception:
-            pass
-        context.user_data.pop("question_preview_msg_id", None)
+            # Media type changed (text→photo or photo→text), or message gone
+            # Fall through to delete+resend
+            try:
+                await context.bot.delete_message(chat_id, existing_msg_id)
+            except Exception:
+                pass
  
-    # 5. Send a fresh message (first open, or after media-type change)
-    try:
-        if image:
-            msg = await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=image,
-                caption=text,
-                reply_markup=keyboard,
-                parse_mode="Markdown"
-            )
-        else:
-            msg = await context.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_markup=keyboard,
-                parse_mode="Markdown"
-            )
-    except Exception as e:
-        print(f"⚠️ rebuild_question_preview Markdown failed, retrying plain: {e}")
-        plain = text.replace("*", "").replace("_", "").replace("\\", "")
-        try:
-            if image:
-                msg = await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=image,
-                    caption=plain,
-                    reply_markup=keyboard
-                )
-            else:
-                msg = await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=plain,
-                    reply_markup=keyboard
-                )
-        except Exception as e2:
-            print(f"⚠️ rebuild_question_preview plain fallback failed: {e2}")
-            return
+    # ── Fallback: send new message ──────────────────────────
+    if image:
+        msg = await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=image,
+            caption=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    else:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
  
     context.user_data["question_preview_msg_id"] = msg.message_id
 
 async def show_question_preview_by_id(chat_id, context):
-    """Delegates to rebuild_question_preview (unified, edit-in-place)."""
-    await rebuild_question_preview(chat_id, context)
+    """
+    Safely rebuilds the question preview without requiring callback_query.
+    Used after editing image.
+    """
+
+    qid = context.user_data.get("active_question_id")
+    if not qid:
+        return
+
+    cur.execute(
+        """
+        SELECT question, image_file_id, options, correct, explanation
+        FROM question_bank
+        WHERE id=?
+        """,
+        (qid,)
+    )
+
+    row = cur.fetchone()
+    if not row:
+        return
+
+    question, image, options, correct, explanation = row
+    options = options.split("||")
+
+    text = f"📝 **{question}**\n\n"
+
+    for i, opt in enumerate(options):
+        marker = "✅" if i == correct else "◻️"
+        text += f"{marker} {opt}\n"
+
+    if explanation:
+        safe_explanation = explanation.replace("_", "\\_").replace("*", "\\*")
+        text += f"\n🧾 _{safe_explanation}_"
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Edit", callback_data="EDIT_Q"),
+            InlineKeyboardButton("⚙️ Manage", callback_data="MANAGE_Q"),
+        ],
+        [
+            InlineKeyboardButton("🗑 Delete", callback_data="DELETE_QUESTION"),
+            InlineKeyboardButton("↩️ Return", callback_data="RETURN_TO_QUESTIONS"),
+        ]
+    ])
+
+    if image:
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=image,
+            caption=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
 
 async def edit_question_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
+ 
     qid = context.user_data.get("active_question_id")
     if not qid:
         await flash_message(context.bot, query.message.chat_id, "❌ No question selected.")
         return
-
-    # 🧠 Build EDIT MENU buttons only
+ 
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📝 Question Text", callback_data="EDIT_Q_TEXT"),
-            InlineKeyboardButton("🖼 Edit Image", callback_data="EDIT_Q_IMAGE"),
+            InlineKeyboardButton("🖼 Edit Image",     callback_data="EDIT_Q_IMAGE"),
         ],
         [
-            InlineKeyboardButton("🔁 Edit Choices", callback_data="EDIT_Q_OPTIONS"),
-            InlineKeyboardButton("✅ Edit Answer", callback_data="EDIT_Q_CORRECT"),
+            InlineKeyboardButton("🔁 Edit Choices",  callback_data="EDIT_Q_OPTIONS"),
+            InlineKeyboardButton("✅ Edit Answer",    callback_data="EDIT_Q_CORRECT"),
         ],
         [
-            InlineKeyboardButton("🧾 Explanation", callback_data="EDIT_Q_EXPLANATION"),
-            InlineKeyboardButton("↩️ Return", callback_data="RETURN_TO_PREVIEW"),
+            InlineKeyboardButton("🧾 Explanation",   callback_data="EDIT_Q_EXPLANATION"),
+            InlineKeyboardButton("↩️ Return",        callback_data="RETURN_TO_PREVIEW"),
         ],
     ])
-
-    # ✅ Only replace inline buttons (NO deletion, NO resend)
+ 
+    # Keep the same message — only swap the buttons
     try:
         await query.message.edit_reply_markup(reply_markup=keyboard)
     except Exception as e:
         print("⚠️ Failed to replace edit menu:", e)
+ 
+    # Ensure the stored ID always points to this message
+    context.user_data["question_preview_msg_id"] = query.message.message_id
 
 async def back_to_question_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -5797,19 +5756,20 @@ async def cancel_shuffle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def cancel_edit_question_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
+ 
     chat_id = query.message.chat_id
-
-    # Delete the prompt message
+ 
     prompt_id = context.user_data.pop("edit_text_prompt_id", None)
     if prompt_id:
         try:
             await context.bot.delete_message(chat_id, prompt_id)
-        except:
+        except Exception:
             pass
-
-    # Exit edit mode safely
+ 
     context.user_data.pop("edit_q_field", None)
+ 
+    # Restore full preview buttons on the existing preview message
+    await rebuild_question_preview(chat_id, context)
 
 async def force_stop_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -6012,7 +5972,6 @@ def build_qb_question_keyboard(context):
     page = context.user_data.get("qb_q_page", 0)
     selected = context.user_data.setdefault("qb_selected", set())
     quiz_id = context.user_data.get("active_quiz_id")
-
     PER_PAGE = 10
 
     cur.execute(
@@ -6047,41 +6006,31 @@ def build_qb_question_keyboard(context):
 
     keyboard = []
 
-    # ======================================================
-    # ROW 1: Add this Page
-    # ======================================================
+    # ── ROW 1: Add this Page ────────────────────────────────
     keyboard.append([
         InlineKeyboardButton("📄 Add this Page", callback_data="QB_ADD_THIS_PAGE"),
     ])
 
-    # ======================================================
-    # ROW 2: Add 10 / Add 50 / Add 100
-    # ======================================================
+    # ── ROW 2: Add 10 / 50 / 100 ───────────────────────────
     keyboard.append([
-        InlineKeyboardButton("🎲 Add 10", callback_data="QB_AUTO_ADD|10"),
-        InlineKeyboardButton("🎲 Add 50", callback_data="QB_AUTO_ADD|50"),
+        InlineKeyboardButton("🎲 Add 10",  callback_data="QB_AUTO_ADD|10"),
+        InlineKeyboardButton("🎲 Add 50",  callback_data="QB_AUTO_ADD|50"),
         InlineKeyboardButton("🎲 Add 100", callback_data="QB_AUTO_ADD|100"),
     ])
 
-    # ======================================================
-    # Question list
-    # ======================================================
+    # ── Question list ───────────────────────────────────────
     for qid, text in page_items:
         already_added = qid in linked_questions
         if already_added:
-            label = f"✅ {text[:45]}"
+            label    = f"✅ {text[:45]}"
             callback = f"QB_REMOVE_Q|{qid}"
         else:
-            checked = "☑" if qid in selected else "⬜"
-            label = f"{checked} {text[:45]}"
+            checked  = "☑" if qid in selected else "⬜"
+            label    = f"{checked} {text[:45]}"
             callback = f"QB_SELECT_Q|{qid}"
-        keyboard.append([
-            InlineKeyboardButton(label, callback_data=callback)
-        ])
+        keyboard.append([InlineKeyboardButton(label, callback_data=callback)])
 
-    # ======================================================
-    # Pagination (above Clear/Add Selected)
-    # ======================================================
+    # ── Pagination (above Clear/Add) ────────────────────────
     if pages > 1:
         nav = []
         if page > 0:
@@ -6091,17 +6040,13 @@ def build_qb_question_keyboard(context):
             nav.append(InlineKeyboardButton("Next ▶", callback_data="QB_Q_NEXT"))
         keyboard.append(nav)
 
-    # ======================================================
-    # Clear Selection + Add Selected
-    # ======================================================
+    # ── Clear Selection + Add Selected ─────────────────────
     keyboard.append([
-        InlineKeyboardButton("🧹 Clear Selection", callback_data="QB_CLEAR_SELECTED"),
-        InlineKeyboardButton(f"➕ Add Selected ({len(selected)})", callback_data="QB_ADD_SELECTED")
+        InlineKeyboardButton("🧹 Clear Selection",       callback_data="QB_CLEAR_SELECTED"),
+        InlineKeyboardButton(f"➕ Add Selected ({len(selected)})", callback_data="QB_ADD_SELECTED"),
     ])
 
-    # ======================================================
-    # Back
-    # ======================================================
+    # ── Back ────────────────────────────────────────────────
     keyboard.append([
         InlineKeyboardButton("⬅️ Back", callback_data="QB_PICK_FOLDER")
     ])
@@ -6200,6 +6145,55 @@ async def qb_add_selected_questions(update: Update, context: ContextTypes.DEFAUL
     context.user_data["reset_q_page"] = True
     await show_questions_from_message(query.message, context)
 
+async def qb_add_this_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Selects all questions visible on the current page."""
+    query = update.callback_query
+    await query.answer()
+
+    folder_name = context.user_data.get("qb_folder_name")
+    page = context.user_data.get("qb_q_page", 0)
+    selected = context.user_data.setdefault("qb_selected", set())
+    quiz_id = context.user_data.get("active_quiz_id")
+    PER_PAGE = 10
+
+    # Resolve folder_id
+    cur.execute(
+        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
+        (OWNER_USER_ID, folder_name)
+    )
+    row = cur.fetchone()
+    if not row:
+        return
+    folder_id = row[0]
+
+    # Load questions in folder
+    cur.execute(
+        "SELECT id FROM question_bank WHERE folder_id=? ORDER BY question COLLATE NOCASE",
+        (folder_id,)
+    )
+    all_questions = [row[0] for row in cur.fetchall()]
+
+    # Load already linked questions
+    cur.execute(
+        "SELECT question_id FROM quiz_question_links WHERE quiz_id=?",
+        (quiz_id,)
+    )
+    linked = {row[0] for row in cur.fetchall()}
+
+    # Get current page items that are NOT already linked
+    total = len(all_questions)
+    pages = (total - 1) // PER_PAGE + 1 if total else 1
+    page = max(0, min(page, pages - 1))
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+
+    for qid in all_questions[start:end]:
+        if qid not in linked:
+            selected.add(qid)
+
+    reply_markup = build_qb_question_keyboard(context)
+    await query.edit_message_reply_markup(reply_markup=reply_markup)
+
 async def qb_remove_question_from_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -6227,57 +6221,6 @@ async def qb_remove_question_from_quiz(update: Update, context: ContextTypes.DEF
         return
 
     # Update the SAME message (no re-send)
-    reply_markup = build_qb_question_keyboard(context)
-    await query.edit_message_reply_markup(reply_markup=reply_markup)
-
-async def qb_add_this_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    quiz_id = context.user_data.get("active_quiz_id")
-    folder_name = context.user_data.get("qb_folder_name")
-    page = context.user_data.get("qb_q_page", 0)
-    selected = context.user_data.setdefault("qb_selected", set())
-
-    PER_PAGE = 10
-
-    # Resolve folder_id
-    cur.execute(
-        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
-        (OWNER_USER_ID, folder_name)
-    )
-    row = cur.fetchone()
-    if not row:
-        return
-    folder_id = row[0]
-
-    # Load questions on this page
-    cur.execute(
-        "SELECT id FROM question_bank WHERE folder_id=? ORDER BY question COLLATE NOCASE",
-        (folder_id,)
-    )
-    all_questions = [row[0] for row in cur.fetchall()]
-
-    # Load already linked
-    cur.execute(
-        "SELECT question_id FROM quiz_question_links WHERE quiz_id=?",
-        (quiz_id,)
-    )
-    linked = {row[0] for row in cur.fetchall()}
-
-    total = len(all_questions)
-    pages = (total - 1) // PER_PAGE + 1 if total else 1
-    page = max(0, min(page, pages - 1))
-
-    start = page * PER_PAGE
-    end = start + PER_PAGE
-    page_items = all_questions[start:end]
-
-    # Add only unlinked questions from this page to selection
-    for qid in page_items:
-        if qid not in linked:
-            selected.add(qid)
-
     reply_markup = build_qb_question_keyboard(context)
     await query.edit_message_reply_markup(reply_markup=reply_markup)
 
@@ -6425,19 +6368,20 @@ async def delete_finish_message(update: Update, context: ContextTypes.DEFAULT_TY
 async def cancel_edit_question_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
+ 
     chat_id = query.message.chat_id
-
-    # Delete image edit menu message
+ 
     menu_id = context.user_data.pop("edit_image_menu_msg_id", None)
     if menu_id:
         try:
             await context.bot.delete_message(chat_id, menu_id)
-        except:
+        except Exception:
             pass
-
-    # Exit image edit mode
+ 
     context.user_data.pop("edit_q_field", None)
+ 
+    # Restore full preview buttons
+    await rebuild_question_preview(chat_id, context)
 
 async def apply_new_options_correct(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -6497,18 +6441,21 @@ async def apply_new_options_correct(update: Update, context: ContextTypes.DEFAUL
 async def cancel_edit_question_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
+ 
     chat_id = query.message.chat_id
-
+ 
     for mid in context.user_data.get("edit_options_flow_msgs", []):
         try:
             await context.bot.delete_message(chat_id, mid)
-        except:
+        except Exception:
             pass
-
+ 
     context.user_data.pop("edit_options_flow_msgs", None)
     context.user_data.pop("edit_options", None)
     context.user_data.pop("edit_q_field", None)
+ 
+    # Restore full preview buttons
+    await rebuild_question_preview(chat_id, context)
 
 async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -6531,67 +6478,52 @@ async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel_edit_question_explanation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
+ 
     chat_id = query.message.chat_id
-
-    # Delete prompt
+ 
     prompt_id = context.user_data.pop("edit_expl_prompt_id", None)
     if prompt_id:
         try:
             await context.bot.delete_message(chat_id, prompt_id)
-        except:
+        except Exception:
             pass
-
+ 
     context.user_data.pop("edit_q_field", None)
+ 
+    # Restore full preview buttons
+    await rebuild_question_preview(chat_id, context)
 
 async def back_to_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
+ 
     chat_id = query.message.chat_id
     preview_mode = context.user_data.get("preview_mode")
-
-    # 🔹 Delete the preview message (photo or text)
-    try:
-        await query.message.delete()
-    except:
-        pass
-
-    # 🔹 Clean stored preview ID
+ 
     context.user_data.pop("question_preview_msg_id", None)
-
-    # =========================
-    # DATABASE MODE → return to folder question list
-    # =========================
+ 
+    # ── DATABASE MODE ────────────────────────────────────────
     if preview_mode == "DATABASE":
         context.user_data.pop("preview_mode", None)
-
-        # 🔍 Return to search results if came from search
+ 
         if context.user_data.get("preview_return") == "DB_SEARCH":
             context.user_data.pop("preview_return", None)
             context.user_data.pop("db_search_list_deleted", None)
-            new_msg = await context.bot.send_message(chat_id=chat_id, text="Loading...")
-            await show_db_search_results(new_msg, context)
+            await show_db_search_results(query.message, context)
             return
-
+ 
         folder_name = context.user_data.get("db_folder_name")
         if not folder_name:
-            new_msg = await context.bot.send_message(chat_id=chat_id, text="Loading...")
-            await show_database_menu(new_msg, context)
+            await show_database_menu(query.message, context)
             return
-
-        new_msg = await context.bot.send_message(chat_id=chat_id, text="Loading...")
-        await show_db_questions_from_message(new_msg, context)
+ 
+        await show_db_questions_from_message(query.message, context)
         return
-
-    # =========================
-    # QUIZ MODE → return to quiz question list
-    # =========================
+ 
+    # ── QUIZ MODE ────────────────────────────────────────────
     context.user_data.pop("preview_mode", None)
     context.user_data["reset_q_page"] = True
-
-    new_msg = await context.bot.send_message(chat_id=chat_id, text="Loading...")
-    await show_questions_from_message(new_msg, context)
+    await show_questions_from_message(query.message, context)
 
 async def show_db_questions_from_message(message, context):
     """
@@ -6948,7 +6880,7 @@ async def mc_folder_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_move_copy_quizzes(message, context):
     PER_PAGE = 5
-    page = context.user_data.get("mc_quiz_page", 0)
+    page   = context.user_data.get("mc_quiz_page", 0)
     folder = context.user_data.get("mc_folder")
 
     cur.execute("""
@@ -6956,32 +6888,26 @@ async def show_move_copy_quizzes(message, context):
         FROM quizzes
         WHERE owner_id=? AND folder=?
     """, (OWNER_USER_ID, folder))
-
     quizzes = cur.fetchall()
 
-    # 🔑 Natural sort (Quiz 2 before Quiz 10)
+    # Natural sort
     quizzes = sorted(quizzes, key=lambda r: natural_sort_key(r[1]))
 
-    total = len(quizzes)
-    pages = (total - 1) // PER_PAGE + 1 if total else 1
-    page = max(0, min(page, pages - 1))
+    total  = len(quizzes)
+    pages  = (total - 1) // PER_PAGE + 1 if total else 1
+    page   = max(0, min(page, pages - 1))
     context.user_data["mc_quiz_page"] = page
 
-    start = page * PER_PAGE
-    end = start + PER_PAGE
+    start      = page * PER_PAGE
+    end        = start + PER_PAGE
     page_items = quizzes[start:end]
 
     keyboard = []
-
     for quiz_id, title in page_items:
         keyboard.append([
-            InlineKeyboardButton(
-                f"📘 {title}",
-                callback_data=f"MC_APPLY|{quiz_id}"
-            )
+            InlineKeyboardButton(f"📘 {title}", callback_data=f"MC_APPLY|{quiz_id}")
         ])
 
-    # 🔄 Pagination
     if pages > 1:
         nav = []
         if page > 0:
@@ -6991,9 +6917,7 @@ async def show_move_copy_quizzes(message, context):
             nav.append(InlineKeyboardButton("Next ▶", callback_data="MC_QUIZ_NEXT"))
         keyboard.append(nav)
 
-    keyboard.append([
-        InlineKeyboardButton("⬅️ Back", callback_data="MOVE_Q_START")
-    ])
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="MOVE_Q_START")])
 
     await safe_edit_message(
         message,
@@ -7044,23 +6968,22 @@ async def return_to_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
  
-    # rebuild_question_preview now edits the message in-place.
-    # No deletion needed — query.message IS the preview message.
+    context.user_data["question_preview_msg_id"] = query.message.message_id
     await rebuild_question_preview(query.message.chat_id, context)
 
 async def manage_question_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    # Safety check
+ 
     qid = context.user_data.get("active_question_id")
     if not qid:
         await flash_message(context.bot, query.message.chat_id, "❌ No question selected.")
         return
-
-    # Reset pagination
+ 
+    # Ensure we can return to the preview from deep inside the manage flow
+    context.user_data["question_preview_msg_id"] = query.message.message_id
+ 
     context.user_data["manage_folder_page"] = 0
-
     await show_manage_folders(query.message, context)
 
 async def show_manage_folders(message, context):
@@ -7156,52 +7079,39 @@ async def manage_open_folder(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def show_manage_quizzes(message, context):
     PER_PAGE = 5
-    page = context.user_data.get("manage_quiz_page", 0)
+    page   = context.user_data.get("manage_quiz_page", 0)
     folder = context.user_data.get("manage_folder")
-    qid = context.user_data.get("active_question_id")
+    qid    = context.user_data.get("active_question_id")
 
-    # Load quizzes in folder
     cur.execute("""
         SELECT quiz_id, title
         FROM quizzes
         WHERE owner_id=? AND folder=?
     """, (OWNER_USER_ID, folder))
-
     quizzes = cur.fetchall()
 
-    # 🔑 Natural sort (Quiz 2 before Quiz 10)
+    # Natural sort
     quizzes = sorted(quizzes, key=lambda r: natural_sort_key(r[1]))
 
-    # Load quizzes already linked to this question
-    cur.execute("""
-        SELECT quiz_id
-        FROM quiz_question_links
-        WHERE question_id=?
-    """, (qid,))
-
+    cur.execute("SELECT quiz_id FROM quiz_question_links WHERE question_id=?", (qid,))
     linked = {row[0] for row in cur.fetchall()}
 
-    total = len(quizzes)
-    pages = (total - 1) // PER_PAGE + 1 if total else 1
-    page = max(0, min(page, pages - 1))
+    total  = len(quizzes)
+    pages  = (total - 1) // PER_PAGE + 1 if total else 1
+    page   = max(0, min(page, pages - 1))
     context.user_data["manage_quiz_page"] = page
 
-    start = page * PER_PAGE
-    end = start + PER_PAGE
+    start      = page * PER_PAGE
+    end        = start + PER_PAGE
     page_items = quizzes[start:end]
 
     keyboard = []
-
     for quiz_id, title in page_items:
         checked = "☑" if quiz_id in linked else "⬜"
         keyboard.append([
-            InlineKeyboardButton(
-                f"{checked} {title}",
-                callback_data=f"MANAGE_TOGGLE|{quiz_id}"
-            )
+            InlineKeyboardButton(f"{checked} {title}", callback_data=f"MANAGE_TOGGLE|{quiz_id}")
         ])
 
-    # Pagination
     if pages > 1:
         nav = []
         if page > 0:
@@ -7211,9 +7121,7 @@ async def show_manage_quizzes(message, context):
             nav.append(InlineKeyboardButton("Next ▶", callback_data="MANAGE_QUIZ_NEXT"))
         keyboard.append(nav)
 
-    keyboard.append([
-        InlineKeyboardButton("⬅️ Back", callback_data="MANAGE_BACK_TO_FOLDERS")
-    ])
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="MANAGE_BACK_TO_FOLDERS")])
 
     await safe_edit_message(
         message,
@@ -7353,37 +7261,41 @@ async def delete_question_from_database(update: Update, context: ContextTypes.DE
         await flash_message(context.bot, query.message.chat_id, "❌ No question selected.")
         return
 
-    # 🔑 Store for confirmation
-    context.user_data["confirm_delete"] = ("QUESTION_FROM_DB", qid)
-
+    # Show confirmation dialog — do NOT delete yet
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ Yes, Delete", callback_data="CONFIRM_DELETE_FROM_DB"),
-            InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_DELETE_FROM_DB"),
+            InlineKeyboardButton("✅ Yes, Delete", callback_data="DB_DELETE_Q_CONFIRM"),
+            InlineKeyboardButton("❌ Cancel", callback_data="DB_DELETE_Q_CANCEL"),
         ]
     ])
 
-    await query.message.reply_text(
-        "⚠️ Are you sure you want to *permanently delete* this question?\n\n"
-        "This will remove it from the Database and from *all quizzes* it belongs to.",
+    msg = await query.message.reply_text(
+        "🗑 *Permanently delete this question?*\n\n"
+        "⚠️ This will remove it from the Database and ALL quizzes it belongs to.",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
 
+    context.user_data["db_delete_q_confirm_msg_id"] = msg.message_id
 
-async def confirm_delete_from_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def db_delete_question_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    data = context.user_data.pop("confirm_delete", None)
-    if not data or data[0] != "QUESTION_FROM_DB":
+    chat_id = query.message.chat_id
+
+    confirm_msg_id = context.user_data.pop("db_delete_q_confirm_msg_id", None)
+    if confirm_msg_id:
         try:
-            await query.message.delete()
+            await context.bot.delete_message(chat_id, confirm_msg_id)
         except:
             pass
-        return
 
-    qid = data[1]
+    qid = context.user_data.get("active_question_id")
+    if not qid:
+        await flash_message(context.bot, chat_id, "❌ No question selected.")
+        return
 
     try:
         async with DB_LOCK:
@@ -7392,44 +7304,37 @@ async def confirm_delete_from_db(update: Update, context: ContextTypes.DEFAULT_T
             conn.commit()
     except Exception as e:
         print("⚠️ Failed to permanently delete question:", e)
-        await query.answer("❌ Failed to delete.", show_alert=True)
+        await flash_message(context.bot, chat_id, "❌ Failed to delete.")
         return
-
-    # 🧹 Delete confirmation dialog
-    try:
-        await query.message.delete()
-    except:
-        pass
-
-    # 🧹 Delete question preview
-    preview_id = context.user_data.pop("question_preview_msg_id", None)
-    if preview_id:
-        try:
-            await context.bot.delete_message(query.message.chat_id, preview_id)
-        except:
-            pass
 
     context.user_data.pop("active_question_id", None)
+    context.user_data.pop("question_preview_msg_id", None)
 
-    # 🔄 Return to correct screen
     if context.user_data.get("preview_return") == "DB_SEARCH":
         context.user_data.pop("preview_return", None)
-        new_msg = await context.bot.send_message(query.message.chat_id, "Loading...")
-        await show_db_search_results(new_msg, context)
+        await show_db_search_results(query.message, context)
         return
 
-    new_msg = await context.bot.send_message(query.message.chat_id, "Loading...")
-    await show_db_questions_from_message(new_msg, context)
+    folder_name = context.user_data.get("db_folder_name")
+    if folder_name:
+        await show_db_questions_from_message(query.message, context)
+    else:
+        await show_database_menu(query.message, context)
 
 
-async def cancel_delete_from_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def db_delete_question_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data.pop("confirm_delete", None)
-    try:
-        await query.message.delete()
-    except:
-        pass
+
+    chat_id = query.message.chat_id
+
+    confirm_msg_id = context.user_data.pop("db_delete_q_confirm_msg_id", None)
+    if confirm_msg_id:
+        try:
+            await context.bot.delete_message(chat_id, confirm_msg_id)
+        except:
+            pass
+    # Leave question preview visible — no redraw needed
 
 async def move_folder_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -8268,10 +8173,10 @@ app.add_handler(CallbackQueryHandler(cancel_edit_question_options, pattern="^CAN
 app.add_handler(CallbackQueryHandler(apply_new_options_correct, pattern="^EDIT_OPT_CORRECT_"))
 app.add_handler(CallbackQueryHandler(cancel_edit_question_text, pattern="^CANCEL_EDIT_Q_TEXT$"))
 app.add_handler(CallbackQueryHandler(delete_finish_message, pattern="^DELETE_FINISH_MSG$"))
-app.add_handler(CallbackQueryHandler(qb_add_this_page, pattern="^QB_ADD_THIS_PAGE$"))
 app.add_handler(CallbackQueryHandler(qb_auto_add_questions, pattern=r"^QB_AUTO_ADD\|"))
 app.add_handler(CallbackQueryHandler(qb_remove_question_from_quiz, pattern=r"^QB_REMOVE_Q\|"))
 app.add_handler(CallbackQueryHandler(qb_add_selected_questions, pattern="^QB_ADD_SELECTED$"))
+app.add_handler(CallbackQueryHandler(qb_add_this_page, pattern="^QB_ADD_THIS_PAGE$"))
 app.add_handler(CallbackQueryHandler(qb_toggle_select_question, pattern="^QB_SELECT_Q\\|"))
 app.add_handler(CallbackQueryHandler(qb_question_prev, pattern="^QB_Q_PREV$"))
 app.add_handler(CallbackQueryHandler(qb_question_next, pattern="^QB_Q_NEXT$"))
@@ -8347,8 +8252,8 @@ app.add_handler(CallbackQueryHandler(remove_question_image, pattern="^EDIT_Q_IMA
 app.add_handler(CallbackQueryHandler(edit_question_back, pattern="^EDIT_Q_BACK$"))
 app.add_handler(CallbackQueryHandler(edit_question_text_start, pattern="^EDIT_Q_TEXT$"))
 app.add_handler(CallbackQueryHandler(delete_question_from_quiz, pattern="^DELETE_Q_FROM_QUIZ$"))
-app.add_handler(CallbackQueryHandler(confirm_delete_from_db, pattern="^CONFIRM_DELETE_FROM_DB$"))
-app.add_handler(CallbackQueryHandler(cancel_delete_from_db, pattern="^CANCEL_DELETE_FROM_DB$"))
+app.add_handler(CallbackQueryHandler(db_delete_question_confirm, pattern="^DB_DELETE_Q_CONFIRM$"))
+app.add_handler(CallbackQueryHandler(db_delete_question_cancel,  pattern="^DB_DELETE_Q_CANCEL$"))
 app.add_handler(CallbackQueryHandler(delete_question_from_database, pattern="^DELETE_Q_FROM_DB$"))
 app.add_handler(CallbackQueryHandler(edit_question_menu, pattern="^EDIT_Q$"))
 app.add_handler(CallbackQueryHandler(back_to_question_options, pattern="^BACK_TO_Q_OPTIONS$"))
