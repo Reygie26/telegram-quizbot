@@ -137,6 +137,14 @@ def natural_sort_key(s):
         for chunk in re.split(r'(\d+)', s)
     ]
 
+def escape_md(text: str) -> str:
+    """Escape special MarkdownV1 characters in dynamic text."""
+    if not text:
+        return ""
+    for ch in ['_', '*', '[', '`']:
+        text = text.replace(ch, f'\\{ch}')
+    return text
+
 # =========================
 # LEADERBOARD KEY HELPER
 # =========================
@@ -891,7 +899,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     opts = q_row[0].split("||")
                     correct_idx = q_row[1]
                     correct_text = opts[correct_idx] if 0 <= correct_idx < len(opts) else "—"
-                    warning_text += f"{i}. {q_text[:80]}\n    ✅ _{correct_text}_\n\n"
+                    warning_text += f"{i}. {escape_md(q_text[:80])}\n    ✅ _{escape_md(correct_text)}_\n\n"
                 else:
                     warning_text += f"{i}. {q_text[:80]}\n\n"
 
@@ -1921,14 +1929,14 @@ async def db_search_preview_question(update: Update, context: ContextTypes.DEFAU
     question, image, options, correct, explanation = row
     options = options.split("||")
 
-    text = f"📝 **{question}**\n\n"
+    text = f"📝 **{escape_md(question)}**\n\n"
+
     for i, opt in enumerate(options):
         marker = "✅" if i == correct else "◻️"
-        text += f"{marker} {opt}\n"
+        text += f"{marker} {escape_md(opt)}\n"
 
     if explanation:
-        safe_exp = explanation.replace("_", "\\_").replace("*", "\\*")
-        text += f"\n🧾 _{safe_exp}_"
+        text += f"\n🧾 _{escape_md(explanation)}_"
 
     keyboard = InlineKeyboardMarkup([
         [
@@ -3207,15 +3215,13 @@ async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     question, image, options, correct, explanation = row
     options = options.split("||")
 
-    text = f"📝 **{question}**\n\n"
-
+    text = f"📝 **{escape_md(question)}**\n\n"
     for i, opt in enumerate(options):
         marker = "✅" if i == correct else "◻️"
-        text += f"{marker} {opt}\n"
+        text += f"{marker} {escape_md(opt)}\n"
 
     if explanation:
-        safe_explanation = explanation.replace("_", "\\_").replace("*", "\\*")
-        text += f"\n🧾 _{safe_explanation}_"
+        text += f"\n🧾 _{escape_md(explanation)}_"
 
     preview_mode = context.user_data.get("preview_mode", "QUIZ")
 
@@ -3270,13 +3276,12 @@ async def rebuild_question_preview(chat_id, context):
     question, image, options, correct, explanation = row
     options = options.split("||")
  
-    text = f"📝 **{question}**\n\n"
+    text = f"📝 **{escape_md(question)}**\n\n"
     for i, opt in enumerate(options):
         marker = "✅" if i == correct else "◻️"
-        text += f"{marker} {opt}\n"
+        text += f"{marker} {escape_md(opt)}\n"
     if explanation:
-        safe_exp = explanation.replace("_", "\\_").replace("*", "\\*")
-        text += f"\n🧾 _{safe_exp}_"
+        text += f"\n🧾 _{escape_md(explanation)}_"
  
     preview_mode = context.user_data.get("preview_mode", "QUIZ")
     if preview_mode == "DATABASE":
@@ -3372,15 +3377,13 @@ async def show_question_preview_by_id(chat_id, context):
     question, image, options, correct, explanation = row
     options = options.split("||")
 
-    text = f"📝 **{question}**\n\n"
-
+    text = f"📝 **{escape_md(question)}**\n\n"
     for i, opt in enumerate(options):
         marker = "✅" if i == correct else "◻️"
-        text += f"{marker} {opt}\n"
+        text += f"{marker} {escape_md(opt)}\n"
 
     if explanation:
-        safe_explanation = explanation.replace("_", "\\_").replace("*", "\\*")
-        text += f"\n🧾 _{safe_explanation}_"
+        text += f"\n🧾 _{escape_md(explanation)}_"
 
     keyboard = InlineKeyboardMarkup([
         [
