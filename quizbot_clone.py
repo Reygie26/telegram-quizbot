@@ -182,7 +182,7 @@ GROUP_LB_MESSAGES = {}   # quiz_id -> {
 
 USER_RATE_LIMIT = {}
 RATE_LIMIT_SECONDS = 1
-SIX_MONTHS_SECONDS = 180 * 24 * 3600  # 6-month token validity
+ONE_YEAR_SECONDS = 365 * 24 * 3600  # 1-year token validity
 
 # =========================
 # DATABASE
@@ -277,6 +277,18 @@ CREATE TABLE IF NOT EXISTS group_leaderboard (
 """)
 conn.commit()
 
+cur.execute("""
+CREATE TABLE IF NOT EXISTS group_lb_messages (
+    leaderboard_key TEXT PRIMARY KEY,
+    quiz_id         TEXT,
+    token           TEXT,
+    chat_id         INTEGER,
+    message_id      INTEGER,
+    page            INTEGER DEFAULT 0
+)
+""")
+conn.commit()
+
 # ===== RUN ONCE: ADD FOLDER COLUMN IF MISSING =====
 # =========================
 # OWNER RESTORE
@@ -307,6 +319,30 @@ def ensure_indexes():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_leaderboard_quiz_chat ON leaderboard(quiz_id, chat_id)")
     
     conn.commit()
+
+def restore_group_lb_messages():
+    """
+    Rebuilds GROUP_LB_MESSAGES from DB after a restart.
+    This is what makes posted quiz links survive deployments.
+    """
+    cur.execute("""
+        SELECT leaderboard_key, quiz_id, token, chat_id, message_id, page
+        FROM group_lb_messages
+    """)
+    rows = cur.fetchall()
+
+    restored = 0
+    for leaderboard_key, quiz_id, token, chat_id, message_id, page in rows:
+        GROUP_LB_MESSAGES[leaderboard_key] = {
+            "quiz_id":    quiz_id,
+            "token":      token,
+            "chat_id":    chat_id,
+            "message_id": message_id,
+            "page":       page,
+        }
+        restored += 1
+
+    print(f"✅ Restored {restored} leaderboard message(s) from DB.")
 
 # =========================
 # UI
@@ -347,7 +383,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         now = int(time.time())
 
-        if not token_row or (now - token_row[0]) > SIX_MONTHS_SECONDS:
+        if not token_row or (now - token_row[0]) > ONE_YEAR_SECONDS:
             msg = await update.message.reply_text("❌ This quiz link is no longer valid.")
             async def _delete_invalid():
                 await asyncio.sleep(5)
@@ -387,11 +423,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["leaderboard_key"] = leaderboard_key
         context.user_data["group_chat_id"] = lb_info["chat_id"]
 
+        # 🔍 Fetch quiz title from DB
+        cur.execute(
+            "SELECT title FROM quizzes WHERE quiz_id=?",
+            (quiz_id,)
+        )
+        title_row = cur.fetchone()
+        quiz_title = title_row[0] if title_row else "Quiz"
+
         msg = await update.message.reply_text(
-            "🎮 Quiz ready!\n\nPress the button below to start.",
+            f"🎮 *Quiz Ready!*\n"
+            f"📘 *{quiz_title}*\n\n"
+            f"Press the button below to start.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("▶️ Start Quiz", callback_data="PLAY_START")]
-            ])
+            ]),
+            parse_mode="Markdown"
         )
 
         context.user_data["chat_messages"].append(msg.message_id)
@@ -866,6 +913,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from difflib import SequenceMatcher
 
         new_text = text.strip()
+        # ── Length validation ──────────────────────────────
+        if len(new_text) > MAX_QUESTION_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Question is too long ({len(new_text)} characters).\n"
+                f"Maximum allowed: {MAX_QUESTION_LENGTH} characters.\n\n"
+                f"Please shorten your question and send it again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(update.effective_chat.id, err.message_id),
+                context.bot.delete_message(update.effective_chat.id, update.message.message_id),
+                return_exceptions=True
+            )
+            return
+        # ──────────────────────────────────────────────────
         similar_matches = []
 
         cur.execute("SELECT id, question FROM question_bank")
@@ -943,6 +1005,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ================= OPTIONS FLOW (NEW QUESTION — DO NOT CHANGE) =================
 
     if q_state == "NEW_Q_OPTION_1":
+        if len(text) > MAX_OPTION_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Option 1 is too long ({len(text)} characters).\n"
+                f"Maximum: {MAX_OPTION_LENGTH} characters. Please send it again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(update.effective_chat.id, err.message_id),
+                context.bot.delete_message(update.effective_chat.id, update.message.message_id),
+                return_exceptions=True
+            )
+            return
         context.user_data["new_question"]["options"].append(text)
         context.user_data["add_q_state"] = "NEW_Q_OPTION_2"
         msg = await update.message.reply_text("➡️ Send option 2:")
@@ -950,6 +1024,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if q_state == "NEW_Q_OPTION_2":
+        if len(text) > MAX_OPTION_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Option 2 is too long ({len(text)} characters).\n"
+                f"Maximum: {MAX_OPTION_LENGTH} characters. Please send it again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(update.effective_chat.id, err.message_id),
+                context.bot.delete_message(update.effective_chat.id, update.message.message_id),
+                return_exceptions=True
+            )
+            return
         context.user_data["new_question"]["options"].append(text)
         context.user_data["add_q_state"] = "NEW_Q_OPTION_3"
         msg = await update.message.reply_text("➡️ Send option 3:")
@@ -957,6 +1043,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if q_state == "NEW_Q_OPTION_3":
+        if len(text) > MAX_OPTION_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Option 3 is too long ({len(text)} characters).\n"
+                f"Maximum: {MAX_OPTION_LENGTH} characters. Please send it again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(update.effective_chat.id, err.message_id),
+                context.bot.delete_message(update.effective_chat.id, update.message.message_id),
+                return_exceptions=True
+            )
+            return
         context.user_data["new_question"]["options"].append(text)
         context.user_data["add_q_state"] = "NEW_Q_OPTION_4"
         msg = await update.message.reply_text("➡️ Send option 4:")
@@ -964,8 +1062,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if q_state == "NEW_Q_OPTION_4":
+        if len(text) > MAX_OPTION_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Option 4 is too long ({len(text)} characters).\n"
+                f"Maximum: {MAX_OPTION_LENGTH} characters. Please send it again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(update.effective_chat.id, err.message_id),
+                context.bot.delete_message(update.effective_chat.id, update.message.message_id),
+                return_exceptions=True
+            )
+            return
         context.user_data["new_question"]["options"].append(text)
         context.user_data["add_q_state"] = "NEW_Q_CORRECT"
+        # ... rest of this block stays exactly as-is
 
         opts = context.user_data["new_question"]["options"]
 
@@ -4339,6 +4450,18 @@ async def send_quiz_to_group(chat_id, quiz_id, context, token):
         "page": 0,
     }
 
+    # 💾 Persist leaderboard message info to DB so it survives restarts
+    try:
+        async with DB_LOCK:
+            cur.execute("""
+                INSERT OR REPLACE INTO group_lb_messages
+                (leaderboard_key, quiz_id, token, chat_id, message_id, page)
+                VALUES (?, ?, ?, ?, ?, 0)
+            """, (leaderboard_key, quiz_id, token, chat_id, msg.message_id))
+            conn.commit()
+    except Exception as e:
+        print("⚠️ Failed to persist lb message info:", e)
+
     GROUP_LEADERBOARDS[leaderboard_key] = {}
 
 def build_group_quiz_text(leaderboard_key, page=0):
@@ -4520,19 +4643,11 @@ async def update_group_leaderboard(leaderboard_key, context):
             try:
                 async with DB_LOCK:
                     # Delete leaderboard rows
-                    cur.execute(
-                        "DELETE FROM group_leaderboard WHERE leaderboard_key=?",
-                        (leaderboard_key,)
-                    )
-
+                    cur.execute("DELETE FROM group_leaderboard WHERE leaderboard_key=?", (leaderboard_key,))
                     # Delete post token (prevents future PLAY)
                     quiz_id, token = leaderboard_key.split(":", 1)
-
-                    cur.execute(
-                        "DELETE FROM quiz_post_tokens WHERE token=? AND quiz_id=?",
-                        (token, quiz_id)
-                    )
-
+                    cur.execute("DELETE FROM quiz_post_tokens WHERE token=? AND quiz_id=?", (token, quiz_id))
+                    cur.execute("DELETE FROM group_lb_messages WHERE leaderboard_key=?", (leaderboard_key,))
                     conn.commit()
 
             except Exception as db_error:
@@ -8121,6 +8236,7 @@ async def db_search_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ensure_default_folder()
 ensure_default_qb_folder()
 ensure_indexes()
+restore_group_lb_messages()
 
 from telegram.ext import ApplicationBuilder
 
