@@ -78,6 +78,8 @@ QUIZ_FOLDERS_PER_PAGE = 5
 PLACEHOLDER_IMAGE_URL = "https://via.placeholder.com/1x1.png"
 PLACEHOLDER_IMAGE_FILE_ID = "AgACAgUAAxkBAAId1GmNwdjStLkxKCsKAodhZXjm9Fc5AAKJDGsbhHpxVPfj2MXOcpF3AQADAgADeQADOgQ"
 DB_LOCK = asyncio.Lock()
+MAX_QUESTION_LENGTH = 500
+MAX_OPTION_LENGTH = 200
 
 ## =========================
 ## START OF CODE
@@ -311,7 +313,7 @@ def ensure_indexes():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_ql_quiz_id ON quiz_question_links(quiz_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_ql_question_id ON quiz_question_links(question_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_ql_quiz_question ON quiz_question_links(quiz_id, question_id)")
-    
+ 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_qb_folder_id ON question_bank(folder_id)")
     
     cur.execute("CREATE INDEX IF NOT EXISTS idx_quizzes_owner_folder ON quizzes(owner_id, folder)")
@@ -321,10 +323,6 @@ def ensure_indexes():
     conn.commit()
 
 def restore_group_lb_messages():
-    """
-    Rebuilds GROUP_LB_MESSAGES from DB after a restart.
-    This is what makes posted quiz links survive deployments.
-    """
     cur.execute("""
         SELECT leaderboard_key, quiz_id, token, chat_id, message_id, page
         FROM group_lb_messages
@@ -333,7 +331,10 @@ def restore_group_lb_messages():
 
     restored = 0
     for leaderboard_key, quiz_id, token, chat_id, message_id, page in rows:
-        GROUP_LB_MESSAGES[leaderboard_key] = {
+        # Rebuild the key from quiz_id + token to guarantee format consistency
+        rebuilt_key = make_leaderboard_key(quiz_id, token)
+
+        GROUP_LB_MESSAGES[rebuilt_key] = {
             "quiz_id":    quiz_id,
             "token":      token,
             "chat_id":    chat_id,
@@ -343,6 +344,25 @@ def restore_group_lb_messages():
         restored += 1
 
     print(f"✅ Restored {restored} leaderboard message(s) from DB.")
+
+def fix_leaderboard_key_format():
+    """One-time fix: ensures all group_lb_messages keys use quiz_id:token format."""
+    cur.execute("SELECT leaderboard_key, quiz_id, token FROM group_lb_messages")
+    rows = cur.fetchall()
+    fixed = 0
+    for key, quiz_id, token in rows:
+        expected = make_leaderboard_key(quiz_id, token)
+        if key != expected:
+            cur.execute(
+                "UPDATE group_lb_messages SET leaderboard_key=? WHERE leaderboard_key=?",
+                (expected, key)
+            )
+            fixed += 1
+    if fixed:
+        conn.commit()
+        print(f"🔧 Fixed {fixed} leaderboard key(s).")
+    else:
+        print("✅ All leaderboard keys are correct.")
 
 # =========================
 # UI
@@ -396,16 +416,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 🔍 Verify leaderboard exists in memory
         lb_info = GROUP_LB_MESSAGES.get(leaderboard_key)
+
+        # ── Fallback: rebuild from DB if memory is cold (e.g. after restart) ──
         if not lb_info:
-            msg = await update.message.reply_text("❌ This quiz link is no longer valid.")
-            async def _delete_invalid():
-                await asyncio.sleep(5)
-                try:
-                    await msg.delete()
-                except:
-                    pass
-            asyncio.create_task(_delete_invalid())
-            return
+            cur.execute(
+                """
+                SELECT quiz_id, token, chat_id, message_id, page
+                FROM group_lb_messages
+                WHERE leaderboard_key = ?
+                """,
+                (leaderboard_key,)
+            )
+            db_row = cur.fetchone()
+
+            if db_row:
+                r_quiz_id, r_token, r_chat_id, r_message_id, r_page = db_row
+                lb_info = {
+                    "quiz_id":    r_quiz_id,
+                    "token":      r_token,
+                    "chat_id":    r_chat_id,
+                    "message_id": r_message_id,
+                    "page":       r_page,
+                }
+                # Repopulate memory so subsequent players don't hit DB again
+                GROUP_LB_MESSAGES[leaderboard_key] = lb_info
+            else:
+                msg = await update.message.reply_text("❌ This quiz link is no longer valid.")
+                async def _delete_invalid():
+                    await asyncio.sleep(5)
+                    try:
+                        await msg.delete()
+                    except:
+                        pass
+                asyncio.create_task(_delete_invalid())
+                return
 
         # 🔒 Reset user state completely
         context.user_data.clear()
@@ -2919,8 +2963,7 @@ async def home_manage_subscribers(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
 
     await flash_message(context.bot, query.message.chat_id, 
-        "👥 **Manage Subscribers**\n\n🚧 This feature is coming soon.",
-        parse_mode="Markdown"
+        "👥 **Manage Subscribers**\n\n🚧 This feature is coming soon."
     )
 
 async def back_to_folders(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8237,6 +8280,7 @@ ensure_default_folder()
 ensure_default_qb_folder()
 ensure_indexes()
 restore_group_lb_messages()
+fix_leaderboard_key_format()
 
 from telegram.ext import ApplicationBuilder
 
