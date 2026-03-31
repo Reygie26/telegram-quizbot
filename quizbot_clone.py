@@ -1453,6 +1453,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
+        # 🔄 SYNC: Refresh all active group posts for this quiz
+        asyncio.create_task(
+            refresh_all_group_posts_for_quiz(quiz_id, context)
+        )
+
         overview_id = context.user_data.get("quiz_overview_msg_id")
         if overview_id:
             await show_quiz_action_menu_by_id(
@@ -1463,6 +1468,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
+    # ================= EDIT DESCRIPTION =================
     # ================= EDIT DESCRIPTION =================
     if state == "EDIT_DESC":
         quiz_id = context.user_data.get("active_quiz_id")
@@ -1509,6 +1515,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await confirm_msg.delete()
         except:
             pass
+
+        # 🔄 SYNC: Refresh all active group posts for this quiz
+        asyncio.create_task(
+            refresh_all_group_posts_for_quiz(quiz_id, context)
+        )
 
         overview_id = context.user_data.get("quiz_overview_msg_id")
         if overview_id:
@@ -2660,7 +2671,6 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not quiz_id:
         return
 
-    # 🔐 SAFE WRITE SECTION
     try:
         async with DB_LOCK:
             cur.execute(
@@ -2673,17 +2683,12 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ Failed to update timer.", show_alert=True)
         return
 
-    # 🔔 Temporary confirmation
     confirm_msg = await query.message.reply_text(
         f"✅ Timer set to {seconds}s."
     )
 
-    # =========================
-    # 🧹 CLEANUP UI MESSAGES
-    # =========================
     prompt_id = context.user_data.pop("edit_timer_prompt_id", None)
 
-    # Delete "Choose timer" prompt
     if prompt_id:
         try:
             await context.bot.delete_message(
@@ -2693,13 +2698,16 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-    # Delete confirmation message
     try:
         await confirm_msg.delete()
     except:
         pass
 
-    # ✅ Refresh quiz overview safely
+    # 🔄 SYNC: Refresh all active group posts for this quiz
+    asyncio.create_task(
+        refresh_all_group_posts_for_quiz(quiz_id, context)
+    )
+
     overview_id = context.user_data.get("quiz_overview_msg_id")
 
     if overview_id:
@@ -2760,7 +2768,6 @@ async def toggle_shuffle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not quiz_id:
         return
 
-    # 🔐 SAFE WRITE SECTION
     try:
         async with DB_LOCK:
             if query.data == "TOGGLE_Q":
@@ -2780,7 +2787,6 @@ async def toggle_shuffle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ Failed to update setting.", show_alert=True)
         return
 
-    # 🧹 Remove shuffle menu (fade effect)
     msg_id = context.user_data.pop("shuffle_menu_msg_id", None)
     if msg_id:
         try:
@@ -2791,7 +2797,11 @@ async def toggle_shuffle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-    # ✅ Return cleanly to quiz overview
+    # 🔄 SYNC: Refresh all active group posts for this quiz
+    asyncio.create_task(
+        refresh_all_group_posts_for_quiz(quiz_id, context)
+    )
+
     overview_id = context.user_data.get("quiz_overview_msg_id")
 
     if overview_id:
@@ -4700,6 +4710,59 @@ async def update_group_leaderboard(leaderboard_key, context):
             # Other harmless errors
             print("⚠️ Failed to edit leaderboard message:", e)
 
+async def refresh_all_group_posts_for_quiz(quiz_id: str, context):
+    cur.execute("""
+        SELECT leaderboard_key, chat_id, message_id, page
+        FROM group_lb_messages
+        WHERE quiz_id = ?
+    """, (quiz_id,))
+
+    posts = cur.fetchall()
+
+    if not posts:
+        return
+
+    for leaderboard_key, chat_id, message_id, page in posts:
+
+        text, pages = build_group_quiz_text(leaderboard_key, page)
+
+        try:
+            _, token = leaderboard_key.split(":", 1)
+        except ValueError:
+            continue
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "▶️ Start Quiz",
+                    url=f"https://t.me/{BOT_USERNAME}?start=PLAY_{quiz_id}_{token}"
+                )
+            ]
+        ])
+
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            error_text = str(e).lower()
+            if "message is not modified" in error_text:
+                pass
+            elif "message to edit not found" in error_text:
+                print(f"🧹 Cleaning deleted post: {leaderboard_key}")
+                cur.execute(
+                    "DELETE FROM group_lb_messages WHERE leaderboard_key=?",
+                    (leaderboard_key,)
+                )
+                GROUP_LB_MESSAGES.pop(leaderboard_key, None)
+                conn.commit()
+            else:
+                print(f"⚠️ Failed to refresh group post {leaderboard_key}:", e)
+
 async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -5794,7 +5857,6 @@ async def qb_select_question(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
 
-    # Safety checks
     quiz_id = context.user_data.get("active_quiz_id")
     if not quiz_id:
         await flash_message(context.bot, query.message.chat_id, "❌ No active quiz.")
@@ -5802,7 +5864,6 @@ async def qb_select_question(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     qid = int(query.data.split("|", 1)[1])
 
-    # ❌ Prevent duplicate link (read only — no lock needed)
     cur.execute(
         """
         SELECT 1
@@ -5812,16 +5873,13 @@ async def qb_select_question(update: Update, context: ContextTypes.DEFAULT_TYPE)
         (quiz_id, qid)
     )
     if cur.fetchone():
-        await flash_message(context.bot, query.message.chat_id, 
+        await flash_message(context.bot, query.message.chat_id,
             "ℹ️ This question is already in the quiz."
         )
         return
 
-    # 🔐 WRITE SECTION (LOCKED)
     try:
         async with DB_LOCK:
-
-            # 🔢 Determine next position safely
             cur.execute(
                 """
                 SELECT COALESCE(MAX(position), 0) + 1
@@ -5832,7 +5890,6 @@ async def qb_select_question(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             position = cur.fetchone()[0]
 
-            # 🔑 LINK question to quiz
             cur.execute(
                 """
                 INSERT INTO quiz_question_links (quiz_id, question_id, position)
@@ -5850,7 +5907,11 @@ async def qb_select_question(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await query.answer("✅ Question added.")
 
-    # 🔁 Reset pagination and return to quiz questions
+    # 🔄 SYNC: Refresh all active group posts for this quiz
+    asyncio.create_task(
+        refresh_all_group_posts_for_quiz(quiz_id, context)
+    )
+
     context.user_data["reset_q_page"] = True
     await show_questions_from_message(query.message, context)
 
@@ -6248,8 +6309,6 @@ async def qb_add_selected_questions(update: Update, context: ContextTypes.DEFAUL
 
     try:
         async with DB_LOCK:
-
-            # 🔢 Get next position in quiz (inside lock)
             cur.execute(
                 """
                 SELECT COALESCE(MAX(position), 0)
@@ -6261,8 +6320,6 @@ async def qb_add_selected_questions(update: Update, context: ContextTypes.DEFAUL
             position = cur.fetchone()[0]
 
             for qid in selected:
-
-                # ❌ Skip duplicates safely
                 cur.execute(
                     """
                     SELECT 1
@@ -6293,16 +6350,18 @@ async def qb_add_selected_questions(update: Update, context: ContextTypes.DEFAUL
         await flash_message(context.bot, query.message.chat_id, "❌ Failed to add questions.")
         return
 
-    # 🧹 Clear selection state (UI state only)
     context.user_data["qb_selected"] = set()
     context.user_data.pop("qb_q_page", None)
 
-    # ✅ Confirmation
-    await flash_message(context.bot, query.message.chat_id, 
+    await flash_message(context.bot, query.message.chat_id,
         f"✅ {added} question(s) added to the quiz."
     )
 
-    # 🔁 Return to quiz question list
+    # 🔄 SYNC: Refresh all active group posts for this quiz
+    asyncio.create_task(
+        refresh_all_group_posts_for_quiz(quiz_id, context)
+    )
+
     context.user_data["reset_q_page"] = True
     await show_questions_from_message(query.message, context)
 
@@ -6365,7 +6424,6 @@ async def qb_remove_question_from_quiz(update: Update, context: ContextTypes.DEF
     if not quiz_id:
         return
 
-    # 🔐 WRITE SECTION (LOCKED)
     try:
         async with DB_LOCK:
             cur.execute(
@@ -6381,7 +6439,11 @@ async def qb_remove_question_from_quiz(update: Update, context: ContextTypes.DEF
         await query.answer("❌ Failed to remove question.", show_alert=True)
         return
 
-    # Update the SAME message (no re-send)
+    # 🔄 SYNC: Refresh all active group posts for this quiz
+    asyncio.create_task(
+        refresh_all_group_posts_for_quiz(quiz_id, context)
+    )
+
     reply_markup = build_qb_question_keyboard(context)
     await query.edit_message_reply_markup(reply_markup=reply_markup)
 
@@ -7362,10 +7424,8 @@ async def qb_clear_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not quiz_id:
         return
 
-    # 1️⃣ Clear manual selection
     context.user_data["qb_selected"] = set()
 
-    # 2️⃣ Unlink all questions from THIS quiz only
     try:
         async with DB_LOCK:
             cur.execute(
@@ -7378,7 +7438,11 @@ async def qb_clear_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ Failed to clear quiz.", show_alert=True)
         return
 
-    # 3️⃣ Rebuild keyboard
+    # 🔄 SYNC: Refresh all active group posts for this quiz
+    asyncio.create_task(
+        refresh_all_group_posts_for_quiz(quiz_id, context)
+    )
+
     reply_markup = build_qb_question_keyboard(context)
 
     try:
