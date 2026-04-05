@@ -8431,6 +8431,27 @@ async def auto_declutter_job(context: ContextTypes.DEFAULT_TYPE):
     # 🧼 Clear user data completely
     context.application.user_data.pop(user_id, None)
 
+async def refresh_all_group_posts(context):
+    """Refreshes ALL active group posts across all quizzes."""
+    cur.execute("SELECT DISTINCT quiz_id FROM group_lb_messages")
+    quiz_ids = [row[0] for row in cur.fetchall()]
+    for quiz_id in quiz_ids:
+        await refresh_all_group_posts_for_quiz(quiz_id, context)
+
+async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return
+    if update.effective_user.id != OWNER_USER_ID:
+        return
+    try:
+        await update.message.delete()
+    except:
+        pass
+    await refresh_all_group_posts(context)
+
 # =========================
 # HANDLERS
 # =========================
@@ -8463,6 +8484,7 @@ app.add_handler(CommandHandler("post", post_quiz_command))
 # =========================
 app.add_handler(CallbackQueryHandler(global_quiz_guard), group=-1)
 # =========================
+app.add_handler(CommandHandler("refresh", refresh_command))
 app.add_handler(CallbackQueryHandler(db_rename_folder_start, pattern="^DB_RENAME_FOLDER\\|"))
 app.add_handler(CallbackQueryHandler(cancel_db_rename_folder, pattern="^CANCEL_DB_RENAME_FOLDER$"))
 app.add_handler(CallbackQueryHandler(db_delete_folder, pattern="^DB_DELETE_FOLDER\\|"))
