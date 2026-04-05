@@ -417,17 +417,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 🔍 Verify leaderboard exists in memory
         lb_info = GROUP_LB_MESSAGES.get(leaderboard_key)
 
-        # ── Fallback: rebuild from DB if memory is cold (e.g. after restart) ──
+        # ── Fallback: rebuild from DB — retry up to 5× with 1s delay
+        # (handles race condition where send_quiz_to_group hasn't committed yet)
         if not lb_info:
-            cur.execute(
-                """
-                SELECT quiz_id, token, chat_id, message_id, page
-                FROM group_lb_messages
-                WHERE leaderboard_key = ?
-                """,
-                (leaderboard_key,)
-            )
-            db_row = cur.fetchone()
+            db_row = None
+            for attempt in range(5):
+                cur.execute(
+                    """
+                    SELECT quiz_id, token, chat_id, message_id, page
+                    FROM group_lb_messages
+                    WHERE leaderboard_key = ?
+                    """,
+                    (leaderboard_key,)
+                )
+                db_row = cur.fetchone()
+                if db_row:
+                    break
+                await asyncio.sleep(1)  # wait 1s and retry
 
             if db_row:
                 r_quiz_id, r_token, r_chat_id, r_message_id, r_page = db_row
@@ -438,7 +444,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "message_id": r_message_id,
                     "page":       r_page,
                 }
-                # Repopulate memory so subsequent players don't hit DB again
                 GROUP_LB_MESSAGES[leaderboard_key] = lb_info
             else:
                 msg = await update.message.reply_text("❌ This quiz link is no longer valid.")
@@ -1259,11 +1264,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         cur.execute(
-            "SELECT 1 FROM folders WHERE owner_id=? AND name=?",
+            "SELECT 1 FROM folders WHERE owner_id=? AND LOWER(name)=LOWER(?)",
             (OWNER_USER_ID, folder_name)
         )
         if cur.fetchone():
-            await update.message.reply_text("❌ Folder already exists.")
+            err = await update.message.reply_text(
+                f"❌ A folder named *{folder_name}* already exists.\n\nPlease send a different name:",
+                parse_mode="Markdown"
+            )
+            await asyncio.sleep(3)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, user_msg_id),
+                return_exceptions=True
+            )
             return
 
         try:
@@ -1323,11 +1337,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         cur.execute(
-            "SELECT 1 FROM folders WHERE owner_id=? AND name=?",
+            "SELECT 1 FROM folders WHERE owner_id=? AND LOWER(name)=LOWER(?)",
             (OWNER_USER_ID, new)
         )
         if cur.fetchone():
-            await update.message.reply_text("❌ A folder with this name already exists.")
+            err = await update.message.reply_text(
+                f"❌ A folder named *{new}* already exists.\n\nPlease send a different name:",
+                parse_mode="Markdown"
+            )
+            await asyncio.sleep(3)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, user_msg_id),
+                return_exceptions=True
+            )
             return
 
         try:
@@ -1373,6 +1396,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         user_msg_id = update.message.message_id
         title = text.strip()
+
+        if not title:
+            err = await update.message.reply_text("❌ Quiz title cannot be empty. Please send a title:")
+            await asyncio.sleep(3)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, user_msg_id),
+                return_exceptions=True
+            )
+            return
+
+        # 🔒 Duplicate title check (case-insensitive)
+        cur.execute(
+            "SELECT 1 FROM quizzes WHERE owner_id=? AND LOWER(title)=LOWER(?)",
+            (OWNER_USER_ID, title)
+        )
+        if cur.fetchone():
+            err = await update.message.reply_text(
+                f"❌ A quiz named *{title}* already exists.\n\nPlease send a different title:",
+                parse_mode="Markdown"
+            )
+            await asyncio.sleep(3)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, user_msg_id),
+                return_exceptions=True
+            )
+            return
 
         try:
             async with DB_LOCK:
@@ -1430,11 +1481,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not quiz_id:
             return
 
+        chat_id = update.effective_chat.id
         user_msg_id = update.message.message_id
+        new_title = text.strip()
+
+        if not new_title:
+            err = await update.message.reply_text("❌ Title cannot be empty. Please send a title:")
+            await asyncio.sleep(3)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, user_msg_id),
+                return_exceptions=True
+            )
+            return
+
+        # 🔒 Duplicate title check (exclude current quiz)
+        cur.execute(
+            "SELECT 1 FROM quizzes WHERE owner_id=? AND LOWER(title)=LOWER(?) AND quiz_id!=?",
+            (OWNER_USER_ID, new_title, quiz_id)
+        )
+        if cur.fetchone():
+            err = await update.message.reply_text(
+                f"❌ A quiz named *{new_title}* already exists.\n\nPlease send a different title:",
+                parse_mode="Markdown"
+            )
+            await asyncio.sleep(3)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, user_msg_id),
+                return_exceptions=True
+            )
+            return
 
         cur.execute(
             "UPDATE quizzes SET title=? WHERE quiz_id=?",
-            (text, quiz_id)
+            (new_title, quiz_id)
         )
         conn.commit()
 
@@ -1445,12 +1526,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompt_id = context.user_data.pop("edit_title_prompt_id", None)
         if prompt_id:
             try:
-                await context.bot.delete_message(update.effective_chat.id, prompt_id)
+                await context.bot.delete_message(chat_id, prompt_id)
             except:
                 pass
 
         try:
-            await context.bot.delete_message(update.effective_chat.id, user_msg_id)
+            await context.bot.delete_message(chat_id, user_msg_id)
         except:
             pass
 
@@ -1459,7 +1540,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-        # 🔄 SYNC: Refresh all active group posts for this quiz
         asyncio.create_task(
             refresh_all_group_posts_for_quiz(quiz_id, context)
         )
@@ -1467,14 +1547,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         overview_id = context.user_data.get("quiz_overview_msg_id")
         if overview_id:
             await show_quiz_action_menu_by_id(
-                chat_id=update.effective_chat.id,
+                chat_id=chat_id,
                 message_id=overview_id,
                 context=context
             )
 
         return
 
-    # ================= EDIT DESCRIPTION =================
     # ================= EDIT DESCRIPTION =================
     if state == "EDIT_DESC":
         quiz_id = context.user_data.get("active_quiz_id")
@@ -3230,14 +3309,27 @@ async def choose_correct_answer(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
 
-    message = query.message  # 🔑 ALWAYS use this in callbacks
-
-    # Extract index (0–3)
+    message = query.message
     correct_index = int(query.data.replace("CORRECT_", ""))
 
     context.user_data["new_question"]["correct"] = correct_index
 
-    # Move to explanation step
+    # ✅ Show green check on selected answer immediately
+    opts = context.user_data["new_question"]["options"]
+    labels = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
+    updated_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{'✅ ' if i == correct_index else ''}{labels[i]} {opts[i]}",
+            callback_data="LOCKED"
+        )]
+        for i in range(len(opts))
+    ])
+
+    try:
+        await query.message.edit_reply_markup(reply_markup=updated_keyboard)
+    except Exception:
+        pass
+
     context.user_data["add_q_state"] = "NEW_Q_EXPLANATION"
 
     keyboard = InlineKeyboardMarkup([
@@ -3249,7 +3341,6 @@ async def choose_correct_answer(update: Update, context: ContextTypes.DEFAULT_TY
         reply_markup=keyboard
     )
 
-    # 🔑 Track explanation prompt
     context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
 
 async def save_new_question(message, context):
@@ -3805,13 +3896,11 @@ async def edit_question_correct_start(update: Update, context: ContextTypes.DEFA
     query = update.callback_query
     await query.answer()
 
-    # 🔒 Safety: ensure a Question Bank question is active
     qid = context.user_data.get("active_question_id")
     if not qid:
         await flash_message(context.bot, query.message.chat_id, "❌ No question selected.")
         return
 
-    # 🔑 Load options + correct answer FROM QUESTION BANK
     cur.execute(
         "SELECT options, correct FROM question_bank WHERE id=?",
         (qid,)
@@ -3823,18 +3912,25 @@ async def edit_question_correct_start(update: Update, context: ContextTypes.DEFA
 
     options_text, current_correct = row
     opts = options_text.split("||")
+    labels = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
 
+    # ✅ Show current correct answer with green check pre-highlighted
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"1️⃣ {opts[0]}", callback_data="EDIT_CORRECT_0")],
-        [InlineKeyboardButton(f"2️⃣ {opts[1]}", callback_data="EDIT_CORRECT_1")],
-        [InlineKeyboardButton(f"3️⃣ {opts[2]}", callback_data="EDIT_CORRECT_2")],
-        [InlineKeyboardButton(f"4️⃣ {opts[3]}", callback_data="EDIT_CORRECT_3")],
+        [InlineKeyboardButton(
+            f"{'✅ ' if i == current_correct else ''}{labels[i]} {opts[i]}",
+            callback_data=f"EDIT_CORRECT_{i}"
+        )]
+        for i in range(len(opts))
     ])
 
-    await query.message.reply_text(
-        "✅ Choose the NEW correct answer:",
-        reply_markup=keyboard
+    msg = await query.message.reply_text(
+        "✅ Choose the NEW correct answer:\n_(current answer is highlighted)_",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
     )
+
+    # Track for cleanup
+    context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
 
 async def edit_question_correct_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3861,6 +3957,26 @@ async def edit_question_correct_apply(update: Update, context: ContextTypes.DEFA
         return
 
     chat_id = query.message.chat_id
+
+    # ✅ Flash green check on selected option before deleting
+    opts_text_row = cur.execute(
+        "SELECT options FROM question_bank WHERE id=?", (qid,)
+    ).fetchone()
+    if opts_text_row:
+        opts = opts_text_row[0].split("||")
+        labels = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
+        flash_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"{'✅ ' if i == correct_index else ''}{labels[i]} {opts[i]}",
+                callback_data="LOCKED"
+            )]
+            for i in range(len(opts))
+        ])
+        try:
+            await query.message.edit_reply_markup(reply_markup=flash_keyboard)
+        except Exception:
+            pass
+        await asyncio.sleep(1)
 
     # 🧹 Delete the "Choose correct answer" message
     try:
@@ -8344,13 +8460,13 @@ def schedule_declutter(user_id: int, chat_id: int, context: ContextTypes.DEFAULT
         job.schedule_removal()
 
     # Schedule new job — 1 hour from now
+    # NOTE: Do NOT pass chat_id/user_id as kwargs to run_once —
+    # they are not supported that way in PTB v20. Use job.data only.
     context.job_queue.run_once(
         auto_declutter_job,
-        when=3600,  # seconds = 1 hour
+        when=3600,
         data={"chat_id": chat_id, "user_id": user_id},
         name=job_name,
-        chat_id=chat_id,
-        user_id=user_id,
     )
 
 async def reset_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
