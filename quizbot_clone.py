@@ -8471,7 +8471,6 @@ restore_group_lb_messages()
 fix_leaderboard_key_format()
 
 from telegram.ext import ApplicationBuilder
-from telegram.ext import JobQueue
 
 app = (
     ApplicationBuilder()
@@ -8480,7 +8479,6 @@ app = (
     .read_timeout(30)
     .write_timeout(30)
     .pool_timeout(30)
-    .job_queue(JobQueue())
     .build()
 )
 
