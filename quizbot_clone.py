@@ -4430,6 +4430,29 @@ async def show_leaderboard(chat_id, quiz_id, bot):
         parse_mode="Markdown"
     )
 
+
+def build_group_post_keyboard(quiz_id: str, token: str, leaderboard_key: str, pages: int = 0, page: int = 0) -> InlineKeyboardMarkup:
+    buttons = []
+
+    # ◀ ▶ Pagination (only if leaderboard has multiple pages)
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"LB_PREV|{leaderboard_key}"))
+        nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="LB_NOP"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data=f"LB_NEXT|{leaderboard_key}"))
+        buttons.append(nav)
+
+    # Always-present action row
+    buttons.append([
+        InlineKeyboardButton("🔄 Reset Score", callback_data=f"RESET_SCORE|{leaderboard_key}"),
+        InlineKeyboardButton("▶️ Start Quiz", url=f"https://t.me/{BOT_USERNAME}?start=PLAY_{quiz_id}_{token}"),
+    ])
+
+    return InlineKeyboardMarkup(buttons)
+
+
 async def send_quiz_to_group(chat_id, quiz_id, context, token):
     # =========================
     # BUILD LEADERBOARD KEY
@@ -4481,18 +4504,7 @@ async def send_quiz_to_group(chat_id, quiz_id, context, token):
     # =========================
     # START BUTTON (TOKEN-BOUND)
     # =========================
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🔄 Reset Score",
-                callback_data=f"RESET_SCORE|{leaderboard_key}"
-            ),
-            InlineKeyboardButton(
-                "▶️ Start Quiz",
-                url=f"https://t.me/{BOT_USERNAME}?start=PLAY_{quiz_id}_{token}"
-            ),
-        ]
-    ])
+    keyboard = build_group_post_keyboard(quiz_id, token, leaderboard_key)
 
     # =========================
     # SEND MESSAGE TO GROUP
@@ -4659,42 +4671,15 @@ async def update_group_leaderboard(leaderboard_key, context):
     # 🔨 Build updated leaderboard text
     text, pages = build_group_quiz_text(leaderboard_key, page)
 
-    buttons = []
-
-    # ◀ ▶ Pagination
-    if pages > 1:
-        nav = []
-        if page > 0:
-            nav.append(
-                InlineKeyboardButton("◀ Prev", callback_data=f"LB_PREV|{leaderboard_key}")
-            )
-        nav.append(
-            InlineKeyboardButton(f"{page+1}/{pages}", callback_data="LB_NOP")
-        )
-        if page < pages - 1:
-            nav.append(
-                InlineKeyboardButton("Next ▶", callback_data=f"LB_NEXT|{leaderboard_key}")
-            )
-        buttons.append(nav)
-
-    # ▶️ Start Quiz + 🔄 Reset Score buttons
-    buttons.append([
-        InlineKeyboardButton(
-            "🔄 Reset Score",
-            callback_data=f"RESET_SCORE|{leaderboard_key}"
-        ),
-        InlineKeyboardButton(
-            "▶️ Start Quiz",
-            url=f"https://t.me/{BOT_USERNAME}?start=PLAY_{quiz_id}_{token}"
-        ),
-    ])
+    # 🔑 Build keyboard from single source of truth
+    keyboard = build_group_post_keyboard(quiz_id, token, leaderboard_key, pages=pages, page=page)
 
     try:
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
             text=text,
-            reply_markup=InlineKeyboardMarkup(buttons),
+            reply_markup=keyboard,
             parse_mode="Markdown"
         )
     except Exception as e:
@@ -4711,14 +4696,11 @@ async def update_group_leaderboard(leaderboard_key, context):
             # 🔐 Remove database records safely
             try:
                 async with DB_LOCK:
-                    # Delete leaderboard rows
                     cur.execute("DELETE FROM group_leaderboard WHERE leaderboard_key=?", (leaderboard_key,))
-                    # Delete post token (prevents future PLAY)
                     quiz_id, token = leaderboard_key.split(":", 1)
                     cur.execute("DELETE FROM quiz_post_tokens WHERE token=? AND quiz_id=?", (token, quiz_id))
                     cur.execute("DELETE FROM group_lb_messages WHERE leaderboard_key=?", (leaderboard_key,))
                     conn.commit()
-
             except Exception as db_error:
                 print("⚠️ Failed to clean DB leaderboard:", db_error)
 
@@ -4747,18 +4729,7 @@ async def refresh_all_group_posts_for_quiz(quiz_id: str, context):
         except ValueError:
             continue
 
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🔄 Reset Score",
-                    callback_data=f"RESET_SCORE|{leaderboard_key}"
-                ),
-                InlineKeyboardButton(
-                    "▶️ Start Quiz",
-                    url=f"https://t.me/{BOT_USERNAME}?start=PLAY_{quiz_id}_{token}"
-                ),
-            ]
-        ])
+        keyboard = build_group_post_keyboard(quiz_id, token, leaderboard_key, pages=pages, page=page)
 
         try:
             await context.bot.edit_message_text(
