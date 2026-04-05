@@ -578,6 +578,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("add_q_state"):
         context.user_data.setdefault("question_flow_msgs", []).append(update.message.message_id)
 
+    # 🔄 Reset inactivity timer on every photo
+    schedule_declutter(update.effective_user.id, update.effective_chat.id, context)
+
     # ================= EDIT QUESTION IMAGE (QUESTION BANK) =================
     if context.user_data.get("edit_q_field") == "IMAGE":
         photo = update.message.photo[-1]
@@ -657,6 +660,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Track user message
     context.user_data.setdefault("chat_messages", []).append(update.message.message_id)
+
+    # 🔄 Reset inactivity timer on every message
+    schedule_declutter(update.effective_user.id, update.effective_chat.id, context)
 
     # ================= DATABASE TEXT FLOW (HARD ISOLATION) =================
     state = context.user_data.get("state")
@@ -4079,8 +4085,9 @@ async def play_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-    # ⏳ Wait 2 seconds before next question
-    await asyncio.sleep(2)
+    # ⏳ Wait longer if explanation was shown
+    pause = 4 if explanation else 0
+    await asyncio.sleep(pause)
 
     # 🔴 HARD ASYNC BOUNDARY
     await asyncio.sleep(0)
@@ -4376,8 +4383,9 @@ async def countdown_timer(user_id, context, seconds, play):
             except:
                 pass
 
-        # ⏳ Wait 2 seconds before advancing
-        await asyncio.sleep(2)
+        # ⏳ Wait longer if explanation was shown
+        pause = 4 if explanation else 0
+        await asyncio.sleep(pause)
 
         # =========================
         # ▶️ Advance Safely
@@ -4476,9 +4484,13 @@ async def send_quiz_to_group(chat_id, quiz_id, context, token):
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
+                "🔄 Reset Score",
+                callback_data=f"RESET_SCORE|{leaderboard_key}"
+            ),
+            InlineKeyboardButton(
                 "▶️ Start Quiz",
                 url=f"https://t.me/{BOT_USERNAME}?start=PLAY_{quiz_id}_{token}"
-            )
+            ),
         ]
     ])
 
@@ -4665,12 +4677,16 @@ async def update_group_leaderboard(leaderboard_key, context):
             )
         buttons.append(nav)
 
-    # ▶️ Start Quiz button (reconstructed safely)
+    # ▶️ Start Quiz + 🔄 Reset Score buttons
     buttons.append([
         InlineKeyboardButton(
-            "▶️ Start this Quiz",
+            "🔄 Reset Score",
+            callback_data=f"RESET_SCORE|{leaderboard_key}"
+        ),
+        InlineKeyboardButton(
+            "▶️ Start Quiz",
             url=f"https://t.me/{BOT_USERNAME}?start=PLAY_{quiz_id}_{token}"
-        )
+        ),
     ])
 
     try:
@@ -4734,9 +4750,13 @@ async def refresh_all_group_posts_for_quiz(quiz_id: str, context):
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
+                    "🔄 Reset Score",
+                    callback_data=f"RESET_SCORE|{leaderboard_key}"
+                ),
+                InlineKeyboardButton(
                     "▶️ Start Quiz",
                     url=f"https://t.me/{BOT_USERNAME}?start=PLAY_{quiz_id}_{token}"
-                )
+                ),
             ]
         ])
 
@@ -6109,6 +6129,10 @@ async def global_quiz_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raise ApplicationHandlerStop
     if not query:
         return
+
+    # 🔄 Reset inactivity timer on every button press
+    if query.message and query.message.chat:
+        schedule_declutter(query.from_user.id, query.message.chat.id, context)
 
     data = query.data or ""
     play = context.user_data.get("play")
@@ -8336,6 +8360,106 @@ async def db_search_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["db_search_page"] = context.user_data.get("db_search_page", 0) + 1
     await show_db_search_results(query.message, context)
 
+def schedule_declutter(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Resets the 1-hour inactivity declutter timer.
+    Cancels any existing job for this user, then schedules a new one.
+    """
+    job_name = f"declutter_{user_id}"
+
+    # Cancel existing job if any
+    current_jobs = context.job_queue.get_jobs_by_name(job_name)
+    for job in current_jobs:
+        job.schedule_removal()
+
+    # Schedule new job — 1 hour from now
+    context.job_queue.run_once(
+        auto_declutter_job,
+        when=3600,  # seconds = 1 hour
+        data={"chat_id": chat_id, "user_id": user_id},
+        name=job_name,
+        chat_id=chat_id,
+        user_id=user_id,
+    )
+
+async def reset_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    user_id = query.from_user.id
+
+    # 🔒 Silent block for non-admins
+    if user_id != OWNER_USER_ID:
+        await query.answer("❌ Only the quiz admin can reset scores.", show_alert=True)
+        return
+
+    await query.answer()
+
+    try:
+        leaderboard_key = query.data.split("|", 1)[1]
+    except (IndexError, ValueError):
+        return
+
+    # 🧹 Clear memory
+    GROUP_LEADERBOARDS.pop(leaderboard_key, None)
+
+    # 🔐 Clear database
+    try:
+        async with DB_LOCK:
+            cur.execute(
+                "DELETE FROM group_leaderboard WHERE leaderboard_key=?",
+                (leaderboard_key,)
+            )
+            conn.commit()
+    except Exception as e:
+        print("⚠️ Reset score DB error:", e)
+        return
+
+    # 🔄 Refresh group post immediately
+    await update_group_leaderboard(leaderboard_key, context)
+
+async def auto_declutter_job(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    chat_id = job.data.get("chat_id")
+    user_id = job.data.get("user_id")
+
+    if not chat_id:
+        return
+
+    # Get user_data for this user
+    user_data = context.application.user_data.get(user_id, {})
+
+    # 🧹 Delete all tracked chat messages
+    message_ids = list(user_data.get("chat_messages", []))
+    question_flow_ids = list(user_data.get("question_flow_msgs", []))
+    all_ids = list(set(message_ids + question_flow_ids))
+
+    # Also clean up any active quiz messages
+    play = user_data.get("play")
+    if play:
+        for mid in play.get("question_message_ids", []):
+            all_ids.append(mid)
+        for mid in play.get("timer_message_ids", []):
+            all_ids.append(mid)
+        task = play.get("timer_task")
+        if task:
+            task.cancel()
+
+    # Also clean question preview
+    preview_id = user_data.get("question_preview_msg_id")
+    if preview_id:
+        all_ids.append(preview_id)
+
+    # Delete all collected message IDs
+    delete_tasks = [
+        context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        for mid in set(all_ids)
+    ]
+    if delete_tasks:
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+    # 🧼 Clear user data completely
+    context.application.user_data.pop(user_id, None)
+
 # =========================
 # HANDLERS
 # =========================
@@ -8347,6 +8471,7 @@ restore_group_lb_messages()
 fix_leaderboard_key_format()
 
 from telegram.ext import ApplicationBuilder
+from telegram.ext import JobQueue
 
 app = (
     ApplicationBuilder()
@@ -8355,6 +8480,7 @@ app = (
     .read_timeout(30)
     .write_timeout(30)
     .pool_timeout(30)
+    .job_queue(JobQueue())
     .build()
 )
 
@@ -8414,6 +8540,7 @@ app.add_handler(CallbackQueryHandler(shuffle_back, pattern="^SHUFFLE_BACK$"))
 app.add_handler(CallbackQueryHandler(resume_quiz, pattern="^RESUME_QUIZ$"))
 app.add_handler(CallbackQueryHandler(force_stop_quiz, pattern="^FORCE_STOP_QUIZ$"))
 app.add_handler(CallbackQueryHandler(post_quiz_to_group, pattern="^POST_QUIZ$"))
+app.add_handler(CallbackQueryHandler(reset_score, pattern=r"^RESET_SCORE\|"))
 app.add_handler(CallbackQueryHandler(cancel_create_question, pattern="^CANCEL_CREATE_QUESTION$"))
 app.add_handler(CallbackQueryHandler(qb_move_question, pattern="^QB_MOVE$"))
 app.add_handler(CallbackQueryHandler(qb_move_apply, pattern="^QB_MOVE_TO\\|"))
