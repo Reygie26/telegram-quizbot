@@ -1755,12 +1755,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
 
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("♾ Lifetime",  callback_data="SUB_DURATION|Lifetime")],
-            [InlineKeyboardButton("📅 1 Year",   callback_data="SUB_DURATION|1 Year"),
-             InlineKeyboardButton("📅 6 Months", callback_data="SUB_DURATION|6 Months")],
-            [InlineKeyboardButton("📅 1 Month",  callback_data="SUB_DURATION|1 Month"),
-             InlineKeyboardButton("📅 1 Week",   callback_data="SUB_DURATION|1 Week")],
-            [InlineKeyboardButton("📅 1 Day",    callback_data="SUB_DURATION|1 Day")],
+            [InlineKeyboardButton("📅 1 Day",    callback_data="SUB_DURATION|1 Day"),
+             InlineKeyboardButton("📅 1 Week",   callback_data="SUB_DURATION|1 Week"),
+             InlineKeyboardButton("📅 1 Month",  callback_data="SUB_DURATION|1 Month")],
+            [InlineKeyboardButton("📅 6 Months", callback_data="SUB_DURATION|6 Months"),
+             InlineKeyboardButton("📅 1 Year",   callback_data="SUB_DURATION|1 Year"),
+             InlineKeyboardButton("♾ Lifetime",  callback_data="SUB_DURATION|Lifetime")],
             [InlineKeyboardButton("❌ Cancel",   callback_data="SUB_CANCEL")],
         ])
         msg = await context.bot.send_message(
@@ -1771,9 +1771,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data["sub_prompt_id"] = msg.message_id
         return
-
-
-
 
 # =========================
 # DELETE QUESTION
@@ -8801,29 +8798,49 @@ async def sub_apply_duration(update, context):
     sub_type  = query.data.split("|", 1)[1]
     user_id   = context.user_data.get("sub_new_user_id")
     name      = context.user_data.get("sub_new_name")
-    is_renew  = "sub_renew_id" in context.user_data   # True when renewing
+    is_renew  = "sub_renew_id" in context.user_data
 
     if not user_id or not name:
         await flash_message(context.bot, query.message.chat_id, "❌ Subscriber data lost.")
         return
 
-    now        = int(time.time())
-    duration   = SUBSCRIPTION_DURATIONS.get(sub_type, 0)
-    expires_at = 0 if sub_type == "Lifetime" else now + duration
+    now      = int(time.time())
+    duration = SUBSCRIPTION_DURATIONS.get(sub_type, 0)
 
+    # ── PROBLEM 2 FIX: When renewing, ADD duration to remaining time ──
+    if is_renew and sub_type != "Lifetime":
+        cur.execute("SELECT expires_at, subscription_type FROM subscribers WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+        if row:
+            current_expires, current_type = row
+            if current_type == "Lifetime":
+                # Already lifetime — no change needed
+                expires_at = 0
+            else:
+                # Add new duration on top of remaining time
+                # If already expired, start counting from now
+                base = max(current_expires, now)
+                expires_at = base + duration
+        else:
+            expires_at = now + duration
+    elif sub_type == "Lifetime":
+        expires_at = 0
+    else:
+        expires_at = now + duration
+
+    # ── PROBLEM 3 FIX: subscribed_at = now (latest action date) ──
     try:
         async with DB_LOCK:
             if is_renew:
-                # UPDATE existing row — preserve original subscribed_at
                 cur.execute("""
                     UPDATE subscribers
                     SET subscription_type = ?,
                         expires_at        = ?,
-                        is_active         = 1
+                        is_active         = 1,
+                        subscribed_at     = ?
                     WHERE user_id = ?
-                """, (sub_type, expires_at, user_id))
+                """, (sub_type, expires_at, now, user_id))
             else:
-                # INSERT new subscriber — record subscribed_at = now
                 cur.execute("""
                     INSERT OR REPLACE INTO subscribers
                     (user_id, name, subscription_type, expires_at, is_active, subscribed_at)
@@ -8872,6 +8889,18 @@ async def _show_sub_list(message, context, active: bool):
     Tapping opens sub_overview.
     """
     now = int(time.time())
+
+    # ── PROBLEM 1 FIX: Auto-expire any overdue subscribers before listing ──
+    async with DB_LOCK:
+        cur.execute("""
+            UPDATE subscribers
+            SET is_active = 0
+            WHERE subscription_type != 'Lifetime'
+              AND expires_at > 0
+              AND expires_at <= ?
+              AND is_active = 1
+        """, (now,))
+        conn.commit()
 
     if active:
         cur.execute("""
@@ -9017,12 +9046,12 @@ async def sub_renew(update, context):
     context.user_data["sub_new_user_id"] = target_id
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("♾ Lifetime",  callback_data="SUB_DURATION|Lifetime")],
-        [InlineKeyboardButton("📅 1 Year",   callback_data="SUB_DURATION|1 Year"),
-         InlineKeyboardButton("📅 6 Months", callback_data="SUB_DURATION|6 Months")],
-        [InlineKeyboardButton("📅 1 Month",  callback_data="SUB_DURATION|1 Month"),
-         InlineKeyboardButton("📅 1 Week",   callback_data="SUB_DURATION|1 Week")],
-        [InlineKeyboardButton("📅 1 Day",    callback_data="SUB_DURATION|1 Day")],
+        [InlineKeyboardButton("📅 1 Day",    callback_data="SUB_DURATION|1 Day"),
+         InlineKeyboardButton("📅 1 Week",   callback_data="SUB_DURATION|1 Week"),
+         InlineKeyboardButton("📅 1 Month",  callback_data="SUB_DURATION|1 Month")],
+        [InlineKeyboardButton("📅 6 Months", callback_data="SUB_DURATION|6 Months"),
+         InlineKeyboardButton("📅 1 Year",   callback_data="SUB_DURATION|1 Year"),
+         InlineKeyboardButton("♾ Lifetime",  callback_data="SUB_DURATION|Lifetime")],
         [InlineKeyboardButton("❌ Cancel",   callback_data=f"SUB_VIEW|{target_id}")],
     ])
 
