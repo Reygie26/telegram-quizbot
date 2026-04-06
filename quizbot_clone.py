@@ -8963,10 +8963,10 @@ async def sub_overview(update, context):
         sub_date = "—"
 
     # ── Days Remaining ─────────────────────────────────────
-    if s_type == "Lifetime":
+    if not is_active:
+        remaining_text = "0 days (Revoked)"
+    elif s_type == "Lifetime":
         remaining_text = "Lifetime (no expiry)"
-    elif not is_active:
-        remaining_text = "Revoked / Inactive"
     elif expires_at and expires_at > now:
         days = (expires_at - now) // 86400
         expiry_date = datetime.datetime.utcfromtimestamp(expires_at).strftime("%B %d, %Y")
@@ -8985,9 +8985,14 @@ async def sub_overview(update, context):
     list_type = context.user_data.get("sub_list_type", "active")
     back_cb = f"SUB_LIST|{list_type}"
 
+    if list_type == "inactive":
+        action_button = InlineKeyboardButton("🗑 Delete", callback_data=f"SUB_DELETE|{user_id}")
+    else:
+        action_button = InlineKeyboardButton("🚫 Revoke", callback_data=f"SUB_REVOKE|{user_id}")
+
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🚫 Revoke",  callback_data=f"SUB_REVOKE|{user_id}"),
+            action_button,
             InlineKeyboardButton("🔄 Renew",   callback_data=f"SUB_RENEW|{user_id}"),
             InlineKeyboardButton("⬅️ Back",    callback_data=back_cb),
         ]
@@ -9115,6 +9120,28 @@ async def sub_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("sub_new_user_id", None)
     context.user_data.pop("sub_new_name", None)
 
+async def sub_delete(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    target_id = int(query.data.split("|", 1)[1])
+
+    cur.execute("SELECT name FROM subscribers WHERE user_id=?", (target_id,))
+    row = cur.fetchone()
+    name = row[0] if row else str(target_id)
+
+    try:
+        async with DB_LOCK:
+            cur.execute("DELETE FROM subscribers WHERE user_id=?", (target_id,))
+            conn.commit()
+    except Exception as e:
+        print("⚠️ Failed to delete subscriber:", e)
+        await flash_message(context.bot, query.message.chat_id, "❌ Delete failed.")
+        return
+
+    await flash_message(context.bot, query.message.chat_id, f"🗑 {name} removed from subscribers.")
+    await home_manage_subscribers_from_message(query.message, context)
+
 # =========================
 # HANDLERS
 # =========================
@@ -9160,6 +9187,7 @@ app.add_handler(CallbackQueryHandler(sub_revoke_confirm,      pattern="^SUB_REVO
 app.add_handler(CallbackQueryHandler(sub_revoke_apply,        pattern="^SUB_REVOKE_CONFIRM$"))
 app.add_handler(CallbackQueryHandler(sub_revoke_cancel,       pattern="^SUB_REVOKE_CANCEL$"))
 app.add_handler(CallbackQueryHandler(sub_cancel,              pattern="^SUB_CANCEL$"))
+app.add_handler(CallbackQueryHandler(sub_delete, pattern="^SUB_DELETE\\|"))
 app.add_handler(CallbackQueryHandler(db_rename_folder_start, pattern="^DB_RENAME_FOLDER\\|"))
 app.add_handler(CallbackQueryHandler(cancel_db_rename_folder, pattern="^CANCEL_DB_RENAME_FOLDER$"))
 app.add_handler(CallbackQueryHandler(db_delete_folder, pattern="^DB_DELETE_FOLDER\\|"))
