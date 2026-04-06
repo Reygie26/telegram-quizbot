@@ -80,6 +80,14 @@ PLACEHOLDER_IMAGE_FILE_ID = "AgACAgUAAxkBAAId1GmNwdjStLkxKCsKAodhZXjm9Fc5AAKJDGs
 DB_LOCK = asyncio.Lock()
 MAX_QUESTION_LENGTH = 500
 MAX_OPTION_LENGTH = 200
+SUBSCRIPTION_DURATIONS = {
+    "Lifetime":   0,
+    "1 Year":     365 * 24 * 3600,
+    "6 Months":   183 * 24 * 3600,
+    "1 Month":    30  * 24 * 3600,
+    "1 Week":     7   * 24 * 3600,
+    "1 Day":      1   * 24 * 3600,
+}
 
 ## =========================
 ## START OF CODE
@@ -146,6 +154,25 @@ def escape_md(text: str) -> str:
     for ch in ['_', '*', '[', '`']:
         text = text.replace(ch, f'\\{ch}')
     return text
+
+def is_authorized(user_id: int) -> bool:
+    if user_id == OWNER_USER_ID:
+        return True
+    now = int(time.time())
+    cur.execute("""
+        SELECT subscription_type, expires_at, is_active
+        FROM subscribers
+        WHERE user_id = ?
+    """, (user_id,))
+    row = cur.fetchone()
+    if not row:
+        return False
+    subscription_type, expires_at, is_active = row
+    if not is_active:
+        return False
+    if subscription_type == "Lifetime":
+        return True
+    return expires_at > now
 
 # =========================
 # LEADERBOARD KEY HELPER
@@ -290,6 +317,19 @@ CREATE TABLE IF NOT EXISTS group_lb_messages (
 )
 """)
 conn.commit()
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS subscribers (
+    user_id INTEGER PRIMARY KEY,
+    name TEXT,
+    subscription_type TEXT,
+    expires_at INTEGER,
+    is_active INTEGER DEFAULT 1
+)
+""")
+conn.commit()
+
+
 
 # ===== RUN ONCE: ADD FOLDER COLUMN IF MISSING =====
 # =========================
@@ -497,12 +537,38 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_type in ("group", "supergroup", "channel"):
         return
 
-    # 🔒 Private chat but NOT owner
+    # 🔒 Private chat but NOT owner — check subscriber access
     if user_id != OWNER_USER_ID:
+        if not is_authorized(user_id):
+            msg = await update.message.reply_text(
+                "👋 Hi!\n\nPlease open a quiz from a group to start answering.\nYou don't have access to the admin panel."
+            )
+            context.user_data.setdefault("chat_messages", []).append(msg.message_id)
+            return
+        # ✅ Authorized subscriber — show admin panel
+        context.user_data.clear()
+        context.user_data["chat_messages"] = []
+        if update.message:
+            context.user_data["chat_messages"].append(update.message.message_id)
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📂 Quiz Folder", callback_data="HOME_MY_QUIZZES"),
+                InlineKeyboardButton("➕ Create a new Quiz", callback_data="HOME_CREATE"),
+            ],
+            [
+                InlineKeyboardButton("🗄 Database", callback_data="HOME_DATABASE"),
+                InlineKeyboardButton("❓ Create a Question", callback_data="HOME_CREATE_QUESTION"),
+            ],
+        ])
+
         msg = await update.message.reply_text(
-            "👋 Hi!\n\nPlease open a quiz from a group to start answering.\nYou don’t have access to the admin panel."
+            "🧠 **Welcome to TeleQuiz Admin Panel**\n\nPlease choose an option:",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
         )
-        context.user_data.setdefault("chat_messages", []).append(msg.message_id)
+        context.user_data["chat_messages"].append(msg.message_id)
+        track_bot_message(context, msg.message_id)
         return
 
     # ✅ OWNER — show admin home
@@ -529,7 +595,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     msg = await update.message.reply_text(
-        "🧠 **Welcome to TeleQuiz a Telegram Quiz Bot personally created by Engr. Reygie M. Gorgonio to provide review solutions (Admin Panel)**\n\nPlease choose an option:",
+        "🧠 **Welcome to TeleQuiz, a smart Telegram Quiz Bot created by Engr. Reygie M. Gorgonio designed to make quizzes organized, competitive and fun (Admin Panel)**\n\nPlease choose an option:",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
@@ -1615,6 +1681,93 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         return
+
+    # SUB_WAIT_USER_ID
+    if state == "SUB_WAIT_USER_ID":
+        chat_id = update.effective_chat.id
+        try:
+            new_user_id = int(text.strip())
+        except ValueError:
+            err = await update.message.reply_text("❌ Invalid User ID. Please send numbers only.")
+            await asyncio.sleep(2)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, update.message.message_id),
+                return_exceptions=True
+            )
+            return
+
+        # 🔍 Validate: check if this Telegram User ID actually exists
+        try:
+            await context.bot.get_chat(new_user_id)
+        except Exception:
+            err = await context.bot.send_message(
+                chat_id,
+                f"❌ User ID `{new_user_id}` not found on Telegram.\n\nPlease send a valid User ID:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Cancel", callback_data="SUB_CANCEL")]
+                ])
+            )
+            context.user_data["sub_prompt_id"] = err.message_id
+            return
+
+        context.user_data["sub_new_user_id"] = new_user_id
+        context.user_data["state"] = "SUB_WAIT_NAME"
+
+        # Cleanup
+        prompt_id = context.user_data.pop("sub_prompt_id", None)
+        if prompt_id:
+            try: await context.bot.delete_message(chat_id, prompt_id)
+            except: pass
+        try: await context.bot.delete_message(chat_id, update.message.message_id)
+        except: pass
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="SUB_CANCEL")]
+        ])
+        msg = await context.bot.send_message(
+            chat_id,
+            f"✅ User ID `{new_user_id}` accepted.\n\n📝 Now send the *Subscriber Name*:",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+        context.user_data["sub_prompt_id"] = msg.message_id
+        return
+
+    # SUB_WAIT_NAME
+    if state == "SUB_WAIT_NAME":
+        chat_id = update.effective_chat.id
+        context.user_data["sub_new_name"] = text.strip()
+        context.user_data["state"] = "SUB_WAIT_DURATION"
+
+        prompt_id = context.user_data.pop("sub_prompt_id", None)
+        if prompt_id:
+            try: await context.bot.delete_message(chat_id, prompt_id)
+            except: pass
+        try: await context.bot.delete_message(chat_id, update.message.message_id)
+        except: pass
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("♾ Lifetime",  callback_data="SUB_DURATION|Lifetime")],
+            [InlineKeyboardButton("📅 1 Year",   callback_data="SUB_DURATION|1 Year"),
+             InlineKeyboardButton("📅 6 Months", callback_data="SUB_DURATION|6 Months")],
+            [InlineKeyboardButton("📅 1 Month",  callback_data="SUB_DURATION|1 Month"),
+             InlineKeyboardButton("📅 1 Week",   callback_data="SUB_DURATION|1 Week")],
+            [InlineKeyboardButton("📅 1 Day",    callback_data="SUB_DURATION|1 Day")],
+            [InlineKeyboardButton("❌ Cancel",   callback_data="SUB_CANCEL")],
+        ])
+        msg = await context.bot.send_message(
+            chat_id,
+            f"👤 Name: *{text.strip()}*\n\n⏳ Select subscription duration:",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+        context.user_data["sub_prompt_id"] = msg.message_id
+        return
+
+
+
 
 # =========================
 # DELETE QUESTION
@@ -2905,7 +3058,9 @@ async def go_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data.pop("preview_mode", None)
 
-    keyboard = InlineKeyboardMarkup([
+    user_id = query.from_user.id
+
+    rows = [
         [
             InlineKeyboardButton("📂 Quiz Folder", callback_data="HOME_MY_QUIZZES"),
             InlineKeyboardButton("➕ Create a new Quiz", callback_data="HOME_CREATE"),
@@ -2914,14 +3069,17 @@ async def go_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🗄 Database", callback_data="HOME_DATABASE"),
             InlineKeyboardButton("❓ Create a Question", callback_data="HOME_CREATE_QUESTION"),
         ],
-        [
+    ]
+
+    # 👑 Only the owner sees Manage Subscribers
+    if user_id == OWNER_USER_ID:
+        rows.append([
             InlineKeyboardButton("👥 Manage Subscribers", callback_data="HOME_MANAGE_SUBSCRIBERS"),
-        ]
-    ])
+        ])
 
     await query.message.edit_text(
         "🏠 Home Menu",
-        reply_markup=keyboard
+        reply_markup=InlineKeyboardMarkup(rows)
     )
 
 def home_button():
@@ -8568,6 +8726,293 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     await refresh_all_group_posts(context)
 
+async def home_manage_subscribers(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    if query.from_user.id != OWNER_USER_ID:
+        await flash_message(context.bot, query.message.chat_id,
+            "❌ Only the Bot Creator can manage subscribers."
+        )
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Subscriber", callback_data="SUB_ADD")],
+        [InlineKeyboardButton("♾ Lifetime",    callback_data="SUB_LIST|Lifetime")],
+        [InlineKeyboardButton("📅 1 Year",      callback_data="SUB_LIST|1 Year"),
+         InlineKeyboardButton("📅 6 Months",    callback_data="SUB_LIST|6 Months")],
+        [InlineKeyboardButton("📅 1 Month",     callback_data="SUB_LIST|1 Month"),
+         InlineKeyboardButton("📅 1 Week",      callback_data="SUB_LIST|1 Week")],
+        [InlineKeyboardButton("📅 1 Day",       callback_data="SUB_LIST|1 Day")],
+        [InlineKeyboardButton("❌ Expired",     callback_data="SUB_LIST|Expired")],
+        [InlineKeyboardButton("🏠 Home",        callback_data="GO_HOME")],
+    ])
+
+    await query.message.edit_text(
+        "👥 *Manage Subscribers*",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+async def home_manage_subscribers_from_message(message, context):
+    """
+    Redraws the Manage Subscribers menu on an existing message object.
+    Used after adding a subscriber to return cleanly to the menu.
+    """
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Subscriber", callback_data="SUB_ADD")],
+        [InlineKeyboardButton("♾ Lifetime",    callback_data="SUB_LIST|Lifetime")],
+        [InlineKeyboardButton("📅 1 Year",      callback_data="SUB_LIST|1 Year"),
+         InlineKeyboardButton("📅 6 Months",    callback_data="SUB_LIST|6 Months")],
+        [InlineKeyboardButton("📅 1 Month",     callback_data="SUB_LIST|1 Month"),
+         InlineKeyboardButton("📅 1 Week",      callback_data="SUB_LIST|1 Week")],
+        [InlineKeyboardButton("📅 1 Day",       callback_data="SUB_LIST|1 Day")],
+        [InlineKeyboardButton("❌ Expired",     callback_data="SUB_LIST|Expired")],
+        [InlineKeyboardButton("🏠 Home",        callback_data="GO_HOME")],
+    ])
+
+    try:
+        await message.edit_text(
+            "👥 *Manage Subscribers*",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    except Exception:
+        await context.bot.send_message(
+            chat_id=message.chat_id,
+            text="👥 *Manage Subscribers*",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+
+async def sub_add_start(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["state"] = "SUB_WAIT_USER_ID"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="SUB_CANCEL")]
+    ])
+
+    msg = await query.message.reply_text(
+        "➕ *Add Subscriber*\n\n📋 Send the Telegram *User ID*:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    context.user_data["sub_prompt_id"] = msg.message_id
+
+async def sub_apply_duration(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    sub_type = query.data.split("|", 1)[1]
+    user_id  = context.user_data.get("sub_new_user_id")
+    name     = context.user_data.get("sub_new_name")
+
+    if not user_id or not name:
+        await flash_message(context.bot, query.message.chat_id, "❌ Subscriber data lost.")
+        return
+
+    now = int(time.time())
+    duration = SUBSCRIPTION_DURATIONS.get(sub_type, 0)
+    expires_at = 0 if sub_type == "Lifetime" else now + duration
+
+    try:
+        async with DB_LOCK:
+            cur.execute("""
+                INSERT OR REPLACE INTO subscribers
+                (user_id, name, subscription_type, expires_at, is_active)
+                VALUES (?, ?, ?, ?, 1)
+            """, (user_id, name, sub_type, expires_at))
+            conn.commit()
+    except Exception as e:
+        print("⚠️ Failed to add subscriber:", e)
+        await flash_message(context.bot, query.message.chat_id, "❌ Failed to add subscriber.")
+        return
+
+    # Cleanup prompt
+    try: await query.message.delete()
+    except: pass
+
+    # Cleanup state
+    context.user_data.pop("sub_new_user_id", None)
+    context.user_data.pop("sub_new_name", None)
+    context.user_data.pop("state", None)
+
+    await flash_message(
+        context.bot, query.message.chat_id,
+        f"✅ Subscriber *{name}* added with *{sub_type}* access.",
+        delay=2
+    )
+
+    # Return to Manage Subscribers menu
+    # (reuse the existing message or send new)
+    await home_manage_subscribers_from_message(query.message, context)
+
+async def sub_list(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    sub_type = query.data.split("|", 1)[1]
+    now = int(time.time())
+
+    if sub_type == "Expired":
+        cur.execute("""
+            SELECT user_id, name, subscription_type, expires_at
+            FROM subscribers
+            WHERE is_active = 0
+               OR (subscription_type != 'Lifetime' AND expires_at <= ?)
+            ORDER BY name COLLATE NOCASE
+        """, (now,))
+    else:
+        cur.execute("""
+            SELECT user_id, name, subscription_type, expires_at
+            FROM subscribers
+            WHERE subscription_type = ?
+              AND is_active = 1
+              AND (subscription_type = 'Lifetime' OR expires_at > ?)
+            ORDER BY name COLLATE NOCASE
+        """, (sub_type, now))
+
+    rows = cur.fetchall()
+
+    keyboard = []
+
+    if not rows:
+        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="HOME_MANAGE_SUBSCRIBERS")])
+        await query.message.edit_text(
+            f"📋 *{sub_type}*\n\n_No subscribers found._",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return
+
+    text = f"📋 *{sub_type} Subscribers*\n\n"
+
+    for user_id, name, s_type, expires_at in rows:
+        if s_type == "Lifetime":
+            remaining = "Lifetime"
+        elif expires_at == 0:
+            remaining = "Expired"
+        else:
+            diff = expires_at - now
+            if diff <= 0:
+                remaining = "Expired"
+            else:
+                days = diff // 86400
+                remaining = f"{days} day(s)"
+
+        text += (
+            f"🆔 `{user_id}`\n"
+            f"👤 {name}\n"
+            f"📦 {s_type}\n"
+            f"⏳ Remaining: {remaining}\n"
+        )
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🚫 Revoke — {name}",
+                callback_data=f"SUB_REVOKE|{user_id}"
+            )
+        ])
+        text += "\n"
+
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="HOME_MANAGE_SUBSCRIBERS")])
+
+    await query.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def sub_revoke_confirm(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    target_id = int(query.data.split("|", 1)[1])
+
+    cur.execute("SELECT name FROM subscribers WHERE user_id=?", (target_id,))
+    row = cur.fetchone()
+    name = row[0] if row else str(target_id)
+
+    context.user_data["sub_revoke_id"] = target_id
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Yes, Revoke", callback_data="SUB_REVOKE_CONFIRM"),
+            InlineKeyboardButton("❌ Cancel",      callback_data="SUB_REVOKE_CANCEL"),
+        ]
+    ])
+
+    await query.message.reply_text(
+        f"⚠️ Revoke access for *{name}*?\n\nThey will lose admin access immediately.",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+async def sub_revoke_apply(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    target_id = context.user_data.pop("sub_revoke_id", None)
+    if not target_id:
+        return
+
+    try:
+        async with DB_LOCK:
+            cur.execute("""
+                UPDATE subscribers
+                SET is_active = 0, expires_at = 0
+                WHERE user_id = ?
+            """, (target_id,))
+            conn.commit()
+    except Exception as e:
+        print("⚠️ Revoke failed:", e)
+        return
+
+    try: await query.message.delete()
+    except: pass
+
+    await flash_message(context.bot, query.message.chat_id, "✅ Subscriber revoked.")
+
+async def sub_revoke_cancel(update, context):
+    query = update.callback_query
+    await query.answer()
+    try: await query.message.delete()
+    except: pass
+
+async def auto_expire_subscribers(context):
+    now = int(time.time())
+    async with DB_LOCK:
+        cur.execute("""
+            UPDATE subscribers
+            SET is_active = 0
+            WHERE subscription_type != 'Lifetime'
+              AND expires_at > 0
+              AND expires_at <= ?
+              AND is_active = 1
+        """, (now,))
+        conn.commit()
+
+async def sub_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+
+    # 🧹 Delete the prompt message
+    prompt_id = context.user_data.pop("sub_prompt_id", None)
+    if prompt_id:
+        try:
+            await context.bot.delete_message(chat_id, prompt_id)
+        except Exception:
+            pass
+
+    # 🧹 Clear all subscriber flow state
+    context.user_data.pop("state", None)
+    context.user_data.pop("sub_new_user_id", None)
+    context.user_data.pop("sub_new_name", None)
+
 # =========================
 # HANDLERS
 # =========================
@@ -8590,17 +9035,28 @@ app = (
     .build()
 )
 
+app.job_queue.run_repeating(auto_expire_subscribers, interval=3600, first=10)
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("clear", clear_chat))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 app.add_handler(CommandHandler("post", post_quiz_command))
+
 # =========================
 # Must Stay on Top of other CallbackQueryHandler
 # =========================
 app.add_handler(CallbackQueryHandler(global_quiz_guard), group=-1)
 # =========================
 app.add_handler(CommandHandler("refresh", refresh_command))
+
+app.add_handler(CallbackQueryHandler(home_manage_subscribers, pattern="^HOME_MANAGE_SUBSCRIBERS$"))
+app.add_handler(CallbackQueryHandler(sub_add_start,           pattern="^SUB_ADD$"))
+app.add_handler(CallbackQueryHandler(sub_apply_duration,      pattern="^SUB_DURATION\\|"))
+app.add_handler(CallbackQueryHandler(sub_list,                pattern="^SUB_LIST\\|"))
+app.add_handler(CallbackQueryHandler(sub_revoke_confirm,      pattern="^SUB_REVOKE\\|"))
+app.add_handler(CallbackQueryHandler(sub_revoke_apply,        pattern="^SUB_REVOKE_CONFIRM$"))
+app.add_handler(CallbackQueryHandler(sub_revoke_cancel,       pattern="^SUB_REVOKE_CANCEL$"))
+app.add_handler(CallbackQueryHandler(sub_cancel, pattern="^SUB_CANCEL$"))
 app.add_handler(CallbackQueryHandler(db_rename_folder_start, pattern="^DB_RENAME_FOLDER\\|"))
 app.add_handler(CallbackQueryHandler(cancel_db_rename_folder, pattern="^CANCEL_DB_RENAME_FOLDER$"))
 app.add_handler(CallbackQueryHandler(db_delete_folder, pattern="^DB_DELETE_FOLDER\\|"))
@@ -8686,7 +9142,6 @@ app.add_handler(CallbackQueryHandler(qb_pick_folder_start, pattern="^QB_PICK_FOL
 app.add_handler(CallbackQueryHandler(qb_folder_prev, pattern="^QB_FOLDER_PREV$"))
 app.add_handler(CallbackQueryHandler(qb_folder_next, pattern="^QB_FOLDER_NEXT$"))
 app.add_handler(CallbackQueryHandler(home_create_question, pattern="^HOME_CREATE_QUESTION$"))
-app.add_handler(CallbackQueryHandler(home_manage_subscribers, pattern="^HOME_MANAGE_SUBSCRIBERS$"))
 app.add_handler(CallbackQueryHandler(database_add_folder_start, pattern="^DB_ADD$"))
 app.add_handler(CallbackQueryHandler(confirm_delete, pattern="^CONFIRM_DELETE$"))
 app.add_handler(CallbackQueryHandler(cancel_delete, pattern="^CANCEL_DELETE$"))
