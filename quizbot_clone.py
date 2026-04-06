@@ -11,6 +11,7 @@ import sqlite3
 import os
 import secrets
 import time
+import datetime
 
 from telegram.ext import ApplicationHandlerStop
 from telegram import InputMediaPhoto
@@ -324,12 +325,17 @@ CREATE TABLE IF NOT EXISTS subscribers (
     name TEXT,
     subscription_type TEXT,
     expires_at INTEGER,
-    is_active INTEGER DEFAULT 1
+    is_active INTEGER DEFAULT 1,
+    subscribed_at INTEGER DEFAULT 0
 )
 """)
 conn.commit()
 
-
+try:
+    cur.execute("ALTER TABLE subscribers ADD COLUMN subscribed_at INTEGER DEFAULT 0")
+    conn.commit()
+except Exception:
+    pass  # Column already exists — safe to ignore
 
 # ===== RUN ONCE: ADD FOLDER COLUMN IF MISSING =====
 # =========================
@@ -8737,15 +8743,10 @@ async def home_manage_subscribers(update, context):
         return
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Subscriber", callback_data="SUB_ADD")],
-        [InlineKeyboardButton("♾ Lifetime",    callback_data="SUB_LIST|Lifetime")],
-        [InlineKeyboardButton("📅 1 Year",      callback_data="SUB_LIST|1 Year"),
-         InlineKeyboardButton("📅 6 Months",    callback_data="SUB_LIST|6 Months")],
-        [InlineKeyboardButton("📅 1 Month",     callback_data="SUB_LIST|1 Month"),
-         InlineKeyboardButton("📅 1 Week",      callback_data="SUB_LIST|1 Week")],
-        [InlineKeyboardButton("📅 1 Day",       callback_data="SUB_LIST|1 Day")],
-        [InlineKeyboardButton("❌ Expired",     callback_data="SUB_LIST|Expired")],
-        [InlineKeyboardButton("🏠 Home",        callback_data="GO_HOME")],
+        [InlineKeyboardButton("➕ Add Subscriber",       callback_data="SUB_ADD")],
+        [InlineKeyboardButton("✅ Active Subscriptions",  callback_data="SUB_LIST|active")],
+        [InlineKeyboardButton("❌ Inactive Subscriptions",callback_data="SUB_LIST|inactive")],
+        [InlineKeyboardButton("🏠 Home",                 callback_data="GO_HOME")],
     ])
 
     await query.message.edit_text(
@@ -8755,20 +8756,11 @@ async def home_manage_subscribers(update, context):
     )
 
 async def home_manage_subscribers_from_message(message, context):
-    """
-    Redraws the Manage Subscribers menu on an existing message object.
-    Used after adding a subscriber to return cleanly to the menu.
-    """
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Subscriber", callback_data="SUB_ADD")],
-        [InlineKeyboardButton("♾ Lifetime",    callback_data="SUB_LIST|Lifetime")],
-        [InlineKeyboardButton("📅 1 Year",      callback_data="SUB_LIST|1 Year"),
-         InlineKeyboardButton("📅 6 Months",    callback_data="SUB_LIST|6 Months")],
-        [InlineKeyboardButton("📅 1 Month",     callback_data="SUB_LIST|1 Month"),
-         InlineKeyboardButton("📅 1 Week",      callback_data="SUB_LIST|1 Week")],
-        [InlineKeyboardButton("📅 1 Day",       callback_data="SUB_LIST|1 Day")],
-        [InlineKeyboardButton("❌ Expired",     callback_data="SUB_LIST|Expired")],
-        [InlineKeyboardButton("🏠 Home",        callback_data="GO_HOME")],
+        [InlineKeyboardButton("➕ Add Subscriber",        callback_data="SUB_ADD")],
+        [InlineKeyboardButton("✅ Active Subscriptions",  callback_data="SUB_LIST|active")],
+        [InlineKeyboardButton("❌ Inactive Subscriptions",callback_data="SUB_LIST|inactive")],
+        [InlineKeyboardButton("🏠 Home",                  callback_data="GO_HOME")],
     ])
 
     try:
@@ -8806,58 +8798,92 @@ async def sub_apply_duration(update, context):
     query = update.callback_query
     await query.answer()
 
-    sub_type = query.data.split("|", 1)[1]
-    user_id  = context.user_data.get("sub_new_user_id")
-    name     = context.user_data.get("sub_new_name")
+    sub_type  = query.data.split("|", 1)[1]
+    user_id   = context.user_data.get("sub_new_user_id")
+    name      = context.user_data.get("sub_new_name")
+    is_renew  = "sub_renew_id" in context.user_data   # True when renewing
 
     if not user_id or not name:
         await flash_message(context.bot, query.message.chat_id, "❌ Subscriber data lost.")
         return
 
-    now = int(time.time())
-    duration = SUBSCRIPTION_DURATIONS.get(sub_type, 0)
+    now        = int(time.time())
+    duration   = SUBSCRIPTION_DURATIONS.get(sub_type, 0)
     expires_at = 0 if sub_type == "Lifetime" else now + duration
 
     try:
         async with DB_LOCK:
-            cur.execute("""
-                INSERT OR REPLACE INTO subscribers
-                (user_id, name, subscription_type, expires_at, is_active)
-                VALUES (?, ?, ?, ?, 1)
-            """, (user_id, name, sub_type, expires_at))
+            if is_renew:
+                # UPDATE existing row — preserve original subscribed_at
+                cur.execute("""
+                    UPDATE subscribers
+                    SET subscription_type = ?,
+                        expires_at        = ?,
+                        is_active         = 1
+                    WHERE user_id = ?
+                """, (sub_type, expires_at, user_id))
+            else:
+                # INSERT new subscriber — record subscribed_at = now
+                cur.execute("""
+                    INSERT OR REPLACE INTO subscribers
+                    (user_id, name, subscription_type, expires_at, is_active, subscribed_at)
+                    VALUES (?, ?, ?, ?, 1, ?)
+                """, (user_id, name, sub_type, expires_at, now))
             conn.commit()
     except Exception as e:
-        print("⚠️ Failed to add subscriber:", e)
-        await flash_message(context.bot, query.message.chat_id, "❌ Failed to add subscriber.")
+        print("⚠️ Failed to save subscriber:", e)
+        await flash_message(context.bot, query.message.chat_id, "❌ Operation failed.")
         return
 
-    # Cleanup prompt
-    try: await query.message.delete()
-    except: pass
-
-    # Cleanup state
+    # ── Cleanup state ──────────────────────────────────────
     context.user_data.pop("sub_new_user_id", None)
     context.user_data.pop("sub_new_name", None)
+    context.user_data.pop("sub_renew_id", None)
     context.user_data.pop("state", None)
 
+    action_word = "renewed" if is_renew else "added"
     await flash_message(
         context.bot, query.message.chat_id,
-        f"✅ Subscriber *{name}* added with *{sub_type}* access.",
+        f"✅ *{name}* {action_word} with *{sub_type}* access.",
         delay=2
     )
 
-    # Return to Manage Subscribers menu
-    # (reuse the existing message or send new)
     await home_manage_subscribers_from_message(query.message, context)
 
 async def sub_list(update, context):
+    """Router: dispatches to active or inactive list."""
     query = update.callback_query
     await query.answer()
 
-    sub_type = query.data.split("|", 1)[1]
+    mode = query.data.split("|", 1)[1]
+
+    if mode == "active":
+        await _show_sub_list(query.message, context, active=True)
+    else:
+        await _show_sub_list(query.message, context, active=False)
+
+
+async def _show_sub_list(message, context, active: bool):
+    """
+    Shared renderer for active / inactive subscriber lists.
+    Each subscriber appears as a single inline button:
+        [Name — X days remaining]   (active)
+        [Name — Expired]            (inactive)
+    Tapping opens sub_overview.
+    """
     now = int(time.time())
 
-    if sub_type == "Expired":
+    if active:
+        cur.execute("""
+            SELECT user_id, name, subscription_type, expires_at
+            FROM subscribers
+            WHERE is_active = 1
+              AND (subscription_type = 'Lifetime' OR expires_at > ?)
+            ORDER BY name COLLATE NOCASE
+        """, (now,))
+        header = "✅ *Active Subscriptions*"
+        empty_text = "✅ *Active Subscriptions*\n\n_No active subscribers yet._"
+    else:
         cur.execute("""
             SELECT user_id, name, subscription_type, expires_at
             FROM subscribers
@@ -8865,63 +8891,139 @@ async def sub_list(update, context):
                OR (subscription_type != 'Lifetime' AND expires_at <= ?)
             ORDER BY name COLLATE NOCASE
         """, (now,))
-    else:
-        cur.execute("""
-            SELECT user_id, name, subscription_type, expires_at
-            FROM subscribers
-            WHERE subscription_type = ?
-              AND is_active = 1
-              AND (subscription_type = 'Lifetime' OR expires_at > ?)
-            ORDER BY name COLLATE NOCASE
-        """, (sub_type, now))
+        header = "❌ *Inactive Subscriptions*"
+        empty_text = "❌ *Inactive Subscriptions*\n\n_No inactive subscribers._"
 
     rows = cur.fetchall()
-
     keyboard = []
 
     if not rows:
         keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="HOME_MANAGE_SUBSCRIBERS")])
-        await query.message.edit_text(
-            f"📋 *{sub_type}*\n\n_No subscribers found._",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
+        await message.edit_text(empty_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
-
-    text = f"📋 *{sub_type} Subscribers*\n\n"
 
     for user_id, name, s_type, expires_at in rows:
         if s_type == "Lifetime":
-            remaining = "Lifetime"
-        elif expires_at == 0:
-            remaining = "Expired"
+            badge = "Lifetime"
+        elif expires_at and expires_at > now:
+            days = (expires_at - now) // 86400
+            badge = f"{days}d left"
         else:
-            diff = expires_at - now
-            if diff <= 0:
-                remaining = "Expired"
-            else:
-                days = diff // 86400
-                remaining = f"{days} day(s)"
+            badge = "Expired"
 
-        text += (
-            f"🆔 `{user_id}`\n"
-            f"👤 {name}\n"
-            f"📦 {s_type}\n"
-            f"⏳ Remaining: {remaining}\n"
-        )
         keyboard.append([
             InlineKeyboardButton(
-                f"🚫 Revoke — {name}",
-                callback_data=f"SUB_REVOKE|{user_id}"
+                f"{name}  •  {badge}",
+                callback_data=f"SUB_VIEW|{user_id}"
             )
         ])
-        text += "\n"
 
     keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="HOME_MANAGE_SUBSCRIBERS")])
 
-    await query.message.edit_text(
-        text,
+    list_type = "active" if active else "inactive"
+    await message.edit_text(
+        header,
         reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    # Store so the Back button in sub_overview knows where to return
+    context.user_data["sub_list_type"] = list_type
+
+
+async def sub_overview(update, context):
+    """
+    Shows full details of one subscriber.
+    Buttons: [Revoke] [Renew] [Back]
+    """
+    query = update.callback_query
+    await query.answer()
+
+    target_id = int(query.data.split("|", 1)[1])
+    context.user_data["sub_view_id"] = target_id
+
+    now = int(time.time())
+
+    cur.execute("""
+        SELECT user_id, name, subscription_type, expires_at, is_active, subscribed_at
+        FROM subscribers
+        WHERE user_id = ?
+    """, (target_id,))
+    row = cur.fetchone()
+
+    if not row:
+        await query.answer("❌ Subscriber not found.", show_alert=True)
+        return
+
+    user_id, name, s_type, expires_at, is_active, subscribed_at = row
+
+    # ── Subscription Date ──────────────────────────────────
+    if subscribed_at and subscribed_at > 0:
+        sub_date = datetime.datetime.utcfromtimestamp(subscribed_at).strftime("%B %d, %Y")
+    else:
+        sub_date = "—"
+
+    # ── Days Remaining ─────────────────────────────────────
+    if s_type == "Lifetime":
+        remaining_text = "Lifetime (no expiry)"
+    elif not is_active:
+        remaining_text = "Revoked / Inactive"
+    elif expires_at and expires_at > now:
+        days = (expires_at - now) // 86400
+        expiry_date = datetime.datetime.utcfromtimestamp(expires_at).strftime("%B %d, %Y")
+        remaining_text = f"{days} day(s) (expires {expiry_date})"
+    else:
+        remaining_text = "Expired"
+
+    text = (
+        f"👤 *{name}*\n\n"
+        f"🆔 User ID: `{user_id}`\n"
+        f"📅 Subscribed: {sub_date}\n"
+        f"📦 Duration: {s_type}\n"
+        f"⏳ Remaining: {remaining_text}"
+    )
+
+    list_type = context.user_data.get("sub_list_type", "active")
+    back_cb = f"SUB_LIST|{list_type}"
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🚫 Revoke",  callback_data=f"SUB_REVOKE|{user_id}"),
+            InlineKeyboardButton("🔄 Renew",   callback_data=f"SUB_RENEW|{user_id}"),
+            InlineKeyboardButton("⬅️ Back",    callback_data=back_cb),
+        ]
+    ])
+
+    await query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+
+async def sub_renew(update, context):
+    """Opens the duration picker to renew an existing subscriber."""
+    query = update.callback_query
+    await query.answer()
+
+    target_id = int(query.data.split("|", 1)[1])
+    context.user_data["sub_renew_id"] = target_id
+
+    # Pre-fill name so sub_apply_duration can use it
+    cur.execute("SELECT name FROM subscribers WHERE user_id=?", (target_id,))
+    row = cur.fetchone()
+    name = row[0] if row else str(target_id)
+    context.user_data["sub_new_name"] = name
+    context.user_data["sub_new_user_id"] = target_id
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("♾ Lifetime",  callback_data="SUB_DURATION|Lifetime")],
+        [InlineKeyboardButton("📅 1 Year",   callback_data="SUB_DURATION|1 Year"),
+         InlineKeyboardButton("📅 6 Months", callback_data="SUB_DURATION|6 Months")],
+        [InlineKeyboardButton("📅 1 Month",  callback_data="SUB_DURATION|1 Month"),
+         InlineKeyboardButton("📅 1 Week",   callback_data="SUB_DURATION|1 Week")],
+        [InlineKeyboardButton("📅 1 Day",    callback_data="SUB_DURATION|1 Day")],
+        [InlineKeyboardButton("❌ Cancel",   callback_data=f"SUB_VIEW|{target_id}")],
+    ])
+
+    await query.message.edit_text(
+        f"🔄 *Renew subscription for {name}*\n\nSelect new duration:",
+        reply_markup=keyboard,
         parse_mode="Markdown"
     )
 
@@ -9048,15 +9150,16 @@ app.add_handler(CommandHandler("post", post_quiz_command))
 app.add_handler(CallbackQueryHandler(global_quiz_guard), group=-1)
 # =========================
 app.add_handler(CommandHandler("refresh", refresh_command))
-
 app.add_handler(CallbackQueryHandler(home_manage_subscribers, pattern="^HOME_MANAGE_SUBSCRIBERS$"))
 app.add_handler(CallbackQueryHandler(sub_add_start,           pattern="^SUB_ADD$"))
 app.add_handler(CallbackQueryHandler(sub_apply_duration,      pattern="^SUB_DURATION\\|"))
 app.add_handler(CallbackQueryHandler(sub_list,                pattern="^SUB_LIST\\|"))
+app.add_handler(CallbackQueryHandler(sub_overview,            pattern="^SUB_VIEW\\|"))
+app.add_handler(CallbackQueryHandler(sub_renew,               pattern="^SUB_RENEW\\|"))
 app.add_handler(CallbackQueryHandler(sub_revoke_confirm,      pattern="^SUB_REVOKE\\|"))
 app.add_handler(CallbackQueryHandler(sub_revoke_apply,        pattern="^SUB_REVOKE_CONFIRM$"))
 app.add_handler(CallbackQueryHandler(sub_revoke_cancel,       pattern="^SUB_REVOKE_CANCEL$"))
-app.add_handler(CallbackQueryHandler(sub_cancel, pattern="^SUB_CANCEL$"))
+app.add_handler(CallbackQueryHandler(sub_cancel,              pattern="^SUB_CANCEL$"))
 app.add_handler(CallbackQueryHandler(db_rename_folder_start, pattern="^DB_RENAME_FOLDER\\|"))
 app.add_handler(CallbackQueryHandler(cancel_db_rename_folder, pattern="^CANCEL_DB_RENAME_FOLDER$"))
 app.add_handler(CallbackQueryHandler(db_delete_folder, pattern="^DB_DELETE_FOLDER\\|"))
