@@ -156,6 +156,13 @@ def escape_md(text: str) -> str:
         text = text.replace(ch, f'\\{ch}')
     return text
 
+def get_active_user_id(context) -> int:
+    """
+    Returns the logged-in user's ID from session.
+    Falls back to OWNER_USER_ID if not set (safety net).
+    """
+    return context.user_data.get("active_user_id", OWNER_USER_ID)
+
 def is_authorized(user_id: int) -> bool:
     if user_id == OWNER_USER_ID:
         return True
@@ -547,12 +554,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id != OWNER_USER_ID:
         if not is_authorized(user_id):
             msg = await update.message.reply_text(
-                "👋 Hi!\n\nPlease open a quiz from a group to start answering.\nYou don't have access to the admin panel."
+                "👋 Hi!\n\nYou don't have Admin access to this Bot yet. To begin, open a Quiz posted in a group and start answering or avail Admin access.\n\nTo avail of Admin access, please contact the Bot creator on Telegram:\nReygie Marimon Gorgonio\nContact No. : 0928 180 2793\nTelegram      : @Eucresia\n\nTeleQuiz Bot Official links\nChannel : https://t.me/Bot_TeleQuiz\nGroup    : https://t.me/+pbioRS0BWN4wZjM9\n\nYou can also DM the Official Channel to avail Admin Access to the Bot"
             )
             context.user_data.setdefault("chat_messages", []).append(msg.message_id)
             return
         # ✅ Authorized subscriber — show admin panel
         context.user_data.clear()
+        context.user_data["active_user_id"] = user_id
         context.user_data["chat_messages"] = []
         if update.message:
             context.user_data["chat_messages"].append(update.message.message_id)
@@ -580,6 +588,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ✅ OWNER — show admin home
     # 🔒 HARD RESET: entering admin mode must clear play state
     context.user_data.clear()
+    context.user_data["active_user_id"] = user_id
     context.user_data["chat_messages"] = []
 
     # 🔥 Track /start again after reset
@@ -774,7 +783,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             WHERE owner_id=?
               AND LOWER(name) = LOWER(?)
             """,
-            (OWNER_USER_ID, normalized)
+            (get_active_user_id(context), normalized)
         )
         if cur.fetchone():
             await update.message.reply_text("❌ Folder already exists.")
@@ -785,7 +794,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with DB_LOCK:
                 cur.execute(
                     "INSERT INTO question_bank_folders (owner_id, name) VALUES (?, ?)",
-                    (OWNER_USER_ID, normalized)
+                    (get_active_user_id(context), normalized)
                 )
                 conn.commit()
         except Exception as e:
@@ -845,7 +854,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             WHERE owner_id=?
               AND LOWER(name) = LOWER(?)
             """,
-            (OWNER_USER_ID, new_name)
+            (get_active_user_id(context), new_name)
         )
         if cur.fetchone():
             await update.message.reply_text("❌ A folder with this name already exists.")
@@ -856,7 +865,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with DB_LOCK:
                 cur.execute(
                     "UPDATE question_bank_folders SET name=? WHERE owner_id=? AND name=?",
-                    (new_name, OWNER_USER_ID, old_name)
+                    (new_name, get_active_user_id(context), old_name)
                 )
                 conn.commit()
         except Exception as e:
@@ -1277,7 +1286,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         cur.execute(
             "SELECT 1 FROM folders WHERE owner_id=? AND name=?",
-            (OWNER_USER_ID, folder)
+            (get_active_user_id(context), folder)
         )
         if cur.fetchone():
             await update.message.reply_text("❌ Folder already exists.")
@@ -1285,7 +1294,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         cur.execute(
             "INSERT INTO folders (owner_id, name) VALUES (?, ?)",
-            (OWNER_USER_ID, folder)
+            (get_active_user_id(context), folder)
         )
 
         quiz_id = context.user_data.get("active_quiz_id")
@@ -1293,7 +1302,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         cur.execute(
             "UPDATE quizzes SET folder=? WHERE quiz_id=? AND owner_id=?",
-            (folder, quiz_id, OWNER_USER_ID)
+            (folder, quiz_id, get_active_user_id(context))
         )
         conn.commit()
 
@@ -1337,7 +1346,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         cur.execute(
             "SELECT 1 FROM folders WHERE owner_id=? AND LOWER(name)=LOWER(?)",
-            (OWNER_USER_ID, folder_name)
+            (get_active_user_id(context), folder_name)
         )
         if cur.fetchone():
             err = await update.message.reply_text(
@@ -1356,7 +1365,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with DB_LOCK:
                 cur.execute(
                     "INSERT INTO folders (owner_id, name) VALUES (?, ?)",
-                    (OWNER_USER_ID, folder_name)
+                    (get_active_user_id(context), folder_name)
                 )
                 conn.commit()
         except Exception as e:
@@ -1410,7 +1419,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         cur.execute(
             "SELECT 1 FROM folders WHERE owner_id=? AND LOWER(name)=LOWER(?)",
-            (OWNER_USER_ID, new)
+            (get_active_user_id(context), new)
         )
         if cur.fetchone():
             err = await update.message.reply_text(
@@ -1429,11 +1438,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with DB_LOCK:
                 cur.execute(
                     "UPDATE folders SET name=? WHERE owner_id=? AND name=?",
-                    (new, OWNER_USER_ID, old)
+                    (new, get_active_user_id(context), old)
                 )
                 cur.execute(
                     "UPDATE quizzes SET folder=? WHERE owner_id=? AND folder=?",
-                    (new, OWNER_USER_ID, old)
+                    (new, get_active_user_id(context), old)
                 )
                 conn.commit()
         except Exception as e:
@@ -1482,7 +1491,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 🔒 Duplicate title check (case-insensitive)
         cur.execute(
             "SELECT 1 FROM quizzes WHERE owner_id=? AND LOWER(title)=LOWER(?)",
-            (OWNER_USER_ID, title)
+            (get_active_user_id(context), title)
         )
         if cur.fetchone():
             err = await update.message.reply_text(
@@ -1503,7 +1512,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "INSERT INTO quizzes VALUES (?, ?, ?, NULL, 'Default', 1, 1, 15)",
                     (
                         context.user_data["quiz_id"],
-                        OWNER_USER_ID,
+                        get_active_user_id(context),
                         title,
                     )
                 )
@@ -1570,7 +1579,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 🔒 Duplicate title check (exclude current quiz)
         cur.execute(
             "SELECT 1 FROM quizzes WHERE owner_id=? AND LOWER(title)=LOWER(?) AND quiz_id!=?",
-            (OWNER_USER_ID, new_title, quiz_id)
+            (get_active_user_id(context), new_title, quiz_id)
         )
         if cur.fetchone():
             err = await update.message.reply_text(
@@ -1831,11 +1840,12 @@ async def show_quiz_folders(message, context):
     PER_PAGE = 5  # folders per page (excluding Default)
 
     # Load all folders
+    active_uid = get_active_user_id(context)
     cur.execute("""
         SELECT name
         FROM folders
         WHERE owner_id=?
-    """, (OWNER_USER_ID,))
+    """, (active_uid,))
     rows = [row[0] for row in cur.fetchall()]
 
     # 🔑 Separate Default folder
@@ -1855,7 +1865,7 @@ async def show_quiz_folders(message, context):
     # 📁 DEFAULT FOLDER (ALWAYS ON TOP, NOT PAGINATED)
     cur.execute(
         "SELECT COUNT(*) FROM quizzes WHERE owner_id=? AND folder=?",
-        (OWNER_USER_ID, default_folder)
+        (active_uid, default_folder)
     )
     default_count = cur.fetchone()[0]
 
@@ -1870,7 +1880,7 @@ async def show_quiz_folders(message, context):
     for folder in page_items:
         cur.execute(
             "SELECT COUNT(*) FROM quizzes WHERE owner_id=? AND folder=?",
-            (OWNER_USER_ID, folder)
+            (active_uid, folder)
         )
         count = cur.fetchone()[0]
 
@@ -1909,6 +1919,7 @@ async def show_quiz_folders(message, context):
     )
 
 async def show_database_menu(message, context):
+    active_uid = get_active_user_id(context)
     """
     Database menu.
     UI behaves like Quiz Folder but logic is fully independent.
@@ -1923,7 +1934,7 @@ async def show_database_menu(message, context):
           AND name != 'Default'
         ORDER BY name COLLATE NOCASE
         """,
-        (OWNER_USER_ID,)
+        (get_active_user_id(context),)
     )
     folders = cur.fetchall()
 
@@ -1949,7 +1960,7 @@ async def show_database_menu(message, context):
         JOIN question_bank_folders f ON f.id = qb.folder_id
         WHERE f.owner_id=? AND f.name='Default'
         """,
-        (OWNER_USER_ID,)
+        (active_uid,)
     )
     default_count = cur.fetchone()[0]
 
@@ -2003,6 +2014,7 @@ async def show_database_menu(message, context):
     )
 
 async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    active_uid = get_active_user_id(context)
     query = update.callback_query
     await query.answer()
     # Only update folder_name and reset page when triggered by DB_OPEN
@@ -2025,7 +2037,7 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         FROM question_bank_folders
         WHERE owner_id=? AND name=?
         """,
-        (OWNER_USER_ID, folder_name)
+        (active_uid, folder_name)
     )
     row = cur.fetchone()
     if not row:
@@ -2128,7 +2140,7 @@ async def qb_pick_folder_menu(message, context):
         FROM question_bank_folders
         WHERE owner_id=?
         """,
-        (OWNER_USER_ID,)
+        (get_active_user_id(context),)
     )
     rows = [row[0] for row in cur.fetchall()]
 
@@ -2160,7 +2172,7 @@ async def qb_pick_folder_menu(message, context):
             FROM question_bank_folders
             WHERE owner_id=? AND name=?
             """,
-            (OWNER_USER_ID, folder)
+            (get_active_user_id(context), folder)
         )
         row = cur.fetchone()
         if not row:
@@ -2255,7 +2267,7 @@ async def show_db_search_results(message, context):
           AND LOWER(qb.question) LIKE LOWER(?)
         ORDER BY qb.question COLLATE NOCASE
         """,
-        (OWNER_USER_ID, f"%{keyword}%")
+        (get_active_user_id(context), f"%{keyword}%")
     )
     rows = cur.fetchall()
 
@@ -2386,6 +2398,7 @@ async def db_search_preview_question(update: Update, context: ContextTypes.DEFAU
 # =========================
 
 async def show_quizzes_in_folder(message, context, folder):
+    active_uid = get_active_user_id(context)
     context.user_data["folder_screen_message_object"] = message
     context.user_data["last_folder_screen_msg_id"] = message.message_id
 
@@ -2393,7 +2406,7 @@ async def show_quizzes_in_folder(message, context, folder):
         SELECT quiz_id, title
         FROM quizzes
         WHERE owner_id=? AND folder=?
-    """, (OWNER_USER_ID, folder))
+    """, (active_uid, folder))
     rows = cur.fetchall()
 
     # ── Natural sort ──────────────────────────────────────
@@ -2548,7 +2561,7 @@ async def quiz_action_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🔑 SAVE THE FOLDER THIS QUIZ BELONGS TO
     cur.execute(
         "SELECT folder FROM quizzes WHERE quiz_id=? AND owner_id=?",
-        (quiz_id, OWNER_USER_ID)
+        (quiz_id, get_active_user_id(context))
     )
     row = cur.fetchone()
     if row:
@@ -2581,7 +2594,7 @@ async def show_move_quiz_folders(message, context):
         ORDER BY
             CASE WHEN name='Default' THEN 0 ELSE 1 END,
             name COLLATE NOCASE
-    """, (OWNER_USER_ID,))
+    """, (get_active_user_id(context),))
 
     folders = [row[0] for row in cur.fetchall()]
 
@@ -2603,7 +2616,7 @@ async def show_move_quiz_folders(message, context):
             SELECT COUNT(*)
             FROM quizzes
             WHERE owner_id=? AND folder=?
-        """, (OWNER_USER_ID, folder_name))
+        """, (get_active_user_id(context), folder_name))
 
         count = cur.fetchone()[0]
 
@@ -2692,7 +2705,7 @@ async def move_quiz_to_folder(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     cur.execute(
         "UPDATE quizzes SET folder=? WHERE quiz_id=? AND owner_id=?",
-        (folder, quiz_id, OWNER_USER_ID)
+        (folder, quiz_id, get_active_user_id(context))
     )
     conn.commit()
 
@@ -3516,7 +3529,7 @@ async def save_new_question(message, context):
         FROM question_bank_folders
         WHERE owner_id=? AND name='Default'
         """,
-        (OWNER_USER_ID,)
+        (get_active_user_id(context),)
     )
     folder_row = cur.fetchone()
     folder_id = folder_row[0]
@@ -5052,7 +5065,7 @@ async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 INSERT INTO quiz_post_tokens (token, quiz_id, owner_id, created_at)
                 VALUES (?, ?, ?, ?)
                 """,
-                (token, quiz_id, OWNER_USER_ID, timestamp)
+                (token, quiz_id, get_active_user_id(context), timestamp)
             )
             conn.commit()
     except Exception as e:
@@ -5104,7 +5117,7 @@ async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # =========================
     # OWNER-ONLY PROTECTION
     # =========================
-    if user_id != OWNER_USER_ID:
+    if not is_authorized(user_id):
         warn_msg = await update.message.reply_text(
             "❌ Only the bot owner can post quizzes."
         )
@@ -5255,7 +5268,7 @@ async def copy_question_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 🔑 Load all quizzes owned by user
     cur.execute(
         "SELECT quiz_id, title FROM quizzes WHERE owner_id=? ORDER BY title",
-        (OWNER_USER_ID,)
+        (get_active_user_id(context),)
     )
     quizzes = cur.fetchall()
 
@@ -5955,7 +5968,7 @@ async def show_qb_move_folders(message, context):
         WHERE owner_id=?
         ORDER BY name COLLATE NOCASE
         """,
-        (OWNER_USER_ID,)
+        (get_active_user_id(context),)
     )
     folders = cur.fetchall()
 
@@ -6068,7 +6081,7 @@ async def qb_open_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         FROM question_bank_folders
         WHERE owner_id=? AND name=?
         """,
-        (OWNER_USER_ID, folder_name)
+        (get_active_user_id(context), folder_name)
     )
     row = cur.fetchone()
 
@@ -6470,7 +6483,7 @@ def build_qb_question_keyboard(context):
 
     cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
-        (OWNER_USER_ID, folder_name)
+        (get_active_user_id(context), folder_name)
     )
     row = cur.fetchone()
     if not row:
@@ -7021,6 +7034,7 @@ async def back_to_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_questions_from_message(query.message, context)
 
 async def show_db_questions_from_message(message, context):
+    active_uid = get_active_user_id(context)
     """
     Rebuilds the database folder question list on an existing message object.
     Used by back_to_questions when returning from a DATABASE preview.
@@ -7033,7 +7047,7 @@ async def show_db_questions_from_message(message, context):
     # Resolve folder_id
     cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
-        (OWNER_USER_ID, folder_name)
+        (active_uid, folder_name)
     )
     row = cur.fetchone()
     if not row:
@@ -7146,7 +7160,7 @@ async def show_move_copy_folders(message, context):
         ORDER BY
             CASE WHEN name='Default' THEN 0 ELSE 1 END,
             name COLLATE NOCASE
-    """, (OWNER_USER_ID,))
+    """, (get_active_user_id(context),))
 
     folders = [row[0] for row in cur.fetchall()]
 
@@ -7167,7 +7181,7 @@ async def show_move_copy_folders(message, context):
             SELECT COUNT(*)
             FROM quizzes
             WHERE owner_id=? AND folder=?
-        """, (OWNER_USER_ID, folder_name))
+        """, (get_active_user_id(context), folder_name))
 
         count = cur.fetchone()[0]
 
@@ -7382,7 +7396,7 @@ async def show_move_copy_quizzes(message, context):
         SELECT quiz_id, title
         FROM quizzes
         WHERE owner_id=? AND folder=?
-    """, (OWNER_USER_ID, folder))
+    """, (get_active_user_id(context), folder))
     quizzes = cur.fetchall()
 
     # Natural sort
@@ -7493,7 +7507,7 @@ async def show_manage_folders(message, context):
         ORDER BY
             CASE WHEN name='Default' THEN 0 ELSE 1 END,
             name COLLATE NOCASE
-    """, (OWNER_USER_ID,))
+    """, (get_active_user_id(context),))
 
     folders = [row[0] for row in cur.fetchall()]
 
@@ -7515,7 +7529,7 @@ async def show_manage_folders(message, context):
             SELECT COUNT(*)
             FROM quizzes
             WHERE owner_id=? AND folder=?
-        """, (OWNER_USER_ID, folder))
+        """, (get_active_user_id(context), folder))
 
         count = cur.fetchone()[0]
 
@@ -7582,7 +7596,7 @@ async def show_manage_quizzes(message, context):
         SELECT quiz_id, title
         FROM quizzes
         WHERE owner_id=? AND folder=?
-    """, (OWNER_USER_ID, folder))
+    """, (get_active_user_id(context), folder))
     quizzes = cur.fetchall()
 
     # Natural sort
@@ -8070,7 +8084,7 @@ async def show_db_move_folder_list(message, context):
         WHERE owner_id=?
         ORDER BY name COLLATE NOCASE
         """,
-        (OWNER_USER_ID,)
+        (get_active_user_id(context),)
     )
     all_folders = cur.fetchall()
 
@@ -8154,6 +8168,7 @@ async def db_move_from_folder_open(update: Update, context: ContextTypes.DEFAULT
     await show_db_move_question_list(query.message, context)
 
 async def db_move_add_this_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    active_uid = get_active_user_id(context)
     query = update.callback_query
     await query.answer()
 
@@ -8166,7 +8181,7 @@ async def db_move_add_this_page(update: Update, context: ContextTypes.DEFAULT_TY
     # Resolve source folder_id
     cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
-        (OWNER_USER_ID, source_folder)
+        (active_uid, source_folder)
     )
     row = cur.fetchone()
     if not row:
@@ -8176,7 +8191,7 @@ async def db_move_add_this_page(update: Update, context: ContextTypes.DEFAULT_TY
     # Resolve target folder_id
     cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
-        (OWNER_USER_ID, target_folder)
+        (active_uid, target_folder)
     )
     row = cur.fetchone()
     if not row:
@@ -8220,6 +8235,7 @@ async def db_move_add_this_page(update: Update, context: ContextTypes.DEFAULT_TY
     await show_db_move_question_list(query.message, context)
 
 async def db_move_auto_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    active_uid = get_active_user_id(context)
     query = update.callback_query
     await query.answer()
 
@@ -8232,7 +8248,7 @@ async def db_move_auto_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Resolve source folder_id
     cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
-        (OWNER_USER_ID, source_folder)
+        (active_uid, source_folder)
     )
     row = cur.fetchone()
     if not row:
@@ -8242,7 +8258,7 @@ async def db_move_auto_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Resolve target folder_id
     cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
-        (OWNER_USER_ID, target_folder)
+        (active_uid, target_folder)
     )
     row = cur.fetchone()
     if not row:
@@ -8273,6 +8289,7 @@ async def db_move_auto_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_db_move_question_list(query.message, context)
 
 async def show_db_move_question_list(message, context):
+    active_uid = get_active_user_id(context)
     target_folder = context.user_data.get("db_move_target_folder")
     source_folder = context.user_data.get("db_move_source_folder")
     selected = context.user_data.setdefault("db_move_selected", set())
@@ -8282,7 +8299,7 @@ async def show_db_move_question_list(message, context):
     # Resolve source folder_id
     cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
-        (OWNER_USER_ID, source_folder)
+        (active_uid, source_folder)
     )
     row = cur.fetchone()
     if not row:
@@ -8293,7 +8310,7 @@ async def show_db_move_question_list(message, context):
     # Resolve target folder_id
     cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
-        (OWNER_USER_ID, target_folder)
+        (active_uid, target_folder)
     )
     row = cur.fetchone()
     if not row:
@@ -8460,7 +8477,7 @@ async def db_delete_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Resolve folder_id
     cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
-        (OWNER_USER_ID, folder_name)
+        (get_active_user_id(context), folder_name)
     )
     row = cur.fetchone()
     if not row:
@@ -8472,7 +8489,7 @@ async def db_delete_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Resolve Default folder_id
     cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name='Default'",
-        (OWNER_USER_ID,)
+        (get_active_user_id(context),)
     )
     default_row = cur.fetchone()
     if not default_row:
@@ -8847,6 +8864,19 @@ async def sub_apply_duration(update, context):
                     VALUES (?, ?, ?, ?, 1, ?)
                 """, (user_id, name, sub_type, expires_at, now))
             conn.commit()
+
+            # ✅ Auto-create Default folders for new subscriber
+            cur.execute(
+                "INSERT OR IGNORE INTO folders (owner_id, name) VALUES (?, 'Default')",
+                (user_id,)
+            )
+            cur.execute(
+                "INSERT OR IGNORE INTO question_bank_folders (owner_id, name) VALUES (?, 'Default')",
+                (user_id,)
+            )
+            conn.commit()
+
+
     except Exception as e:
         print("⚠️ Failed to save subscriber:", e)
         await flash_message(context.bot, query.message.chat_id, "❌ Operation failed.")
