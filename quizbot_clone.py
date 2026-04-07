@@ -3600,7 +3600,7 @@ async def save_new_question(message, context):
         [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
     ])
 
-    context.user_data["question_flow_msgs"] = []
+    # ✅ Reset state FIRST — before sending new prompt
     context.user_data["add_q_state"] = "NEW_Q_TEXT"
     context.user_data["new_question"] = {"options": []}
 
@@ -3609,7 +3609,9 @@ async def save_new_question(message, context):
         reply_markup=keyboard
     )
 
-    context.user_data["question_flow_msgs"].append(msg.message_id)
+    # ✅ Start a FRESH tracker AFTER bulk delete is done
+    context.user_data["question_flow_msgs"] = [msg.message_id]
+    context.user_data["create_q_prompt_msg_id"] = msg.message_id
 
 async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
