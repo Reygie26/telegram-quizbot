@@ -8873,14 +8873,35 @@ async def sub_list(update, context):
     await query.answer()
 
     mode = query.data.split("|", 1)[1]
+    context.user_data["sub_list_page"] = 0
 
     if mode == "active":
-        await _show_sub_list(query.message, context, active=True)
+        await _show_sub_list(query.message, context, active=True, page=0)
     else:
-        await _show_sub_list(query.message, context, active=False)
+        await _show_sub_list(query.message, context, active=False, page=0)
+
+async def sub_list_prev(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    list_type = query.data.split("|", 1)[1]
+    page = max(0, context.user_data.get("sub_list_page", 0) - 1)
+
+    active = (list_type == "active")
+    await _show_sub_list(query.message, context, active=active, page=page)
 
 
-async def _show_sub_list(message, context, active: bool):
+async def sub_list_next(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    list_type = query.data.split("|", 1)[1]
+    page = context.user_data.get("sub_list_page", 0) + 1
+
+    active = (list_type == "active")
+    await _show_sub_list(query.message, context, active=active, page=page)
+
+async def _show_sub_list(message, context, active: bool, page: int = 0):
     """
     Shared renderer for active / inactive subscriber lists.
     Each subscriber appears as a single inline button:
@@ -8908,7 +8929,8 @@ async def _show_sub_list(message, context, active: bool):
             FROM subscribers
             WHERE is_active = 1
               AND (subscription_type = 'Lifetime' OR expires_at > ?)
-            ORDER BY name COLLATE NOCASE
+            ORDER BY
+                CASE WHEN subscription_type = 'Lifetime' THEN 9999999999 ELSE expires_at END ASC
         """, (now,))
         header = "✅ *Active Subscriptions*"
         empty_text = "✅ *Active Subscriptions*\n\n_No active subscribers yet._"
@@ -8918,7 +8940,7 @@ async def _show_sub_list(message, context, active: bool):
             FROM subscribers
             WHERE is_active = 0
                OR (subscription_type != 'Lifetime' AND expires_at <= ?)
-            ORDER BY name COLLATE NOCASE
+            ORDER BY expires_at ASC
         """, (now,))
         header = "❌ *Inactive Subscriptions*"
         empty_text = "❌ *Inactive Subscriptions*\n\n_No inactive subscribers._"
@@ -8931,7 +8953,16 @@ async def _show_sub_list(message, context, active: bool):
         await message.edit_text(empty_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
 
-    for user_id, name, s_type, expires_at in rows:
+    PER_PAGE = 10
+    total = len(rows)
+    pages = (total - 1) // PER_PAGE + 1
+    page = max(0, min(page, pages - 1))
+
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+    page_rows = rows[start:end]
+
+    for user_id, name, s_type, expires_at in page_rows:
         if s_type == "Lifetime":
             badge = "Lifetime"
         elif expires_at and expires_at > now:
@@ -8947,17 +8978,27 @@ async def _show_sub_list(message, context, active: bool):
             )
         ])
 
+    list_type = "active" if active else "inactive"
+
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"SUB_LIST_PREV|{list_type}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="SUB_LIST_NOP"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data=f"SUB_LIST_NEXT|{list_type}"))
+        keyboard.append(nav)
+
     keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="HOME_MANAGE_SUBSCRIBERS")])
 
-    list_type = "active" if active else "inactive"
+    context.user_data["sub_list_type"] = list_type
+    context.user_data["sub_list_page"] = page
+
     await message.edit_text(
         header,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
-    # Store so the Back button in sub_overview knows where to return
-    context.user_data["sub_list_type"] = list_type
-
 
 async def sub_overview(update, context):
     """
@@ -8985,11 +9026,13 @@ async def sub_overview(update, context):
 
     user_id, name, s_type, expires_at, is_active, subscribed_at = row
 
-    # ── Subscription Date ──────────────────────────────────
+    # ── Subscription Date ──────────────────────────────────────
     if subscribed_at and subscribed_at > 0:
-        sub_date = datetime.datetime.utcfromtimestamp(subscribed_at).strftime("%B %d, %Y")
+        sub_date = datetime.datetime.fromtimestamp(subscribed_at, datetime.timezone.utc).strftime("%B %d, %Y")
+        sub_date_label = "Last Renewed"
     else:
         sub_date = "—"
+        sub_date_label = "Subscribed"
 
     # ── Days Remaining ─────────────────────────────────────
     if not is_active:
@@ -8998,7 +9041,7 @@ async def sub_overview(update, context):
         remaining_text = "Lifetime (no expiry)"
     elif expires_at and expires_at > now:
         days = (expires_at - now) // 86400
-        expiry_date = datetime.datetime.utcfromtimestamp(expires_at).strftime("%B %d, %Y")
+        expiry_date = datetime.datetime.fromtimestamp(expires_at, datetime.timezone.utc).strftime("%B %d, %Y")
         remaining_text = f"{days} day(s) (expires {expiry_date})"
     else:
         remaining_text = "Expired"
@@ -9006,7 +9049,7 @@ async def sub_overview(update, context):
     text = (
         f"👤 *{name}*\n\n"
         f"🆔 User ID: `{user_id}`\n"
-        f"📅 Subscribed: {sub_date}\n"
+        f"📅 {sub_date_label}: {sub_date}\n"
         f"📦 Duration: {s_type}\n"
         f"⏳ Remaining: {remaining_text}"
     )
@@ -9210,6 +9253,9 @@ app.add_handler(CallbackQueryHandler(home_manage_subscribers, pattern="^HOME_MAN
 app.add_handler(CallbackQueryHandler(sub_add_start,           pattern="^SUB_ADD$"))
 app.add_handler(CallbackQueryHandler(sub_apply_duration,      pattern="^SUB_DURATION\\|"))
 app.add_handler(CallbackQueryHandler(sub_list,                pattern="^SUB_LIST\\|"))
+app.add_handler(CallbackQueryHandler(sub_list_prev, pattern="^SUB_LIST_PREV\\|"))
+app.add_handler(CallbackQueryHandler(sub_list_next, pattern="^SUB_LIST_NEXT\\|"))
+app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^SUB_LIST_NOP$"))
 app.add_handler(CallbackQueryHandler(sub_overview,            pattern="^SUB_VIEW\\|"))
 app.add_handler(CallbackQueryHandler(sub_renew,               pattern="^SUB_RENEW\\|"))
 app.add_handler(CallbackQueryHandler(sub_revoke_confirm,      pattern="^SUB_REVOKE\\|"))
