@@ -597,7 +597,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
 
         msg = await update.message.reply_text(
-            "🧠 **Welcome to TeleQuiz Admin Panel**\n⚠️Notice: All your Data will be deleted after 1 Year of Inactive Subscription\n\nPlease choose an option:",
+            "🧠 **Welcome to TeleQuiz Admin Panel**\n⚠️Notice: All your Data will be deleted after\n   1 Year of Inactive Subscription\n\nPlease choose an option:",
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
