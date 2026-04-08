@@ -2391,13 +2391,13 @@ async def db_search_preview_question(update: Update, context: ContextTypes.DEFAU
         ]
     ])
 
-    # Delete current menu message first
-    try:
-        await query.message.delete()
-    except:
-        pass
+    old_list_id = query.message.message_id
 
     if image:
+        try:
+            await context.bot.delete_message(chat_id, old_list_id)
+        except:
+            pass
         msg = await context.bot.send_photo(
             chat_id=chat_id,
             photo=image,
@@ -2406,12 +2406,26 @@ async def db_search_preview_question(update: Update, context: ContextTypes.DEFAU
             parse_mode="Markdown"
         )
     else:
-        msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=keyboard,
-            parse_mode="Markdown"
-        )
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=old_list_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+            msg = query.message
+        except:
+            try:
+                await context.bot.delete_message(chat_id, old_list_id)
+            except:
+                pass
+            msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
 
     context.user_data["question_preview_msg_id"] = msg.message_id
     context.user_data["db_search_list_deleted"] = True
@@ -3666,10 +3680,7 @@ async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     # Remove previous list/menu message
-    try:
-        await query.message.delete()
-    except:
-        pass
+    old_list_id = query.message.message_id
 
     qid = int(query.data.replace("Q_", ""))
     if not verify_question_owner(qid, context):
@@ -3721,6 +3732,11 @@ async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ✅ TRUE MEDIA LOGIC
     if image:
+        # Can't edit a text message into a photo — delete and resend
+        try:
+            await context.bot.delete_message(chat_id, old_list_id)
+        except:
+            pass
         msg = await context.bot.send_photo(
             chat_id=chat_id,
             photo=image,
@@ -3729,12 +3745,26 @@ async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     else:
-        msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=keyboard,
-            parse_mode="Markdown"
-        )
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=old_list_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+            msg = query.message
+        except:
+            try:
+                await context.bot.delete_message(chat_id, old_list_id)
+            except:
+                pass
+            msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
 
     context.user_data["question_preview_msg_id"] = msg.message_id
 
@@ -5160,9 +5190,9 @@ async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # =========================
     # OWNER-ONLY PROTECTION
     # =========================
-    if user_id != OWNER_USER_ID:
+    if not is_authorized(user_id):
         warn_msg = await update.message.reply_text(
-            "❌ Only the bot owner can post quizzes."
+            "❌ Only the Bot Admin can post quizzes."
         )
 
         async def delete_later():
