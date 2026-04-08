@@ -163,6 +163,26 @@ def get_active_user_id(context) -> int:
     """
     return context.user_data.get("active_user_id", OWNER_USER_ID)
 
+def verify_quiz_owner(quiz_id: str, context) -> bool:
+    """Returns True only if the active user owns this quiz."""
+    cur.execute(
+        "SELECT 1 FROM quizzes WHERE quiz_id=? AND owner_id=?",
+        (quiz_id, get_active_user_id(context))
+    )
+    return cur.fetchone() is not None
+
+def verify_question_owner(question_id: int, context) -> bool:
+    """Returns True only if the active user owns this question (via folder)."""
+    cur.execute(
+        """
+        SELECT 1 FROM question_bank qb
+        JOIN question_bank_folders f ON f.id = qb.folder_id
+        WHERE qb.id=? AND f.owner_id=?
+        """,
+        (question_id, get_active_user_id(context))
+    )
+    return cur.fetchone() is not None
+
 def is_authorized(user_id: int) -> bool:
     if user_id == OWNER_USER_ID:
         return True
@@ -1819,6 +1839,9 @@ async def delete_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not quiz_id:
         await flash_message(context.bot, query.message.chat_id, "❌ No quiz selected.")
         return
+    if not verify_quiz_owner(quiz_id, context):
+        await flash_message(context.bot, query.message.chat_id, "❌ Access denied.")
+        return
 
     context.user_data["confirm_delete"] = ("QUIZ", quiz_id)
 
@@ -2539,12 +2562,6 @@ async def delete_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-async def back_to_folders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()  # stops the loading spinner
-
-    await show_quiz_folders(query.message, context)
-
 # =========================
 # QUIZ ACTION MENU
 # =========================
@@ -2799,6 +2816,9 @@ async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     quiz_id = context.user_data.get("active_quiz_id")
     if not quiz_id:
+        return
+    if not verify_quiz_owner(quiz_id, context):
+        await query.answer("❌ Access denied.", show_alert=True)
         return
     cur.execute(
         "SELECT title, description, timer, shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
@@ -3227,14 +3247,6 @@ async def home_create_question(update: Update, context: ContextTypes.DEFAULT_TYP
     # 🔑 Track specifically for duplicate cancel cleanup
     context.user_data["create_q_prompt_msg_id"] = msg.message_id
 
-async def home_manage_subscribers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    await flash_message(context.bot, query.message.chat_id, 
-        "👥 **Manage Subscribers**\n\n🚧 This feature is coming soon."
-    )
-
 async def back_to_folders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -3634,6 +3646,9 @@ async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     qid = int(query.data.replace("Q_", ""))
+    if not verify_question_owner(qid, context):
+        await query.answer("❌ Access denied.", show_alert=True)
+        return
     context.user_data["active_question_id"] = qid
 
     cur.execute(
@@ -6666,7 +6681,7 @@ async def qb_add_this_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Resolve folder_id
     cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
-        (OWNER_USER_ID, folder_name)
+        (get_active_user_id(context), folder_name)
     )
     row = cur.fetchone()
     if not row:
@@ -6756,7 +6771,7 @@ async def qb_auto_add_questions(update: Update, context: ContextTypes.DEFAULT_TY
         FROM question_bank_folders
         WHERE owner_id=? AND name=?
         """,
-        (OWNER_USER_ID, folder_name)
+        (get_active_user_id(context), folder_name)
     )
     row = cur.fetchone()
     if not row:
@@ -6815,6 +6830,8 @@ async def qb_auto_add_questions(update: Update, context: ContextTypes.DEFAULT_TY
 async def show_quiz_action_menu_by_id(chat_id, message_id, context):
     quiz_id = context.user_data.get("active_quiz_id")
     if not quiz_id:
+        return
+    if not verify_quiz_owner(quiz_id, context):
         return
 
     cur.execute("""
@@ -8424,7 +8441,7 @@ async def db_move_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Resolve target folder_id
     cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
-        (OWNER_USER_ID, target_folder)
+        (get_active_user_id(context), target_folder)
     )
     row = cur.fetchone()
     if not row:
