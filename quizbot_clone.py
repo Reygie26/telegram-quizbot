@@ -5241,6 +5241,29 @@ async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(delete_later())
         return
 
+    # ── OWNERSHIP CHECK: only the quiz creator can post this quiz ──
+    cur.execute(
+        "SELECT owner_id FROM quiz_post_tokens WHERE token=? AND quiz_id=?",
+        (token, quiz_id)
+    )
+    owner_row = cur.fetchone()
+    if not owner_row or owner_row[0] != user_id:
+        warn_msg = await update.message.reply_text(
+            "❌ You can only post quizzes that you created."
+        )
+        async def delete_later():
+            await asyncio.sleep(3)
+            try:
+                await warn_msg.delete()
+            except:
+                pass
+            try:
+                await update.message.delete()
+            except:
+                pass
+        asyncio.create_task(delete_later())
+        return
+
     # =========================
     # POST QUIZ TO GROUP
     # =========================
@@ -7079,34 +7102,46 @@ async def cancel_edit_question_explanation(update: Update, context: ContextTypes
 async def back_to_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
- 
+
     chat_id = query.message.chat_id
     preview_mode = context.user_data.get("preview_mode")
- 
+
+    # 🧹 Delete the current preview message (works for BOTH photo and text messages)
+    try:
+        await query.message.delete()
+    except:
+        pass
+
     context.user_data.pop("question_preview_msg_id", None)
- 
+
     # ── DATABASE MODE ────────────────────────────────────────
     if preview_mode == "DATABASE":
         context.user_data.pop("preview_mode", None)
- 
+
         if context.user_data.get("preview_return") == "DB_SEARCH":
             context.user_data.pop("preview_return", None)
             context.user_data.pop("db_search_list_deleted", None)
-            await show_db_search_results(query.message, context)
+            # Send a fresh placeholder, then build the search results on it
+            new_msg = await context.bot.send_message(chat_id, "Loading...")
+            await show_db_search_results(new_msg, context)
             return
- 
+
         folder_name = context.user_data.get("db_folder_name")
         if not folder_name:
-            await show_database_menu(query.message, context)
+            new_msg = await context.bot.send_message(chat_id, "Loading...")
+            await show_database_menu(new_msg, context)
             return
- 
-        await show_db_questions_from_message(query.message, context)
+
+        new_msg = await context.bot.send_message(chat_id, "Loading...")
+        await show_db_questions_from_message(new_msg, context)
         return
- 
+
     # ── QUIZ MODE ────────────────────────────────────────────
     context.user_data.pop("preview_mode", None)
     context.user_data["reset_q_page"] = True
-    await show_questions_from_message(query.message, context)
+
+    new_msg = await context.bot.send_message(chat_id, "Loading...")
+    await show_questions_from_message(new_msg, context)
 
 async def show_db_questions_from_message(message, context):
     active_uid = get_active_user_id(context)
