@@ -5134,7 +5134,7 @@ async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # =========================
     # OWNER-ONLY PROTECTION
     # =========================
-    if not is_authorized(user_id):
+    if user_id != OWNER_USER_ID:
         warn_msg = await update.message.reply_text(
             "❌ Only the bot owner can post quizzes."
         )
