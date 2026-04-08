@@ -3219,6 +3219,10 @@ async def home_create_question(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # 🔒 Clear any quiz-specific state
     context.user_data.pop("active_quiz_id", None)
+    context.user_data.pop("active_question_id", None)
+    context.user_data.pop("edit_q_field", None)
+    context.user_data.pop("add_q_state", None)
+    context.user_data.pop("new_question", None)
 
     # 🧹 Clear any leftover duplicate tracking (safety)
     context.user_data.pop("create_q_prompt_msg_id", None)
@@ -3488,6 +3492,7 @@ async def skip_question_explanation(update: Update, context: ContextTypes.DEFAUL
     if context.user_data.get("add_q_state") != "NEW_Q_EXPLANATION":
         return
 
+    context.user_data["state"] = None
     context.user_data["new_question"]["explanation"] = None
     await save_new_question(query.message, context)
 
@@ -3517,6 +3522,7 @@ async def choose_correct_answer(update: Update, context: ContextTypes.DEFAULT_TY
         pass
 
     context.user_data["add_q_state"] = "NEW_Q_EXPLANATION"
+    context.user_data["state"] = None
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("⏭ Skip explanation", callback_data="SKIP_Q_EXPLANATION")]
@@ -3526,7 +3532,6 @@ async def choose_correct_answer(update: Update, context: ContextTypes.DEFAULT_TY
         "📝 Send explanation:",
         reply_markup=keyboard
     )
-
     context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
 
 async def save_new_question(message, context):
@@ -3535,15 +3540,36 @@ async def save_new_question(message, context):
     options_text = "||".join(q["options"])
 
     # 🔑 Resolve Question Bank folder (Default for now)
+    active_uid = get_active_user_id(context)
     cur.execute(
         """
         SELECT id
         FROM question_bank_folders
         WHERE owner_id=? AND name='Default'
         """,
-        (get_active_user_id(context),)
+        (active_uid,)
     )
     folder_row = cur.fetchone()
+
+    # 🛡️ Auto-create Default QB folder if missing (subscriber edge case)
+    if not folder_row:
+        cur.execute(
+            "INSERT OR IGNORE INTO question_bank_folders (owner_id, name) VALUES (?, 'Default')",
+            (active_uid,)
+        )
+        conn.commit()
+        cur.execute(
+            "SELECT id FROM question_bank_folders WHERE owner_id=? AND name='Default'",
+            (active_uid,)
+        )
+        folder_row = cur.fetchone()
+
+    if not folder_row:
+        await message.reply_text("❌ Failed to resolve question folder. Please contact the bot admin.")
+        context.user_data.pop("add_q_state", None)
+        context.user_data.pop("new_question", None)
+        return
+
     folder_id = folder_row[0]
 
     # ✅ 1. INSERT INTO QUESTION BANK (SOURCE OF TRUTH)
@@ -8884,17 +8910,16 @@ async def sub_apply_duration(update, context):
                 """, (user_id, name, sub_type, expires_at, now))
             conn.commit()
 
-            # ✅ Auto-create Default folders for new subscriber
-            cur.execute(
-                "INSERT OR IGNORE INTO folders (owner_id, name) VALUES (?, 'Default')",
-                (user_id,)
-            )
-            cur.execute(
-                "INSERT OR IGNORE INTO question_bank_folders (owner_id, name) VALUES (?, 'Default')",
-                (user_id,)
-            )
-            conn.commit()
-
+        # ✅ Auto-create Default folders for new subscriber
+        cur.execute(
+            "INSERT OR IGNORE INTO folders (owner_id, name) VALUES (?, 'Default')",
+            (user_id,)
+        )
+        cur.execute(
+            "INSERT OR IGNORE INTO question_bank_folders (owner_id, name) VALUES (?, 'Default')",
+            (user_id,)
+        )
+        conn.commit()
 
     except Exception as e:
         print("⚠️ Failed to save subscriber:", e)
