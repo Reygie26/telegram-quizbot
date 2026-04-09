@@ -364,6 +364,12 @@ try:
 except Exception:
     pass  # Column already exists — safe to ignore
 
+try:
+    cur.execute("ALTER TABLE subscribers ADD COLUMN needs_notice INTEGER DEFAULT 0")
+    conn.commit()
+except Exception:
+    pass  # Column already exists — safe to ignore
+
 # ===== RUN ONCE: ADD FOLDER COLUMN IF MISSING =====
 # =========================
 # OWNER RESTORE
@@ -585,6 +591,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message:
             context.user_data["chat_messages"].append(update.message.message_id)
 
+        # 🔔 Check if this subscriber needs to see the first-access notice
+        cur.execute(
+            "SELECT needs_notice FROM subscribers WHERE user_id=?",
+            (user_id,)
+        )
+        notice_row = cur.fetchone()
+        needs_notice = notice_row and notice_row[0] == 1
+
+        if needs_notice:
+            notice_keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ I Agree", callback_data="SUB_AGREE_NOTICE")]
+            ])
+            msg = await update.message.reply_text(
+                "🧠 **Welcome to TeleQuiz Admin Panel**\n\n"
+                "⚠️ *Important Notice*\n\n"
+                "All folders, quizzes, and questions you create are tied to your subscription. "
+                "If your subscription becomes inactive and is not renewed within 1 year, "
+                "all your data will be permanently and automatically deleted.\n\n"
+                "Please tap I Agree to continue.",
+                reply_markup=notice_keyboard,
+                parse_mode="Markdown"
+            )
+            context.user_data["chat_messages"].append(msg.message_id)
+            return
+
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("📂 Quiz Folder", callback_data="HOME_MY_QUIZZES"),
@@ -597,7 +628,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
 
         msg = await update.message.reply_text(
-            "🧠 **Welcome to TeleQuiz Admin Panel**\n\n⚠️ Notice: All your Data will be deleted after\n       1 year of inactive subscription\n\nPlease choose an option:",
+            "🧠 **Welcome to TeleQuiz Admin Panel**\n\nPlease choose an option:",
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
@@ -4751,8 +4782,13 @@ async def countdown_timer(user_id, context, seconds, play):
         await asyncio.sleep(pause)
 
         # =========================
-        # ▶️ Advance Safely
+        # ▶️ Advance Safely (guard against race with answer button)
         # =========================
+        # Re-check locked state one final time before advancing
+        play = context.user_data.get("play")
+        if not play or play.get("advancing") or play.get("finished"):
+            return
+
         if play["index"] >= len(play["questions"]) - 1:
             await finish_quiz(user_id, context)
         else:
@@ -5917,20 +5953,27 @@ async def advance_quiz(user_id, context):
         return
 
     async with play["context_lock"]:
-        # 🚫 Prevent double-advance
-        if play.get("finished"):
+        # 🚫 Prevent double-advance (from both timer expiry AND answer button)
+        if play.get("advancing") or play.get("finished"):
             return
+
+        # 🔒 Mark as advancing to block any concurrent call
+        play["advancing"] = True
 
         play["index"] += 1
 
         # 🏁 END OF QUIZ
         if play["index"] >= len(play["questions"]):
             play["finished"] = True
+            play["advancing"] = False
             await finish_quiz(user_id, context)
             return
 
         # ▶️ NEXT QUESTION
         await send_next_question(user_id, context)
+
+        # 🔓 Release advance lock after next question is fully sent
+        play["advancing"] = False
 
 async def qb_pick_folder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -7104,44 +7147,24 @@ async def back_to_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     chat_id = query.message.chat_id
-    preview_mode = context.user_data.get("preview_mode")
+    msg = query.message
 
-    # 🧹 Delete the current preview message (works for BOTH photo and text messages)
-    try:
-        await query.message.delete()
-    except:
-        pass
-
-    context.user_data.pop("question_preview_msg_id", None)
-
-    # ── DATABASE MODE ────────────────────────────────────────
-    if preview_mode == "DATABASE":
-        context.user_data.pop("preview_mode", None)
-
-        if context.user_data.get("preview_return") == "DB_SEARCH":
-            context.user_data.pop("preview_return", None)
-            context.user_data.pop("db_search_list_deleted", None)
-            # Send a fresh placeholder, then build the search results on it
-            new_msg = await context.bot.send_message(chat_id, "Loading...")
-            await show_db_search_results(new_msg, context)
-            return
-
-        folder_name = context.user_data.get("db_folder_name")
-        if not folder_name:
-            new_msg = await context.bot.send_message(chat_id, "Loading...")
-            await show_database_menu(new_msg, context)
-            return
-
-        new_msg = await context.bot.send_message(chat_id, "Loading...")
-        await show_db_questions_from_message(new_msg, context)
-        return
-
-    # ── QUIZ MODE ────────────────────────────────────────────
-    context.user_data.pop("preview_mode", None)
-    context.user_data["reset_q_page"] = True
-
-    new_msg = await context.bot.send_message(chat_id, "Loading...")
-    await show_questions_from_message(new_msg, context)
+    # 🧹 FIX: If the current message is a photo (image question),
+    # we cannot edit it into a text message.
+    # Delete it first, then send a fresh placeholder for the question list.
+    if msg.photo:
+        try:
+            await msg.delete()
+        except:
+            pass
+        # Clear the stored preview ID since we just deleted it
+        context.user_data.pop("question_preview_msg_id", None)
+        # Send a fresh plain message to build the question list on
+        new_msg = await context.bot.send_message(chat_id=chat_id, text="⏳")
+        await show_questions_from_message(new_msg, context)
+    else:
+        # Normal text message — edit it directly
+        await show_questions_from_message(msg, context)
 
 async def show_db_questions_from_message(message, context):
     active_uid = get_active_user_id(context)
@@ -8964,14 +8987,15 @@ async def sub_apply_duration(update, context):
                     SET subscription_type = ?,
                         expires_at        = ?,
                         is_active         = 1,
-                        subscribed_at     = ?
+                        subscribed_at     = ?,
+                        needs_notice      = 1
                     WHERE user_id = ?
                 """, (sub_type, expires_at, now, user_id))
             else:
                 cur.execute("""
                     INSERT OR REPLACE INTO subscribers
-                    (user_id, name, subscription_type, expires_at, is_active, subscribed_at)
-                    VALUES (?, ?, ?, ?, 1, ?)
+                    (user_id, name, subscription_type, expires_at, is_active, subscribed_at, needs_notice)
+                    VALUES (?, ?, ?, ?, 1, ?, 1)
                 """, (user_id, name, sub_type, expires_at, now))
             conn.commit()
 
@@ -9301,7 +9325,10 @@ async def sub_revoke_cancel(update, context):
 
 async def auto_expire_subscribers(context):
     now = int(time.time())
+    ONE_YEAR = 365 * 24 * 3600
+
     async with DB_LOCK:
+        # Step 1: Mark overdue active subscriptions as inactive
         cur.execute("""
             UPDATE subscribers
             SET is_active = 0
@@ -9311,6 +9338,93 @@ async def auto_expire_subscribers(context):
               AND is_active = 1
         """, (now,))
         conn.commit()
+
+        # Step 2: Find inactive subscribers who expired more than 1 year ago
+        cutoff = now - ONE_YEAR
+        cur.execute("""
+            SELECT user_id FROM subscribers
+            WHERE is_active = 0
+              AND expires_at > 0
+              AND expires_at <= ?
+        """, (cutoff,))
+        stale_users = [row[0] for row in cur.fetchall()]
+
+        for uid in stale_users:
+            print(f"🗑 Auto-purging data for inactive user {uid} (expired >1 year ago)")
+
+            # Delete quiz question links
+            cur.execute("""
+                DELETE FROM quiz_question_links
+                WHERE quiz_id IN (
+                    SELECT quiz_id FROM quizzes WHERE owner_id=?
+                )
+            """, (uid,))
+
+            # Delete quizzes
+            cur.execute("DELETE FROM quizzes WHERE owner_id=?", (uid,))
+
+            # Delete quiz folders
+            cur.execute("DELETE FROM folders WHERE owner_id=?", (uid,))
+
+            # Get question bank folder IDs for this user
+            cur.execute("SELECT id FROM question_bank_folders WHERE owner_id=?", (uid,))
+            qb_folder_ids = [row[0] for row in cur.fetchall()]
+
+            for fid in qb_folder_ids:
+                # Delete questions in each folder
+                cur.execute("DELETE FROM question_bank WHERE folder_id=?", (fid,))
+
+            # Delete question bank folders
+            cur.execute("DELETE FROM question_bank_folders WHERE owner_id=?", (uid,))
+
+            # Delete the subscriber record itself
+            cur.execute("DELETE FROM subscribers WHERE user_id=?", (uid,))
+
+        conn.commit()
+
+async def subscriber_agree_notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the subscriber tapping 'I Agree' on the first-access notice."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    # Mark notice as acknowledged in DB
+    try:
+        async with DB_LOCK:
+            cur.execute(
+                "UPDATE subscribers SET needs_notice=0 WHERE user_id=?",
+                (user_id,)
+            )
+            conn.commit()
+    except Exception as e:
+        print("⚠️ Failed to clear notice flag:", e)
+
+    # Delete the notice message
+    try:
+        await query.message.delete()
+    except:
+        pass
+
+    # Now show the normal admin panel
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📂 Quiz Folder", callback_data="HOME_MY_QUIZZES"),
+            InlineKeyboardButton("➕ Create a new Quiz", callback_data="HOME_CREATE"),
+        ],
+        [
+            InlineKeyboardButton("🗄 Database", callback_data="HOME_DATABASE"),
+            InlineKeyboardButton("❓ Create a Question", callback_data="HOME_CREATE_QUESTION"),
+        ],
+    ])
+
+    msg = await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text="🧠 **Welcome to TeleQuiz Admin Panel**\n\nPlease choose an option:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    context.user_data.setdefault("chat_messages", []).append(msg.message_id)
 
 async def sub_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -9400,6 +9514,7 @@ app.add_handler(CallbackQueryHandler(sub_renew,               pattern="^SUB_RENE
 app.add_handler(CallbackQueryHandler(sub_revoke_confirm,      pattern="^SUB_REVOKE\\|"))
 app.add_handler(CallbackQueryHandler(sub_revoke_apply,        pattern="^SUB_REVOKE_CONFIRM$"))
 app.add_handler(CallbackQueryHandler(sub_revoke_cancel,       pattern="^SUB_REVOKE_CANCEL$"))
+app.add_handler(CallbackQueryHandler(subscriber_agree_notice, pattern="^SUB_AGREE_NOTICE$"))
 app.add_handler(CallbackQueryHandler(sub_cancel,              pattern="^SUB_CANCEL$"))
 app.add_handler(CallbackQueryHandler(sub_delete, pattern="^SUB_DELETE\\|"))
 app.add_handler(CallbackQueryHandler(db_rename_folder_start, pattern="^DB_RENAME_FOLDER\\|"))
