@@ -149,10 +149,14 @@ def natural_sort_key(s):
     ]
 
 def escape_md(text: str) -> str:
-    """Escape special MarkdownV1 characters in dynamic text."""
+    """
+    Escape special MarkdownV1 characters in dynamic text.
+    Prevents user-supplied text from accidentally triggering bold/italic/code formatting.
+    """
     if not text:
         return ""
-    for ch in ['_', '*', '[', '`']:
+    # Order matters: escape backslash first to avoid double-escaping
+    for ch in ['\\', '_', '*', '[', '`']:
         text = text.replace(ch, f'\\{ch}')
     return text
 
@@ -628,7 +632,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
 
         msg = await update.message.reply_text(
-            "🧠 **Welcome to TeleQuiz Admin Panel**\n\nPlease choose an option:",
+            "🧠 **Welcome to TeleQuiz (Admin Panel)**\n\nPlease choose an option to start 👇:",
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
@@ -661,7 +665,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     msg = await update.message.reply_text(
-        "🧠 **Welcome to TeleQuiz, a smart Telegram Quiz Bot created by Engr. Reygie M. Gorgonio designed to make quizzes organized, competitive and fun (Admin Panel)**\n\nPlease choose an option:",
+        "🧠 **Welcome to TeleQuiz (Bot creator Panel)\nA smart Telegram Quiz Bot designed to make quizzes organized, competitive and fun**\n\nPlease choose an option to start 👇:",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
@@ -2793,12 +2797,9 @@ async def show_quiz_action_menu(message, context):
     )
     total_questions = cur.fetchone()[0]
 
-    # 📘 Title
-    text = f"📘 **{title}**"
-
-    # 📝 Description (if any)
+    text = f"📘 **{escape_md(title)}**"
     if desc:
-        text += f"\n📝 _{desc}_"
+        text += f"\n📝 _{escape_md(desc)}_"
 
     # ⬜ Blank line
     text += "\n\n"
@@ -2878,8 +2879,8 @@ async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_questions = cur.fetchone()[0]
 
     text = (
-        f"📘 **{title}**"
-        + (f"\n📝 _{desc}_" if desc else "")
+        f"📘 **{escape_md(title)}**"
+        + (f"\n📝 _{escape_md(desc)}_" if desc else "")
         + "\n\n"
         + f"📊 Questions: {total_questions}    ⏱ Timer: {timer}s"
         + f"\n🔀 Questions: {'ON' if sq else 'OFF'}"
@@ -4789,7 +4790,13 @@ async def countdown_timer(user_id, context, seconds, play):
         if not play or play.get("advancing") or play.get("finished"):
             return
 
+        async with play["context_lock"]:
+            if play.get("advancing") or play.get("finished"):
+                return
+            play["advancing"] = True
+
         if play["index"] >= len(play["questions"]) - 1:
+            play["advancing"] = False
             await finish_quiz(user_id, context)
         else:
             await advance_quiz(user_id, context)
@@ -6273,68 +6280,6 @@ async def qb_open_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-async def qb_select_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    quiz_id = context.user_data.get("active_quiz_id")
-    if not quiz_id:
-        await flash_message(context.bot, query.message.chat_id, "❌ No active quiz.")
-        return
-
-    qid = int(query.data.split("|", 1)[1])
-
-    cur.execute(
-        """
-        SELECT 1
-        FROM quiz_question_links
-        WHERE quiz_id=? AND question_id=?
-        """,
-        (quiz_id, qid)
-    )
-    if cur.fetchone():
-        await flash_message(context.bot, query.message.chat_id,
-            "ℹ️ This question is already in the quiz."
-        )
-        return
-
-    try:
-        async with DB_LOCK:
-            cur.execute(
-                """
-                SELECT COALESCE(MAX(position), 0) + 1
-                FROM quiz_question_links
-                WHERE quiz_id=?
-                """,
-                (quiz_id,)
-            )
-            position = cur.fetchone()[0]
-
-            cur.execute(
-                """
-                INSERT INTO quiz_question_links (quiz_id, question_id, position)
-                VALUES (?, ?, ?)
-                """,
-                (quiz_id, qid, position)
-            )
-
-            conn.commit()
-
-    except Exception as e:
-        print("⚠️ Failed to link question:", e)
-        await flash_message(context.bot, query.message.chat_id, "❌ Failed to add question.")
-        return
-
-    await query.answer("✅ Question added.")
-
-    # 🔄 SYNC: Refresh all active group posts for this quiz
-    asyncio.create_task(
-        refresh_all_group_posts_for_quiz(quiz_id, context)
-    )
-
-    context.user_data["reset_q_page"] = True
-    await show_questions_from_message(query.message, context)
-
 async def cancel_create_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -6878,6 +6823,7 @@ async def qb_auto_add_questions(update: Update, context: ContextTypes.DEFAULT_TY
     # How many to select (10 / 50 / 100)
     limit = int(query.data.split("|")[1])
 
+    active_uid = get_active_user_id(context)
     quiz_id = context.user_data.get("active_quiz_id")
     folder_name = context.user_data.get("qb_folder_name")
 
@@ -6893,7 +6839,7 @@ async def qb_auto_add_questions(update: Update, context: ContextTypes.DEFAULT_TY
         FROM question_bank_folders
         WHERE owner_id=? AND name=?
         """,
-        (get_active_user_id(context), folder_name)
+        (active_uid, folder_name)
     )
     row = cur.fetchone()
     if not row:
@@ -6968,9 +6914,12 @@ async def show_quiz_action_menu_by_id(chat_id, message_id, context):
 
     title, desc, timer, sq, sa, total_questions = cur.fetchone()
 
-    text = f"📘 **{title}**"
+    # 📘 Title
+    text = f"📘 **{escape_md(title)}**"
+
+    # 📝 Description (if any)
     if desc:
-        text += f"\n📝 _{desc}_"
+        text += f"\n📝 _{escape_md(desc)}_"
 
     text += "\n\n"
     text += f"📊 Questions: {total_questions}    ⏱ Timer: {timer}s"
@@ -7112,6 +7061,23 @@ async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Track /clear message itself
     context.user_data.setdefault("chat_messages", []).append(update.message.message_id)
 
+    # 🔒 Block /clear during an active quiz to prevent corruption
+    if context.user_data.get("play"):
+        try:
+            await update.message.delete()
+        except:
+            pass
+        msg = await context.bot.send_message(
+            chat_id,
+            "⚠️ Cannot clear chat while a quiz is running.\nStop the quiz first using the Stop Quiz button."
+        )
+        await asyncio.sleep(3)
+        try:
+            await msg.delete()
+        except:
+            pass
+        return
+
     message_ids = context.user_data.get("chat_messages", [])
 
     # Delete all stored messages
@@ -7121,8 +7087,14 @@ async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-    # Clear memory safely
+    # Preserve critical session keys before clearing
+    active_user_id = context.user_data.get("active_user_id")
+
     context.user_data.clear()
+
+    # Restore critical session keys
+    if active_user_id:
+        context.user_data["active_user_id"] = active_user_id
 
 async def cancel_edit_question_explanation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -8556,6 +8528,7 @@ async def db_move_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    active_uid = get_active_user_id(context)
     target_folder = context.user_data.get("db_move_target_folder")
     selected = context.user_data.get("db_move_selected", set())
 
@@ -8566,8 +8539,9 @@ async def db_move_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Resolve target folder_id
     cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
-        (get_active_user_id(context), target_folder)
+        (active_uid, target_folder)
     )
+
     row = cur.fetchone()
     if not row:
         await query.answer("❌ Target folder not found.", show_alert=True)
@@ -9431,7 +9405,7 @@ async def subscriber_agree_notice(update: Update, context: ContextTypes.DEFAULT_
 
     msg = await context.bot.send_message(
         chat_id=query.message.chat_id,
-        text="🧠 **Welcome to TeleQuiz Admin Panel**\n\nPlease choose an option:",
+        text="🧠 **Welcome to TeleQuiz (Admin Panel)**\n\nPlease choose an option to start 👇:",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
