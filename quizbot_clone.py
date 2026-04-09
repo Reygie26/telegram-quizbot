@@ -3702,15 +3702,15 @@ async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = query.message.chat_id
 
-    # 🔥 HARD CLEAN: delete previous preview if exists
-    old_preview_id = context.user_data.get("question_preview_msg_id")
+    # 🔥 Delete the previous preview message (photo or text) if it exists
+    old_preview_id = context.user_data.pop("question_preview_msg_id", None)
     if old_preview_id:
         try:
             await context.bot.delete_message(chat_id, old_preview_id)
-        except:
+        except Exception:
             pass
 
-    # Remove previous list/menu message
+    # The current message (the question list) will be deleted or edited below
     old_list_id = query.message.message_id
 
     qid = int(query.data.replace("Q_", ""))
@@ -3803,7 +3803,7 @@ async def rebuild_question_preview(chat_id, context):
     qid = context.user_data.get("active_question_id")
     if not qid:
         return
- 
+
     cur.execute(
         "SELECT question, image_file_id, options, correct, explanation FROM question_bank WHERE id=?",
         (qid,)
@@ -3811,23 +3811,23 @@ async def rebuild_question_preview(chat_id, context):
     row = cur.fetchone()
     if not row:
         return
- 
+
     question, image, options, correct, explanation = row
     options = options.split("||")
- 
+
     text = f"📝 **{escape_md(question)}**\n\n"
     for i, opt in enumerate(options):
         marker = "✅" if i == correct else "◻️"
         text += f"{marker} {escape_md(opt)}\n"
     if explanation:
         text += f"\n🧾 _{escape_md(explanation)}_"
- 
+
     preview_mode = context.user_data.get("preview_mode", "QUIZ")
     if preview_mode == "DATABASE":
         delete_callback = "DELETE_Q_FROM_DB"
     else:
         delete_callback = "DELETE_Q_FROM_QUIZ"
- 
+
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✏️ Edit", callback_data="EDIT_Q"),
@@ -3838,14 +3838,13 @@ async def rebuild_question_preview(chat_id, context):
             InlineKeyboardButton("↩️ Return", callback_data="RETURN_TO_QUESTIONS"),
         ]
     ])
- 
+
     existing_msg_id = context.user_data.get("question_preview_msg_id")
- 
+
     # ── Try editing in place first ──────────────────────────
     if existing_msg_id:
         try:
             if image:
-                # Existing message might be a photo — try edit_caption
                 await context.bot.edit_message_caption(
                     chat_id=chat_id,
                     message_id=existing_msg_id,
@@ -3854,7 +3853,6 @@ async def rebuild_question_preview(chat_id, context):
                     parse_mode="Markdown"
                 )
             else:
-                # Existing message is text — try edit_text
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=existing_msg_id,
@@ -3864,13 +3862,14 @@ async def rebuild_question_preview(chat_id, context):
                 )
             return  # ✅ edited in place — done
         except Exception:
-            # Media type changed (text→photo or photo→text), or message gone
-            # Fall through to delete+resend
+            # Media type mismatch (text→photo or photo→text), or message gone.
+            # Always attempt deletion before resending.
             try:
                 await context.bot.delete_message(chat_id, existing_msg_id)
             except Exception:
                 pass
- 
+            context.user_data.pop("question_preview_msg_id", None)
+
     # ── Fallback: send new message ──────────────────────────
     if image:
         msg = await context.bot.send_photo(
@@ -3887,7 +3886,8 @@ async def rebuild_question_preview(chat_id, context):
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
- 
+
+    # ✅ Always update stored ID to point at the live message
     context.user_data["question_preview_msg_id"] = msg.message_id
 
 async def show_question_preview_by_id(chat_id, context):
@@ -7147,24 +7147,35 @@ async def back_to_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     chat_id = query.message.chat_id
-    msg = query.message
 
-    # 🧹 FIX: If the current message is a photo (image question),
-    # we cannot edit it into a text message.
-    # Delete it first, then send a fresh placeholder for the question list.
-    if msg.photo:
+    # 🧹 Always delete the current preview message (photo or text)
+    # and build the question list on a fresh message to avoid edit-type conflicts.
+    preview_id = context.user_data.pop("question_preview_msg_id", None)
+
+    # Delete the message that contains the Return button (the preview itself)
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    # Also delete any separately tracked preview if it differs
+    if preview_id and preview_id != query.message.message_id:
         try:
-            await msg.delete()
-        except:
+            await context.bot.delete_message(chat_id, preview_id)
+        except Exception:
             pass
-        # Clear the stored preview ID since we just deleted it
-        context.user_data.pop("question_preview_msg_id", None)
-        # Send a fresh plain message to build the question list on
+
+    # Check which mode we are in (Database folder or Quiz question list)
+    preview_mode = context.user_data.get("preview_mode", "QUIZ")
+
+    if preview_mode == "DATABASE":
+        # Return to database folder question list
+        new_msg = await context.bot.send_message(chat_id=chat_id, text="⏳")
+        await show_db_questions_from_message(new_msg, context)
+    else:
+        # Return to quiz question list
         new_msg = await context.bot.send_message(chat_id=chat_id, text="⏳")
         await show_questions_from_message(new_msg, context)
-    else:
-        # Normal text message — edit it directly
-        await show_questions_from_message(msg, context)
 
 async def show_db_questions_from_message(message, context):
     active_uid = get_active_user_id(context)
