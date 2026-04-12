@@ -113,138 +113,6 @@ def track_bot_message(context, message_id):
     context.user_data.setdefault("bot_messages", set()).add(message_id)
 
 # =========================
-# DATABASE SCHEMA SETUP
-# =========================
-def _setup_schema():
-    _conn, _cur = get_db()
-
-    _cur.execute("""
-CREATE TABLE IF NOT EXISTS leaderboard (
-    quiz_id TEXT,
-    chat_id INTEGER,
-    user_id INTEGER,
-    username TEXT,
-    score INTEGER,
-    PRIMARY KEY (quiz_id, chat_id, user_id)
-)
-""")
-    _conn.commit()
-
-    _cur.execute("""
-CREATE TABLE IF NOT EXISTS question_bank (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    folder_id INTEGER,
-    question TEXT,
-    image_file_id TEXT,
-    options TEXT,
-    correct INTEGER,
-    explanation TEXT
-)
-""")
-
-    _cur.execute("""
-CREATE TABLE IF NOT EXISTS quiz_question_links (
-    quiz_id TEXT,
-    question_id INTEGER,
-    position INTEGER,
-    PRIMARY KEY (quiz_id, question_id)
-)
-""")
-    _conn.commit()
-
-    _cur.execute("""
-CREATE TABLE IF NOT EXISTS quizzes (
-    quiz_id TEXT PRIMARY KEY,
-    owner_id INTEGER,
-    title TEXT,
-    description TEXT,
-    folder TEXT DEFAULT 'Default',
-    shuffle_q INTEGER,
-    shuffle_a INTEGER,
-    timer INTEGER
-)
-""")
-
-    _cur.execute("""
-CREATE TABLE IF NOT EXISTS folders (
-    owner_id INTEGER,
-    name TEXT,
-    UNIQUE(owner_id, name)
-)
-""")
-    _conn.commit()
-
-    _cur.execute("""
-CREATE TABLE IF NOT EXISTS question_bank_folders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner_id INTEGER,
-    name TEXT,
-    UNIQUE(owner_id, name)
-)
-""")
-
-    _cur.execute("""
-CREATE TABLE IF NOT EXISTS quiz_post_tokens (
-    token TEXT PRIMARY KEY,
-    quiz_id TEXT,
-    owner_id INTEGER,
-    created_at INTEGER
-)
-""")
-    _conn.commit()
-
-    _cur.execute("""
-CREATE TABLE IF NOT EXISTS group_leaderboard (
-    leaderboard_key TEXT,
-    user_id INTEGER,
-    name TEXT,
-    score INTEGER,
-    PRIMARY KEY (leaderboard_key, user_id)
-)
-""")
-    _conn.commit()
-
-    _cur.execute("""
-CREATE TABLE IF NOT EXISTS group_lb_messages (
-    leaderboard_key TEXT PRIMARY KEY,
-    quiz_id         TEXT,
-    token           TEXT,
-    chat_id         INTEGER,
-    message_id      INTEGER,
-    page            INTEGER DEFAULT 0
-)
-""")
-    _conn.commit()
-
-    _cur.execute("""
-CREATE TABLE IF NOT EXISTS subscribers (
-    user_id INTEGER PRIMARY KEY,
-    name TEXT,
-    subscription_type TEXT,
-    expires_at INTEGER,
-    is_active INTEGER DEFAULT 1,
-    subscribed_at INTEGER DEFAULT 0
-)
-""")
-    _conn.commit()
-
-    # Safe column migrations — ignored if columns already exist
-    for sql in [
-        "ALTER TABLE subscribers ADD COLUMN subscribed_at INTEGER DEFAULT 0",
-        "ALTER TABLE subscribers ADD COLUMN needs_notice INTEGER DEFAULT 0",
-    ]:
-        try:
-            _cur.execute(sql)
-            _conn.commit()
-        except Exception:
-            pass
-
-    _conn.close()
-
-_setup_schema()
-
-# ===== RUN ONCE: ADD FOLDER COLUMN IF MISSING =====
-# =========================
 # OWNER RESTORE
 # =========================
 def load_owner_from_db():
@@ -479,6 +347,137 @@ def get_db():
     connection.execute("PRAGMA journal_mode=WAL")
     cursor = connection.cursor()
     return connection, cursor
+
+# =========================
+# DATABASE SCHEMA SETUP
+# =========================
+def _setup_schema():
+    _conn, _cur = get_db()
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS leaderboard (
+    quiz_id TEXT,
+    chat_id INTEGER,
+    user_id INTEGER,
+    username TEXT,
+    score INTEGER,
+    PRIMARY KEY (quiz_id, chat_id, user_id)
+)
+""")
+    _conn.commit()
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS question_bank (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    folder_id INTEGER,
+    question TEXT,
+    image_file_id TEXT,
+    options TEXT,
+    correct INTEGER,
+    explanation TEXT
+)
+""")
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS quiz_question_links (
+    quiz_id TEXT,
+    question_id INTEGER,
+    position INTEGER,
+    PRIMARY KEY (quiz_id, question_id)
+)
+""")
+    _conn.commit()
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS quizzes (
+    quiz_id TEXT PRIMARY KEY,
+    owner_id INTEGER,
+    title TEXT,
+    description TEXT,
+    folder TEXT DEFAULT 'Default',
+    shuffle_q INTEGER,
+    shuffle_a INTEGER,
+    timer INTEGER
+)
+""")
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS folders (
+    owner_id INTEGER,
+    name TEXT,
+    UNIQUE(owner_id, name)
+)
+""")
+    _conn.commit()
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS question_bank_folders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id INTEGER,
+    name TEXT,
+    UNIQUE(owner_id, name)
+)
+""")
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS quiz_post_tokens (
+    token TEXT PRIMARY KEY,
+    quiz_id TEXT,
+    owner_id INTEGER,
+    created_at INTEGER
+)
+""")
+    _conn.commit()
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS group_leaderboard (
+    leaderboard_key TEXT,
+    user_id INTEGER,
+    name TEXT,
+    score INTEGER,
+    PRIMARY KEY (leaderboard_key, user_id)
+)
+""")
+    _conn.commit()
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS group_lb_messages (
+    leaderboard_key TEXT PRIMARY KEY,
+    quiz_id         TEXT,
+    token           TEXT,
+    chat_id         INTEGER,
+    message_id      INTEGER,
+    page            INTEGER DEFAULT 0
+)
+""")
+    _conn.commit()
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS subscribers (
+    user_id INTEGER PRIMARY KEY,
+    name TEXT,
+    subscription_type TEXT,
+    expires_at INTEGER,
+    is_active INTEGER DEFAULT 1,
+    subscribed_at INTEGER DEFAULT 0
+)
+""")
+    _conn.commit()
+
+    # Safe column migrations — ignored if columns already exist
+    for sql in [
+        "ALTER TABLE subscribers ADD COLUMN subscribed_at INTEGER DEFAULT 0",
+        "ALTER TABLE subscribers ADD COLUMN needs_notice INTEGER DEFAULT 0",
+    ]:
+        try:
+            _cur.execute(sql)
+            _conn.commit()
+        except Exception:
+            pass
+
+    _conn.close()
+
+_setup_schema()
 
 # =========================
 # UI
