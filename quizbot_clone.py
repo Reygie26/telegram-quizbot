@@ -36,6 +36,9 @@ from telegram.ext import (
 from telegram.ext import InlineQueryHandler
 from telegram import InlineQueryResultArticle, InputTextMessageContent
 
+import random
+from difflib import SequenceMatcher
+
 
 
 ##### =============================================================================================
@@ -110,6 +113,218 @@ def track_bot_message(context, message_id):
     context.user_data.setdefault("bot_messages", set()).add(message_id)
 
 # =========================
+# DATABASE SCHEMA SETUP
+# =========================
+def _setup_schema():
+    _conn, _cur = get_db()
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS leaderboard (
+    quiz_id TEXT,
+    chat_id INTEGER,
+    user_id INTEGER,
+    username TEXT,
+    score INTEGER,
+    PRIMARY KEY (quiz_id, chat_id, user_id)
+)
+""")
+    _conn.commit()
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS question_bank (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    folder_id INTEGER,
+    question TEXT,
+    image_file_id TEXT,
+    options TEXT,
+    correct INTEGER,
+    explanation TEXT
+)
+""")
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS quiz_question_links (
+    quiz_id TEXT,
+    question_id INTEGER,
+    position INTEGER,
+    PRIMARY KEY (quiz_id, question_id)
+)
+""")
+    _conn.commit()
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS quizzes (
+    quiz_id TEXT PRIMARY KEY,
+    owner_id INTEGER,
+    title TEXT,
+    description TEXT,
+    folder TEXT DEFAULT 'Default',
+    shuffle_q INTEGER,
+    shuffle_a INTEGER,
+    timer INTEGER
+)
+""")
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS folders (
+    owner_id INTEGER,
+    name TEXT,
+    UNIQUE(owner_id, name)
+)
+""")
+    _conn.commit()
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS question_bank_folders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id INTEGER,
+    name TEXT,
+    UNIQUE(owner_id, name)
+)
+""")
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS quiz_post_tokens (
+    token TEXT PRIMARY KEY,
+    quiz_id TEXT,
+    owner_id INTEGER,
+    created_at INTEGER
+)
+""")
+    _conn.commit()
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS group_leaderboard (
+    leaderboard_key TEXT,
+    user_id INTEGER,
+    name TEXT,
+    score INTEGER,
+    PRIMARY KEY (leaderboard_key, user_id)
+)
+""")
+    _conn.commit()
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS group_lb_messages (
+    leaderboard_key TEXT PRIMARY KEY,
+    quiz_id         TEXT,
+    token           TEXT,
+    chat_id         INTEGER,
+    message_id      INTEGER,
+    page            INTEGER DEFAULT 0
+)
+""")
+    _conn.commit()
+
+    _cur.execute("""
+CREATE TABLE IF NOT EXISTS subscribers (
+    user_id INTEGER PRIMARY KEY,
+    name TEXT,
+    subscription_type TEXT,
+    expires_at INTEGER,
+    is_active INTEGER DEFAULT 1,
+    subscribed_at INTEGER DEFAULT 0
+)
+""")
+    _conn.commit()
+
+    # Safe column migrations — ignored if columns already exist
+    for sql in [
+        "ALTER TABLE subscribers ADD COLUMN subscribed_at INTEGER DEFAULT 0",
+        "ALTER TABLE subscribers ADD COLUMN needs_notice INTEGER DEFAULT 0",
+    ]:
+        try:
+            _cur.execute(sql)
+            _conn.commit()
+        except Exception:
+            pass
+
+    _conn.close()
+
+_setup_schema()
+
+# ===== RUN ONCE: ADD FOLDER COLUMN IF MISSING =====
+# =========================
+# OWNER RESTORE
+# =========================
+def load_owner_from_db():
+    global OWNER_USER_ID
+    _conn, _cur = get_db()
+    _cur.execute("SELECT owner_id FROM quizzes LIMIT 1")
+    row = _cur.fetchone()
+    _conn.close()
+    if row:
+        OWNER_USER_ID = row[0]
+
+def ensure_default_folder():
+    _conn, _cur = get_db()
+    _cur.execute(
+        "INSERT OR IGNORE INTO folders (owner_id, name) VALUES (?, 'Default')",
+        (OWNER_USER_ID,)
+    )
+    _conn.commit()
+    _conn.close()
+
+def ensure_indexes():
+    _conn, _cur = get_db()
+    _cur.execute("CREATE INDEX IF NOT EXISTS idx_ql_quiz_id ON quiz_question_links(quiz_id)")
+    _cur.execute("CREATE INDEX IF NOT EXISTS idx_ql_question_id ON quiz_question_links(question_id)")
+    _cur.execute("CREATE INDEX IF NOT EXISTS idx_ql_quiz_question ON quiz_question_links(quiz_id, question_id)")
+    _cur.execute("CREATE INDEX IF NOT EXISTS idx_qb_folder_id ON question_bank(folder_id)")
+    _cur.execute("CREATE INDEX IF NOT EXISTS idx_quizzes_owner_folder ON quizzes(owner_id, folder)")
+    _cur.execute("CREATE INDEX IF NOT EXISTS idx_leaderboard_quiz_chat ON leaderboard(quiz_id, chat_id)")
+    _conn.commit()
+    _conn.close()
+
+def restore_group_lb_messages():
+    _conn, _cur = get_db()
+    _cur.execute("""
+        SELECT leaderboard_key, quiz_id, token, chat_id, message_id, page
+        FROM group_lb_messages
+    """)
+    rows = _cur.fetchall()
+    _conn.close()
+
+    restored = 0
+    for leaderboard_key, quiz_id, token, chat_id, message_id, page in rows:
+        # Rebuild the key from quiz_id + token to guarantee format consistency
+        rebuilt_key = make_leaderboard_key(quiz_id, token)
+
+        GROUP_LB_MESSAGES[rebuilt_key] = {
+            "quiz_id":    quiz_id,
+            "token":      token,
+            "chat_id":    chat_id,
+            "message_id": message_id,
+            "page":       page,
+        }
+        restored += 1
+
+    print(f"✅ Restored {restored} leaderboard message(s) from DB.")
+
+def fix_leaderboard_key_format():
+    """One-time fix: ensures all group_lb_messages keys use quiz_id:token format."""
+    _conn, _cur = get_db()
+    _cur.execute("SELECT leaderboard_key, quiz_id, token FROM group_lb_messages")
+    rows = _cur.fetchall()
+    fixed = 0
+    for key, quiz_id, token in rows:
+        expected = make_leaderboard_key(quiz_id, token)
+        if key != expected:
+            _cur.execute(
+                "UPDATE group_lb_messages SET leaderboard_key=? WHERE leaderboard_key=?",
+                (expected, key)
+            )
+            fixed += 1
+    if fixed:
+        _conn.commit()
+        print(f"🔧 Fixed {fixed} leaderboard key(s).")
+    else:
+        print("✅ All leaderboard keys are correct.")
+    _conn.close()
+
+
+
+# =========================
 # NAME FORMATTER IN QUIZ LEADERBOARD
 # =========================
 def format_user_name(user):
@@ -134,7 +349,6 @@ def format_user_name(user):
         return last
     else:
         return "Unknown"
-
 
 import re
 
@@ -168,16 +382,18 @@ def get_active_user_id(context) -> int:
     return context.user_data.get("active_user_id", OWNER_USER_ID)
 
 def verify_quiz_owner(quiz_id: str, context) -> bool:
-    """Returns True only if the active user owns this quiz."""
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         "SELECT 1 FROM quizzes WHERE quiz_id=? AND owner_id=?",
         (quiz_id, get_active_user_id(context))
     )
-    return cur.fetchone() is not None
+    row = _cur.fetchone()
+    _conn.close()
+    return row is not None
 
 def verify_question_owner(question_id: int, context) -> bool:
-    """Returns True only if the active user owns this question (via folder)."""
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         """
         SELECT 1 FROM question_bank qb
         JOIN question_bank_folders f ON f.id = qb.folder_id
@@ -185,18 +401,22 @@ def verify_question_owner(question_id: int, context) -> bool:
         """,
         (question_id, get_active_user_id(context))
     )
-    return cur.fetchone() is not None
+    row = _cur.fetchone()
+    _conn.close()
+    return row is not None
 
 def is_authorized(user_id: int) -> bool:
     if user_id == OWNER_USER_ID:
         return True
     now = int(time.time())
-    cur.execute("""
+    _conn, _cur = get_db()
+    _cur.execute("""
         SELECT subscription_type, expires_at, is_active
         FROM subscribers
         WHERE user_id = ?
     """, (user_id,))
-    row = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
     if not row:
         return False
     subscription_type, expires_at, is_active = row
@@ -248,204 +468,17 @@ ONE_YEAR_SECONDS = 365 * 24 * 3600  # 1-year token validity
 # =========================
 # DATABASE
 # =========================
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-cur = conn.cursor()
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS leaderboard (
-    quiz_id TEXT,
-    chat_id INTEGER,
-    user_id INTEGER,
-    username TEXT,
-    score INTEGER,
-    PRIMARY KEY (quiz_id, chat_id, user_id)
-)
-""")
-conn.commit()
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS question_bank (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    folder_id INTEGER,
-    question TEXT,
-    image_file_id TEXT,
-    options TEXT,
-    correct INTEGER,
-    explanation TEXT
-)
-""")
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS quiz_question_links (
-    quiz_id TEXT,
-    question_id INTEGER,
-    position INTEGER,
-    PRIMARY KEY (quiz_id, question_id)
-)
-""")
-
-conn.commit()
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS quizzes (
-    quiz_id TEXT PRIMARY KEY,
-    owner_id INTEGER,
-    title TEXT,
-    description TEXT,
-    folder TEXT DEFAULT 'Default',
-    shuffle_q INTEGER,
-    shuffle_a INTEGER,
-    timer INTEGER
-)
-""")
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS folders (
-    owner_id INTEGER,
-    name TEXT,
-    UNIQUE(owner_id, name)
-)
-""")
-conn.commit()
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS question_bank_folders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner_id INTEGER,
-    name TEXT,
-    UNIQUE(owner_id, name)
-)
-""")
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS quiz_post_tokens (
-    token TEXT PRIMARY KEY,
-    quiz_id TEXT,
-    owner_id INTEGER,
-    created_at INTEGER
-)
-""")
-conn.commit()
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS group_leaderboard (
-    leaderboard_key TEXT,
-    user_id INTEGER,
-    name TEXT,
-    score INTEGER,
-    PRIMARY KEY (leaderboard_key, user_id)
-)
-""")
-conn.commit()
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS group_lb_messages (
-    leaderboard_key TEXT PRIMARY KEY,
-    quiz_id         TEXT,
-    token           TEXT,
-    chat_id         INTEGER,
-    message_id      INTEGER,
-    page            INTEGER DEFAULT 0
-)
-""")
-conn.commit()
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS subscribers (
-    user_id INTEGER PRIMARY KEY,
-    name TEXT,
-    subscription_type TEXT,
-    expires_at INTEGER,
-    is_active INTEGER DEFAULT 1,
-    subscribed_at INTEGER DEFAULT 0
-)
-""")
-conn.commit()
-
-try:
-    cur.execute("ALTER TABLE subscribers ADD COLUMN subscribed_at INTEGER DEFAULT 0")
-    conn.commit()
-except Exception:
-    pass  # Column already exists — safe to ignore
-
-try:
-    cur.execute("ALTER TABLE subscribers ADD COLUMN needs_notice INTEGER DEFAULT 0")
-    conn.commit()
-except Exception:
-    pass  # Column already exists — safe to ignore
-
-# ===== RUN ONCE: ADD FOLDER COLUMN IF MISSING =====
-# =========================
-# OWNER RESTORE
-# =========================
-def load_owner_from_db():
-    global OWNER_USER_ID
-    cur.execute("SELECT owner_id FROM quizzes LIMIT 1")
-    row = cur.fetchone()
-    if row:
-        OWNER_USER_ID = row[0]
-
-def ensure_default_folder():
-    cur.execute(
-        "INSERT OR IGNORE INTO folders (owner_id, name) VALUES (?, 'Default')",
-        (OWNER_USER_ID,)
-    )
-    conn.commit()
-
-def ensure_indexes():
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_ql_quiz_id ON quiz_question_links(quiz_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_ql_question_id ON quiz_question_links(question_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_ql_quiz_question ON quiz_question_links(quiz_id, question_id)")
- 
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_qb_folder_id ON question_bank(folder_id)")
-    
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_quizzes_owner_folder ON quizzes(owner_id, folder)")
-    
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_leaderboard_quiz_chat ON leaderboard(quiz_id, chat_id)")
-    
-    conn.commit()
-
-def restore_group_lb_messages():
-    cur.execute("""
-        SELECT leaderboard_key, quiz_id, token, chat_id, message_id, page
-        FROM group_lb_messages
-    """)
-    rows = cur.fetchall()
-
-    restored = 0
-    for leaderboard_key, quiz_id, token, chat_id, message_id, page in rows:
-        # Rebuild the key from quiz_id + token to guarantee format consistency
-        rebuilt_key = make_leaderboard_key(quiz_id, token)
-
-        GROUP_LB_MESSAGES[rebuilt_key] = {
-            "quiz_id":    quiz_id,
-            "token":      token,
-            "chat_id":    chat_id,
-            "message_id": message_id,
-            "page":       page,
-        }
-        restored += 1
-
-    print(f"✅ Restored {restored} leaderboard message(s) from DB.")
-
-def fix_leaderboard_key_format():
-    """One-time fix: ensures all group_lb_messages keys use quiz_id:token format."""
-    cur.execute("SELECT leaderboard_key, quiz_id, token FROM group_lb_messages")
-    rows = cur.fetchall()
-    fixed = 0
-    for key, quiz_id, token in rows:
-        expected = make_leaderboard_key(quiz_id, token)
-        if key != expected:
-            cur.execute(
-                "UPDATE group_lb_messages SET leaderboard_key=? WHERE leaderboard_key=?",
-                (expected, key)
-            )
-            fixed += 1
-    if fixed:
-        conn.commit()
-        print(f"🔧 Fixed {fixed} leaderboard key(s).")
-    else:
-        print("✅ All leaderboard keys are correct.")
+def get_db():
+    """
+    Returns a fresh (conn, cur) pair for each call.
+    SQLite allows multiple connections to the same file.
+    Using per-operation connections eliminates shared-cursor
+    data corruption in async code.
+    """
+    connection = sqlite3.connect(DB_FILE, check_same_thread=False)
+    connection.execute("PRAGMA journal_mode=WAL")
+    cursor = connection.cursor()
+    return connection, cursor
 
 # =========================
 # UI
@@ -477,12 +510,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 🔑 Build leaderboard key
         leaderboard_key = make_leaderboard_key(quiz_id, token)
 
-        # 🔍 Verify token exists in DB and is within 6 months
-        cur.execute(
+        # 🔍 Verify token exists in DB and is within 1 year
+        _conn_t, _cur_t = get_db()
+        _cur_t.execute(
             "SELECT created_at FROM quiz_post_tokens WHERE token=? AND quiz_id=?",
             (token, quiz_id)
         )
-        token_row = cur.fetchone()
+        token_row = _cur_t.fetchone()
+        _conn_t.close()
 
         now = int(time.time())
 
@@ -505,7 +540,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not lb_info:
             db_row = None
             for attempt in range(5):
-                cur.execute(
+                _conn_lb, _cur_lb = get_db()
+                _cur_lb.execute(
                     """
                     SELECT quiz_id, token, chat_id, message_id, page
                     FROM group_lb_messages
@@ -513,7 +549,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     """,
                     (leaderboard_key,)
                 )
-                db_row = cur.fetchone()
+                db_row = _cur_lb.fetchone()
+                _conn_lb.close()
                 if db_row:
                     break
                 await asyncio.sleep(1)  # wait 1s and retry
@@ -556,12 +593,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["group_chat_id"] = lb_info["chat_id"]
 
         # 🔍 Fetch quiz title from DB
-        cur.execute(
-            "SELECT title FROM quizzes WHERE quiz_id=?",
-            (quiz_id,)
-        )
-        title_row = cur.fetchone()
-        quiz_title = title_row[0] if title_row else "Quiz"
+        _conn, _cur = get_db()
+        _cur.execute("SELECT title FROM quizzes WHERE quiz_id=?", (quiz_id,))
+        row = _cur.fetchone()
+        _conn.close()
+        quiz_title = row[0] if row else "Quiz"
 
         msg = await update.message.reply_text(
             f"🎮 *Quiz Ready!*\n"
@@ -596,11 +632,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["chat_messages"].append(update.message.message_id)
 
         # 🔔 Check if this subscriber needs to see the first-access notice
-        cur.execute(
+        _conn_n, _cur_n = get_db()
+        _cur_n.execute(
             "SELECT needs_notice FROM subscribers WHERE user_id=?",
             (user_id,)
         )
-        notice_row = cur.fetchone()
+        notice_row = _cur_n.fetchone()
+        _conn_n.close()
         needs_notice = notice_row and notice_row[0] == 1
 
         if needs_notice:
@@ -733,11 +771,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # 🔑 UPDATE QUESTION BANK (SOURCE OF TRUTH)
-        cur.execute(
-            "UPDATE question_bank SET image_file_id=? WHERE id=?",
-            (file_id, qid)
-        )
-        conn.commit()
+        async with DB_LOCK:
+            _conn_img, _cur_img = get_db()
+            _cur_img.execute(
+                "UPDATE question_bank SET image_file_id=? WHERE id=?",
+                (file_id, qid)
+            )
+            _conn_img.commit()
+            _conn_img.close()
 
         context.user_data.pop("edit_q_field", None)
 
@@ -831,7 +872,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ❌ Check duplicate (case-insensitive)
-        cur.execute(
+        _conn_chk, _cur_chk = get_db()
+        _cur_chk.execute(
             """
             SELECT 1
             FROM question_bank_folders
@@ -840,18 +882,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """,
             (get_active_user_id(context), normalized)
         )
-        if cur.fetchone():
+        already = _cur_chk.fetchone()
+        _conn_chk.close()
+        if already:
             await update.message.reply_text("❌ Folder already exists.")
             return
 
         # ✅ Create folder
         try:
             async with DB_LOCK:
-                cur.execute(
+                _conn, _cur = get_db()
+                _cur.execute(
                     "INSERT INTO question_bank_folders (owner_id, name) VALUES (?, ?)",
                     (get_active_user_id(context), normalized)
                 )
-                conn.commit()
+                _conn.commit()
+                _conn.close()
         except Exception as e:
             print("⚠️ DB folder create failed:", e)
             await update.message.reply_text("❌ Failed to create folder.")
@@ -902,7 +948,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ❌ Check duplicate (case-insensitive)
-        cur.execute(
+        _conn_chk, _cur_chk = get_db()
+        _cur_chk.execute(
             """
             SELECT 1
             FROM question_bank_folders
@@ -911,18 +958,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """,
             (get_active_user_id(context), new_name)
         )
-        if cur.fetchone():
+        already = _cur_chk.fetchone()
+        _conn_chk.close()
+        if already:
             await update.message.reply_text("❌ A folder with this name already exists.")
             return
 
         # ✅ Rename folder
         try:
             async with DB_LOCK:
-                cur.execute(
+                _conn, _cur = get_db()
+                _cur.execute(
                     "UPDATE question_bank_folders SET name=? WHERE owner_id=? AND name=?",
                     (new_name, get_active_user_id(context), old_name)
                 )
-                conn.commit()
+                _conn.commit()
+                _conn.close()
         except Exception as e:
             print("⚠️ DB folder rename failed:", e)
             await flash_message(context.bot, chat_id, "❌ Rename failed.")
@@ -1017,11 +1068,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
 
         # Update DB
-        cur.execute(
-            "UPDATE question_bank SET explanation=? WHERE id=?",
-            (new_text, qid)
-        )
-        conn.commit()
+        async with DB_LOCK:
+            _conn_e, _cur_e = get_db()
+            _cur_e.execute(
+                "UPDATE question_bank SET explanation=? WHERE id=?",
+                (new_text, qid)
+            )
+            _conn_e.commit()
+            _conn_e.close()
 
         # Delete prompt
         prompt_id = context.user_data.pop("edit_expl_prompt_id", None)
@@ -1060,11 +1114,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # 🔑 Update DB
-        cur.execute(
-            "UPDATE question_bank SET question=? WHERE id=?",
-            (text, qid)
-        )
-        conn.commit()
+        async with DB_LOCK:
+            _conn_q, _cur_q = get_db()
+            _cur_q.execute(
+                "UPDATE question_bank SET question=? WHERE id=?",
+                (text, qid)
+            )
+            _conn_q.commit()
+            _conn_q.close()
 
         context.user_data.pop("edit_q_field", None)
 
@@ -1101,9 +1158,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data["last_user_question_msg_id"] = update.message.message_id
 
-        from difflib import SequenceMatcher
-
         new_text = text.strip()
+
         # ── Length validation ──────────────────────────────
         if len(new_text) > MAX_QUESTION_LENGTH:
             err = await update.message.reply_text(
@@ -1121,8 +1177,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ──────────────────────────────────────────────────
         similar_matches = []
 
-        cur.execute("SELECT id, question FROM question_bank")
-        existing_questions = cur.fetchall()
+        _conn_dup, _cur_dup = get_db()
+        _cur_dup.execute("SELECT id, question FROM question_bank")
+        existing_questions = _cur_dup.fetchall()
+        _conn_dup.close()
 
         for qid, existing_text in existing_questions:
             similarity = SequenceMatcher(
@@ -1143,11 +1201,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             for i, (_, q_text) in enumerate(top_matches, 1):
                 # Fetch options and correct answer for this question
-                cur.execute(
+                _conn_qr, _cur_qr = get_db()
+                _cur_qr.execute(
                     "SELECT options, correct FROM question_bank WHERE question=? LIMIT 1",
                     (q_text,)
                 )
-                q_row = cur.fetchone()
+                q_row = _cur_qr.fetchone()
+                _conn_qr.close()
                 if q_row:
                     opts = q_row[0].split("||")
                     correct_idx = q_row[1]
@@ -1339,27 +1399,33 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ 'Default' folder already exists.")
             return
 
-        cur.execute(
+        _conn_chk, _cur_chk = get_db()
+        _cur_chk.execute(
             "SELECT 1 FROM folders WHERE owner_id=? AND name=?",
             (get_active_user_id(context), folder)
         )
-        if cur.fetchone():
+        already = _cur_chk.fetchone()
+        _conn_chk.close()
+        if already:
             await update.message.reply_text("❌ Folder already exists.")
             return
-
-        cur.execute(
-            "INSERT INTO folders (owner_id, name) VALUES (?, ?)",
-            (get_active_user_id(context), folder)
-        )
 
         quiz_id = context.user_data.get("active_quiz_id")
         if not quiz_id:
             return
-        cur.execute(
-            "UPDATE quizzes SET folder=? WHERE quiz_id=? AND owner_id=?",
-            (folder, quiz_id, get_active_user_id(context))
-        )
-        conn.commit()
+
+        async with DB_LOCK:
+            _conn_mf, _cur_mf = get_db()
+            _cur_mf.execute(
+                "INSERT INTO folders (owner_id, name) VALUES (?, ?)",
+                (get_active_user_id(context), folder)
+            )
+            _cur_mf.execute(
+                "UPDATE quizzes SET folder=? WHERE quiz_id=? AND owner_id=?",
+                (folder, quiz_id, get_active_user_id(context))
+            )
+            _conn_mf.commit()
+            _conn_mf.close()
 
         context.user_data["state"] = None
 
@@ -1399,11 +1465,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ You cannot create a folder named Default.")
             return
 
-        cur.execute(
+        _conn_chk, _cur_chk = get_db()
+        _cur_chk.execute(
             "SELECT 1 FROM folders WHERE owner_id=? AND LOWER(name)=LOWER(?)",
             (get_active_user_id(context), folder_name)
         )
-        if cur.fetchone():
+        already = _cur_chk.fetchone()
+        _conn_chk.close()
+        if already:
             err = await update.message.reply_text(
                 f"❌ A folder named *{folder_name}* already exists.\n\nPlease send a different name:",
                 parse_mode="Markdown"
@@ -1418,11 +1487,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             async with DB_LOCK:
-                cur.execute(
+                _conn, _cur = get_db()
+                _cur.execute(
                     "INSERT INTO folders (owner_id, name) VALUES (?, ?)",
                     (get_active_user_id(context), folder_name)
                 )
-                conn.commit()
+                _conn.commit()
+                _conn.close()
         except Exception as e:
             print("⚠️ Failed to create folder:", e)
             await flash_message(context.bot, chat_id, "❌ Folder creation failed.")
@@ -1472,11 +1543,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ You cannot rename a folder to Default.")
             return
 
-        cur.execute(
+        _conn_chk, _cur_chk = get_db()
+        _cur_chk.execute(
             "SELECT 1 FROM folders WHERE owner_id=? AND LOWER(name)=LOWER(?)",
             (get_active_user_id(context), new)
         )
-        if cur.fetchone():
+        already = _cur_chk.fetchone()
+        _conn_chk.close()
+        if already:
             err = await update.message.reply_text(
                 f"❌ A folder named *{new}* already exists.\n\nPlease send a different name:",
                 parse_mode="Markdown"
@@ -1491,15 +1565,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             async with DB_LOCK:
-                cur.execute(
+                _conn, _cur = get_db()
+                _cur.execute(
                     "UPDATE folders SET name=? WHERE owner_id=? AND name=?",
                     (new, get_active_user_id(context), old)
                 )
-                cur.execute(
+                _cur.execute(
                     "UPDATE quizzes SET folder=? WHERE owner_id=? AND folder=?",
                     (new, get_active_user_id(context), old)
                 )
-                conn.commit()
+                _conn.commit()
+                _conn.close()
+
         except Exception as e:
             print("⚠️ Rename failed:", e)
             await flash_message(context.bot, chat_id, "❌ Rename failed.")
@@ -1544,11 +1621,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # 🔒 Duplicate title check (case-insensitive)
-        cur.execute(
+        _conn_chk, _cur_chk = get_db()
+        _cur_chk.execute(
             "SELECT 1 FROM quizzes WHERE owner_id=? AND LOWER(title)=LOWER(?)",
             (get_active_user_id(context), title)
         )
-        if cur.fetchone():
+        already = _cur_chk.fetchone()
+        _conn_chk.close()
+        if already:
             err = await update.message.reply_text(
                 f"❌ A quiz named *{title}* already exists.\n\nPlease send a different title:",
                 parse_mode="Markdown"
@@ -1563,7 +1643,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             async with DB_LOCK:
-                cur.execute(
+                _conn, _cur = get_db()
+                _cur.execute(
                     "INSERT INTO quizzes VALUES (?, ?, ?, NULL, 'Default', 1, 1, 15)",
                     (
                         context.user_data["quiz_id"],
@@ -1571,7 +1652,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         title,
                     )
                 )
-                conn.commit()
+                _conn.commit()
+                _conn.close()
         except Exception as e:
             print("⚠️ Quiz creation failed:", e)
             await flash_message(context.bot, chat_id, "❌ Failed to create quiz.")
@@ -1632,11 +1714,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # 🔒 Duplicate title check (exclude current quiz)
-        cur.execute(
+        _conn_chk, _cur_chk = get_db()
+        _cur_chk.execute(
             "SELECT 1 FROM quizzes WHERE owner_id=? AND LOWER(title)=LOWER(?) AND quiz_id!=?",
             (get_active_user_id(context), new_title, quiz_id)
         )
-        if cur.fetchone():
+        already = _cur_chk.fetchone()
+        _conn_chk.close()
+        if already:
             err = await update.message.reply_text(
                 f"❌ A quiz named *{new_title}* already exists.\n\nPlease send a different title:",
                 parse_mode="Markdown"
@@ -1649,11 +1734,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        cur.execute(
-            "UPDATE quizzes SET title=? WHERE quiz_id=?",
-            (new_title, quiz_id)
-        )
-        conn.commit()
+        async with DB_LOCK:
+            _conn_w, _cur_w = get_db()
+            _cur_w.execute(
+                "UPDATE quizzes SET title=? WHERE quiz_id=?",
+                (new_title, quiz_id)
+            )
+            _conn_w.commit()
+            _conn_w.close()
 
         context.user_data["state"] = None
 
@@ -1698,17 +1786,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         user_msg_id = update.message.message_id
 
-        if text.upper() == "CLEAR":
-            cur.execute(
-                "UPDATE quizzes SET description=NULL WHERE quiz_id=?",
-                (quiz_id,)
-            )
-        else:
-            cur.execute(
-                "UPDATE quizzes SET description=? WHERE quiz_id=?",
-                (text, quiz_id)
-            )
-        conn.commit()
+        async with DB_LOCK:
+            _conn_d, _cur_d = get_db()
+            if text.upper() == "CLEAR":
+                _cur_d.execute(
+                    "UPDATE quizzes SET description=NULL WHERE quiz_id=?",
+                    (quiz_id,)
+                )
+            else:
+                _cur_d.execute(
+                    "UPDATE quizzes SET description=? WHERE quiz_id=?",
+                    (text, quiz_id)
+                )
+            _conn_d.commit()
+            _conn_d.close()
 
         context.user_data["state"] = None
 
@@ -1893,20 +1984,15 @@ async def delete_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def show_quiz_folders(message, context):
-    # Pagination state
     page = context.user_data.get("quiz_folder_page", 0)
-    PER_PAGE = 5  # folders per page (excluding Default)
-
-    # Load all folders
+    PER_PAGE = 5
     active_uid = get_active_user_id(context)
-    cur.execute("""
-        SELECT name
-        FROM folders
-        WHERE owner_id=?
-    """, (active_uid,))
-    rows = [row[0] for row in cur.fetchall()]
 
-    # 🔑 Separate Default folder
+    _conn, _cur = get_db()
+    _cur.execute("SELECT name FROM folders WHERE owner_id=?", (active_uid,))
+    rows = [row[0] for row in _cur.fetchall()]
+    _conn.close()
+
     default_folder = "Default"
     other_folders = sorted([f for f in rows if f != default_folder])
 
@@ -1920,12 +2006,13 @@ async def show_quiz_folders(message, context):
 
     keyboard = []
 
-    # 📁 DEFAULT FOLDER (ALWAYS ON TOP, NOT PAGINATED)
-    cur.execute(
+    _conn2, _cur2 = get_db()
+    _cur2.execute(
         "SELECT COUNT(*) FROM quizzes WHERE owner_id=? AND folder=?",
         (active_uid, default_folder)
     )
-    default_count = cur.fetchone()[0]
+    default_count = _cur2.fetchone()[0]
+    _conn2.close()
 
     keyboard.append([
         InlineKeyboardButton(
@@ -1934,13 +2021,14 @@ async def show_quiz_folders(message, context):
         )
     ])
 
-    # 📁 PAGINATED OTHER FOLDERS
     for folder in page_items:
-        cur.execute(
+        _conn3, _cur3 = get_db()
+        _cur3.execute(
             "SELECT COUNT(*) FROM quizzes WHERE owner_id=? AND folder=?",
             (active_uid, folder)
         )
-        count = cur.fetchone()[0]
+        count = _cur3.fetchone()[0]
+        _conn3.close()
 
         keyboard.append([
             InlineKeyboardButton(
@@ -1949,23 +2037,15 @@ async def show_quiz_folders(message, context):
             )
         ])
 
-    # ◀ ▶ Pagination controls (only if needed)
     if pages > 1:
         nav = []
         if page > 0:
-            nav.append(
-                InlineKeyboardButton("◀ Prev", callback_data="QUIZ_FOLDER_PREV")
-            )
-        nav.append(
-            InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QUIZ_FOLDER_NOP")
-        )
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data="QUIZ_FOLDER_PREV"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QUIZ_FOLDER_NOP"))
         if page < pages - 1:
-            nav.append(
-                InlineKeyboardButton("Next ▶", callback_data="QUIZ_FOLDER_NEXT")
-            )
+            nav.append(InlineKeyboardButton("Next ▶", callback_data="QUIZ_FOLDER_NEXT"))
         keyboard.append(nav)
 
-    # Bottom actions
     keyboard.append([
         InlineKeyboardButton("➕ Add Folder", callback_data="ADD_FOLDER"),
         InlineKeyboardButton("🏠 Home", callback_data="GO_HOME")
@@ -1978,28 +2058,21 @@ async def show_quiz_folders(message, context):
 
 async def show_database_menu(message, context):
     active_uid = get_active_user_id(context)
-    """
-    Database menu.
-    UI behaves like Quiz Folder but logic is fully independent.
-    """
 
-    # 🔑 Load database folders (EXCLUDING Default)
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         """
-        SELECT id, name
-        FROM question_bank_folders
-        WHERE owner_id=?
-          AND name != 'Default'
+        SELECT id, name FROM question_bank_folders
+        WHERE owner_id=? AND name != 'Default'
         ORDER BY name COLLATE NOCASE
         """,
-        (get_active_user_id(context),)
+        (active_uid,)
     )
-    folders = cur.fetchall()
+    folders = _cur.fetchall()
+    _conn.close()
 
-    # Pagination
     PER_PAGE = 5
     page = context.user_data.get("db_page", 0)
-
     total = len(folders)
     pages = (total - 1) // PER_PAGE + 1 if total else 1
     page = max(0, min(page, pages - 1))
@@ -2010,21 +2083,19 @@ async def show_database_menu(message, context):
 
     keyboard = []
 
-    # 📁 DEFAULT FOLDER — ALWAYS FIRST
-    cur.execute(
+    _conn2, _cur2 = get_db()
+    _cur2.execute(
         """
-        SELECT COUNT(*)
-        FROM question_bank qb
+        SELECT COUNT(*) FROM question_bank qb
         JOIN question_bank_folders f ON f.id = qb.folder_id
         WHERE f.owner_id=? AND f.name='Default'
         """,
         (active_uid,)
     )
-    default_count = cur.fetchone()[0]
+    default_count = _cur2.fetchone()[0]
+    _conn2.close()
 
-    keyboard.append([
-        InlineKeyboardButton("🔍 Search Questions", callback_data="DB_SEARCH_START")
-    ])
+    keyboard.append([InlineKeyboardButton("🔍 Search Questions", callback_data="DB_SEARCH_START")])
     keyboard.append([
         InlineKeyboardButton(
             f"📁 Default Folder ({default_count})",
@@ -2032,13 +2103,11 @@ async def show_database_menu(message, context):
         )
     ])
 
-    # 📁 User-created database folders
     for folder_id, folder_name in page_items:
-        cur.execute(
-            "SELECT COUNT(*) FROM question_bank WHERE folder_id=?",
-            (folder_id,)
-        )
-        count = cur.fetchone()[0]
+        _conn3, _cur3 = get_db()
+        _cur3.execute("SELECT COUNT(*) FROM question_bank WHERE folder_id=?", (folder_id,))
+        count = _cur3.fetchone()[0]
+        _conn3.close()
 
         keyboard.append([
             InlineKeyboardButton(
@@ -2047,19 +2116,15 @@ async def show_database_menu(message, context):
             )
         ])
 
-    # ◀ ▶ Pagination
     if pages > 1:
         nav = []
         if page > 0:
             nav.append(InlineKeyboardButton("◀ Prev", callback_data="DB_PREV"))
-        nav.append(
-            InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="DB_NOP")
-        )
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="DB_NOP"))
         if page < pages - 1:
             nav.append(InlineKeyboardButton("Next ▶", callback_data="DB_NEXT"))
         keyboard.append(nav)
 
-    # 🔘 Bottom actions
     keyboard.append([
         InlineKeyboardButton("➕ Add Folder", callback_data="DB_ADD"),
         InlineKeyboardButton("🏠 Home", callback_data="GO_HOME"),
@@ -2075,81 +2140,74 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_uid = get_active_user_id(context)
     query = update.callback_query
     await query.answer()
-    # Only update folder_name and reset page when triggered by DB_OPEN
+
     if query.data.startswith("DB_OPEN|"):
         folder_name = query.data.split("|", 1)[1]
         context.user_data["db_folder_name"] = folder_name
         context.user_data["db_q_page"] = 0
     else:
         folder_name = context.user_data.get("db_folder_name")
+
     if not folder_name:
         await query.answer("❌ Folder context lost.", show_alert=True)
         return
+
     context.user_data["preview_mode"] = "DATABASE"
     PER_PAGE = 10
     page = context.user_data.get("db_q_page", 0)
-    # Resolve folder_id
-    cur.execute(
-        """
-        SELECT id
-        FROM question_bank_folders
-        WHERE owner_id=? AND name=?
-        """,
+
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
         (active_uid, folder_name)
     )
-    row = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
+
     if not row:
         await flash_message(context.bot, query.message.chat_id, "❌ Folder not found.")
         return
     folder_id = row[0]
-    # Load all questions in this folder
-    cur.execute(
-        """
-        SELECT id, question
-        FROM question_bank
-        WHERE folder_id=?
-        ORDER BY question COLLATE NOCASE
-        """,
+
+    _conn2, _cur2 = get_db()
+    _cur2.execute(
+        "SELECT id, question FROM question_bank WHERE folder_id=? ORDER BY question COLLATE NOCASE",
         (folder_id,)
     )
-    rows = cur.fetchall()
+    rows = _cur2.fetchall()
+    _conn2.close()
+
     keyboard = []
-    # Empty folder case
+
     if not rows:
         if folder_name != "Default":
             keyboard.append([
                 InlineKeyboardButton("✏️ Rename", callback_data=f"DB_RENAME_FOLDER|{folder_name}"),
                 InlineKeyboardButton("📥 Move Questions In", callback_data=f"DB_MOVE_IN|{folder_name}")
             ])
-        if folder_name != "Default":
             keyboard.append([
                 InlineKeyboardButton("🗑 Delete Folder", callback_data=f"DB_DELETE_FOLDER|{folder_name}"),
                 InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
             ])
         else:
-            keyboard.append([
-                InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
-            ])
+            keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")])
         await query.message.edit_text(
             f"📁 **{folder_name}**\n\n_No questions in this folder yet._",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
         return
-    # Pagination
+
     total = len(rows)
     pages = (total - 1) // PER_PAGE + 1
     page = max(0, min(page, pages - 1))
     context.user_data["db_q_page"] = page
     start = page * PER_PAGE
     end = start + PER_PAGE
-    page_rows = rows[start:end]
-    # Question buttons
-    for qid, text in page_rows:
-        keyboard.append([
-            InlineKeyboardButton(text[:50], callback_data=f"Q_{qid}")
-        ])
-    # Pagination controls
+
+    for qid, text in rows[start:end]:
+        keyboard.append([InlineKeyboardButton(text[:50], callback_data=f"Q_{qid}")])
+
     if pages > 1:
         nav = []
         if page > 0:
@@ -2158,22 +2216,19 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if page < pages - 1:
             nav.append(InlineKeyboardButton("Next ▶", callback_data="DB_Q_NEXT"))
         keyboard.append(nav)
-    # Rename + Move In row (non-Default only)
+
     if folder_name != "Default":
         keyboard.append([
             InlineKeyboardButton("✏️ Rename", callback_data=f"DB_RENAME_FOLDER|{folder_name}"),
             InlineKeyboardButton("📥 Move Questions In", callback_data=f"DB_MOVE_IN|{folder_name}")
         ])
-    # Delete + Back row
-    if folder_name != "Default":
         keyboard.append([
             InlineKeyboardButton("🗑 Delete Folder", callback_data=f"DB_DELETE_FOLDER|{folder_name}"),
             InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
         ])
     else:
-        keyboard.append([
-            InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
-        ])
+        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")])
+
     await query.message.edit_text(
         f"📁 **{folder_name}**\n\nSelect a question:",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2181,34 +2236,21 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def qb_pick_folder_menu(message, context):
-    """
-    Question Bank folder picker (used when adding questions to a quiz)
-    """
-
-    # Reset selection state
     context.user_data["qb_selected"] = set()
     context.user_data.setdefault("qb_folder_page", 0)
-
     page = context.user_data["qb_folder_page"]
     PER_PAGE = 5
 
-    cur.execute(
-        """
-        SELECT name
-        FROM question_bank_folders
-        WHERE owner_id=?
-        """,
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT name FROM question_bank_folders WHERE owner_id=?",
         (get_active_user_id(context),)
     )
-    rows = [row[0] for row in cur.fetchall()]
+    rows = [row[0] for row in _cur.fetchall()]
+    _conn.close()
 
-    # 🔑 Pin Default folder to top
     default_folder = "Default"
-    other_folders = sorted(
-        [f for f in rows if f != default_folder],
-        key=str.lower
-    )
-
+    other_folders = sorted([f for f in rows if f != default_folder], key=str.lower)
     folders = [default_folder] + other_folders if default_folder in rows else other_folders
 
     total = len(folders)
@@ -2221,53 +2263,37 @@ async def qb_pick_folder_menu(message, context):
 
     keyboard = []
 
-    # 📁 Folder buttons
     for folder in page_items:
-        # 🔑 Get folder_id
-        cur.execute(
-            """
-            SELECT id
-            FROM question_bank_folders
-            WHERE owner_id=? AND name=?
-            """,
+        _conn2, _cur2 = get_db()
+        _cur2.execute(
+            "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
             (get_active_user_id(context), folder)
         )
-        row = cur.fetchone()
+        row = _cur2.fetchone()
+        _conn2.close()
         if not row:
             continue
-
         folder_id = row[0]
 
-        # 🔢 Count questions inside this folder
-        cur.execute(
-            "SELECT COUNT(*) FROM question_bank WHERE folder_id=?",
-            (folder_id,)
-        )
-        count = cur.fetchone()[0]
+        _conn3, _cur3 = get_db()
+        _cur3.execute("SELECT COUNT(*) FROM question_bank WHERE folder_id=?", (folder_id,))
+        count = _cur3.fetchone()[0]
+        _conn3.close()
 
         keyboard.append([
-            InlineKeyboardButton(
-                f"📁 {folder} ({count})",
-                callback_data=f"QB_OPEN_FOLDER|{folder}"
-            )
+            InlineKeyboardButton(f"📁 {folder} ({count})", callback_data=f"QB_OPEN_FOLDER|{folder}")
         ])
 
-    # ◀ ▶ Pagination
     if pages > 1:
         nav = []
         if page > 0:
             nav.append(InlineKeyboardButton("◀ Prev", callback_data="QB_FOLDER_PREV"))
-        nav.append(
-            InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QB_FOLDER_NOP")
-        )
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QB_FOLDER_NOP"))
         if page < pages - 1:
             nav.append(InlineKeyboardButton("Next ▶", callback_data="QB_FOLDER_NEXT"))
         keyboard.append(nav)
 
-    # ⬅️ Back
-    keyboard.append([
-        InlineKeyboardButton("⬅️ Back", callback_data="EDIT_QUESTIONS")
-    ])
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="EDIT_QUESTIONS")])
 
     await message.edit_text(
         "📚 **Question Bank**\n\nSelect a folder:",
@@ -2315,26 +2341,24 @@ async def show_db_search_results(message, context):
     page = context.user_data.get("db_search_page", 0)
     PER_PAGE = 10
 
-    # Search question_bank for keyword (case-insensitive)
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         """
         SELECT qb.id, qb.question, qb.options, qb.correct
         FROM question_bank qb
         JOIN question_bank_folders f ON f.id = qb.folder_id
-        WHERE f.owner_id = ?
-          AND LOWER(qb.question) LIKE LOWER(?)
+        WHERE f.owner_id = ? AND LOWER(qb.question) LIKE LOWER(?)
         ORDER BY qb.question COLLATE NOCASE
         """,
         (get_active_user_id(context), f"%{keyword}%")
     )
-    rows = cur.fetchall()
+    rows = _cur.fetchall()
+    _conn.close()
 
     keyboard = []
 
     if not rows:
-        keyboard.append([
-            InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
-        ])
+        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")])
         await message.edit_text(
             f"🔍 Search: *{keyword}*\n\n_No questions found._",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2349,17 +2373,13 @@ async def show_db_search_results(message, context):
 
     start = page * PER_PAGE
     end = start + PER_PAGE
-    page_rows = rows[start:end]
 
-    for qid, q_text, options_raw, correct in page_rows:
+    for qid, q_text, options_raw, correct in rows[start:end]:
         opts = options_raw.split("||")
         correct_text = opts[correct] if 0 <= correct < len(opts) else "—"
         label = f"{q_text[:38]}… ✅ {correct_text[:20]}"
-        keyboard.append([
-            InlineKeyboardButton(label, callback_data=f"DB_SEARCH_Q|{qid}")
-        ])
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"DB_SEARCH_Q|{qid}")])
 
-    # Pagination
     if pages > 1:
         nav = []
         if page > 0:
@@ -2390,15 +2410,17 @@ async def db_search_preview_question(update: Update, context: ContextTypes.DEFAU
     context.user_data["preview_mode"] = "DATABASE"
     context.user_data["preview_return"] = "DB_SEARCH"
 
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         """
         SELECT question, image_file_id, options, correct, explanation
-        FROM question_bank
-        WHERE id=?
+        FROM question_bank WHERE id=?
         """,
         (qid,)
     )
-    row = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
+
     if not row:
         await query.answer("❌ Question not found.", show_alert=True)
         return
@@ -2407,22 +2429,20 @@ async def db_search_preview_question(update: Update, context: ContextTypes.DEFAU
     options = options.split("||")
 
     text = f"📝 **{escape_md(question)}**\n\n"
-
     for i, opt in enumerate(options):
         marker = "✅" if i == correct else "◻️"
         text += f"{marker} {escape_md(opt)}\n"
-
     if explanation:
         text += f"\n🧾 _{escape_md(explanation)}_"
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✏️ Edit", callback_data="EDIT_Q"),
+            InlineKeyboardButton("✏️ Edit",   callback_data="EDIT_Q"),
             InlineKeyboardButton("⚙️ Manage", callback_data="MANAGE_Q"),
         ],
         [
-            InlineKeyboardButton("🗑 Delete", callback_data="DELETE_Q_FROM_DB"),
-            InlineKeyboardButton("↩️ Return", callback_data="RETURN_TO_QUESTIONS"),
+            InlineKeyboardButton("🗑 Delete",  callback_data="DELETE_Q_FROM_DB"),
+            InlineKeyboardButton("↩️ Return",  callback_data="RETURN_TO_QUESTIONS"),
         ]
     ])
 
@@ -2474,14 +2494,14 @@ async def show_quizzes_in_folder(message, context, folder):
     context.user_data["folder_screen_message_object"] = message
     context.user_data["last_folder_screen_msg_id"] = message.message_id
 
-    cur.execute("""
-        SELECT quiz_id, title
-        FROM quizzes
-        WHERE owner_id=? AND folder=?
-    """, (active_uid, folder))
-    rows = cur.fetchall()
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT quiz_id, title FROM quizzes WHERE owner_id=? AND folder=?",
+        (active_uid, folder)
+    )
+    rows = _cur.fetchall()
+    _conn.close()
 
-    # ── Natural sort ──────────────────────────────────────
     rows = sorted(rows, key=lambda r: natural_sort_key(r[1]))
 
     page_key = f"folder_page_{folder}"
@@ -2493,15 +2513,12 @@ async def show_quizzes_in_folder(message, context, folder):
     page = max(0, min(page, pages - 1))
 
     start = page * PER_PAGE
-    end   = start + PER_PAGE
-    page_rows = rows[start:end]
+    end = start + PER_PAGE
 
     keyboard = []
 
-    for qid, title in page_rows:
-        keyboard.append([
-            InlineKeyboardButton(f"📘 {title}", callback_data=f"QUIZ_{qid}")
-        ])
+    for qid, title in rows[start:end]:
+        keyboard.append([InlineKeyboardButton(f"📘 {title}", callback_data=f"QUIZ_{qid}")])
 
     if pages > 1:
         nav = []
@@ -2515,13 +2532,11 @@ async def show_quizzes_in_folder(message, context, folder):
     if folder != "Default":
         keyboard.append([
             InlineKeyboardButton("✏️ Rename", callback_data=f"RENAME_FOLDER|{folder}"),
-            InlineKeyboardButton("🗑 Delete",  callback_data=f"DELETE_FOLDER|{folder}"),
-            InlineKeyboardButton("⬅️ Back",   callback_data="BACK_TO_FOLDERS")
-        ])
-    else:
-        keyboard.append([
+            InlineKeyboardButton("🗑 Delete", callback_data=f"DELETE_FOLDER|{folder}"),
             InlineKeyboardButton("⬅️ Back", callback_data="BACK_TO_FOLDERS")
         ])
+    else:
+        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="BACK_TO_FOLDERS")])
 
     title_label = "All Quizzes" if folder == "Default" else folder
     await message.edit_text(
@@ -2625,11 +2640,13 @@ async def quiz_action_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["reset_q_page"] = True
 
     # 🔑 SAVE THE FOLDER THIS QUIZ BELONGS TO
-    cur.execute(
+    _conn_f, _cur_f = get_db()
+    _cur_f.execute(
         "SELECT folder FROM quizzes WHERE quiz_id=? AND owner_id=?",
         (quiz_id, get_active_user_id(context))
     )
-    row = cur.fetchone()
+    row = _cur_f.fetchone()
+    _conn_f.close()
     if row:
         context.user_data["last_quiz_folder"] = row[0]
 
@@ -2652,17 +2669,16 @@ async def show_move_quiz_folders(message, context):
     PER_PAGE = 5
     page = context.user_data.get("move_quiz_folder_page", 0)
 
-    # 🔑 Load folders (Default first, then alphabetical)
-    cur.execute("""
-        SELECT name
-        FROM folders
+    _conn, _cur = get_db()
+    _cur.execute("""
+        SELECT name FROM folders
         WHERE owner_id=?
         ORDER BY
             CASE WHEN name='Default' THEN 0 ELSE 1 END,
             name COLLATE NOCASE
     """, (get_active_user_id(context),))
-
-    folders = [row[0] for row in cur.fetchall()]
+    folders = [row[0] for row in _cur.fetchall()]
+    _conn.close()
 
     total = len(folders)
     pages = (total - 1) // PER_PAGE + 1 if total else 1
@@ -2676,15 +2692,13 @@ async def show_move_quiz_folders(message, context):
     keyboard = []
 
     for folder_name in page_items:
-
-        # 🔢 Count quizzes inside this folder
-        cur.execute("""
-            SELECT COUNT(*)
-            FROM quizzes
+        _conn2, _cur2 = get_db()
+        _cur2.execute("""
+            SELECT COUNT(*) FROM quizzes
             WHERE owner_id=? AND folder=?
         """, (get_active_user_id(context), folder_name))
-
-        count = cur.fetchone()[0]
+        count = _cur2.fetchone()[0]
+        _conn2.close()
 
         keyboard.append([
             InlineKeyboardButton(
@@ -2693,32 +2707,18 @@ async def show_move_quiz_folders(message, context):
             )
         ])
 
-    # 🔄 Pagination
     if pages > 1:
         nav = []
-
         if page > 0:
-            nav.append(
-                InlineKeyboardButton("◀ Prev", callback_data="MOVE_FOLDER_PREV")
-            )
-
-        nav.append(
-            InlineKeyboardButton(f"{page+1}/{pages}", callback_data="MOVE_NOP")
-        )
-
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data="MOVE_FOLDER_PREV"))
+        nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="MOVE_NOP"))
         if page < pages - 1:
-            nav.append(
-                InlineKeyboardButton("Next ▶", callback_data="MOVE_FOLDER_NEXT")
-            )
-
+            nav.append(InlineKeyboardButton("Next ▶", callback_data="MOVE_FOLDER_NEXT"))
         keyboard.append(nav)
 
-    # ➕ Create new folder
     keyboard.append([
         InlineKeyboardButton("➕ Create new Folder", callback_data="MOVE_CREATE_FOLDER")
     ])
-
-    # ⬅️ Back button
     keyboard.append([
         InlineKeyboardButton("⬅️ Back", callback_data="BACK_TO_ACTION")
     ])
@@ -2769,11 +2769,14 @@ async def move_quiz_to_folder(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not quiz_id:
         return
 
-    cur.execute(
-        "UPDATE quizzes SET folder=? WHERE quiz_id=? AND owner_id=?",
-        (folder, quiz_id, get_active_user_id(context))
-    )
-    conn.commit()
+    async with DB_LOCK:
+        _conn_mv, _cur_mv = get_db()
+        _cur_mv.execute(
+            "UPDATE quizzes SET folder=? WHERE quiz_id=? AND owner_id=?",
+            (folder, quiz_id, get_active_user_id(context))
+        )
+        _conn_mv.commit()
+        _conn_mv.close()
 
     await flash_message(context.bot, query.message.chat_id,
         f"✅ Quiz moved to 📁 {folder}"
@@ -2785,41 +2788,38 @@ async def show_quiz_action_menu(message, context):
     quiz_id = context.user_data.get("active_quiz_id")
     if not quiz_id:
         return
-    cur.execute(
+
+    _conn, _cur = get_db()
+    _cur.execute(
         "SELECT title, description, timer, shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
         (quiz_id,)
     )
-    title, desc, timer, sq, sa = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
 
-    cur.execute(
-        "SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?",
-        (quiz_id,)
-    )
-    total_questions = cur.fetchone()[0]
+    if not row:
+        return
+    title, desc, timer, sq, sa = row
+
+    _conn2, _cur2 = get_db()
+    _cur2.execute("SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?", (quiz_id,))
+    total_questions = _cur2.fetchone()[0]
+    _conn2.close()
 
     text = f"📘 **{escape_md(title)}**"
     if desc:
         text += f"\n📝 _{escape_md(desc)}_"
-
-    # ⬜ Blank line
     text += "\n\n"
-
-    # 📊 Questions & Timer (same row)
     text += f"📊 Questions: {total_questions}    ⏱ Timer: {timer}s"
-
-    # 🔀 Shuffle settings (last row)
     text += (
         f"\n🔀 Questions: {'ON' if sq else 'OFF'}"
         f"   🔀 Options: {'ON' if sa else 'OFF'}"
     )
-    
+
     keyboard = [
         [
             InlineKeyboardButton("▶️ Start this Quiz", callback_data="START_THIS"),
-            InlineKeyboardButton(
-                "📤 Post this Quiz",
-                callback_data="POST_QUIZ"
-            ),
+            InlineKeyboardButton("📤 Post this Quiz", callback_data="POST_QUIZ"),
         ],
         [
             InlineKeyboardButton("✏️ Edit this Quiz", callback_data="EDIT_THIS"),
@@ -2857,7 +2857,6 @@ async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    # 🔁 Reset question pagination
     context.user_data["reset_q_page"] = True
 
     quiz_id = context.user_data.get("active_quiz_id")
@@ -2866,17 +2865,23 @@ async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not verify_quiz_owner(quiz_id, context):
         await query.answer("❌ Access denied.", show_alert=True)
         return
-    cur.execute(
+
+    _conn, _cur = get_db()
+    _cur.execute(
         "SELECT title, description, timer, shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
         (quiz_id,)
     )
-    title, desc, timer, sq, sa = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
 
-    cur.execute(
-        "SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?",
-        (quiz_id,)
-    )
-    total_questions = cur.fetchone()[0]
+    if not row:
+        return
+    title, desc, timer, sq, sa = row
+
+    _conn2, _cur2 = get_db()
+    _cur2.execute("SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?", (quiz_id,))
+    total_questions = _cur2.fetchone()[0]
+    _conn2.close()
 
     text = (
         f"📘 **{escape_md(title)}**"
@@ -2888,20 +2893,17 @@ async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     keyboard = [
-        # Row 1
         [
-            InlineKeyboardButton("📝 Edit Title", callback_data="EDIT_TITLE"),
+            InlineKeyboardButton("📝 Edit Title",       callback_data="EDIT_TITLE"),
             InlineKeyboardButton("🧾 Edit Description", callback_data="EDIT_DESC"),
         ],
-        # Row 2
         [
-            InlineKeyboardButton("⏱ Timer Settings", callback_data="EDIT_TIMER"),
+            InlineKeyboardButton("⏱ Timer Settings",   callback_data="EDIT_TIMER"),
             InlineKeyboardButton("🔀 Shuffle Settings", callback_data="EDIT_SHUFFLE"),
         ],
-        # Row 3
         [
-            InlineKeyboardButton("❓ Show Questions", callback_data="EDIT_QUESTIONS"),
-            InlineKeyboardButton("⬅️ Back", callback_data="BACK_TO_ACTION"),
+            InlineKeyboardButton("❓ Show Questions",   callback_data="EDIT_QUESTIONS"),
+            InlineKeyboardButton("⬅️ Back",            callback_data="BACK_TO_ACTION"),
         ],
     ]
 
@@ -2993,11 +2995,13 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         async with DB_LOCK:
-            cur.execute(
+            _conn, _cur = get_db()
+            _cur.execute(
                 "UPDATE quizzes SET timer=? WHERE quiz_id=?",
                 (seconds, quiz_id)
             )
-            conn.commit()
+            _conn.commit()
+            _conn.close()
     except Exception as e:
         print("⚠️ Failed to update timer:", e)
         await query.answer("❌ Failed to update timer.", show_alert=True)
@@ -3050,11 +3054,13 @@ async def edit_shuffle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     quiz_id = context.user_data.get("active_quiz_id")
     if not quiz_id:
         return
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         "SELECT shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
         (quiz_id,)
     )
-    sq, sa = cur.fetchone()
+    sq, sa = _cur.fetchone()
+    _conn.close()
 
     keyboard = [
         [
@@ -3090,18 +3096,20 @@ async def toggle_shuffle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         async with DB_LOCK:
+            _conn, _cur = get_db()
             if query.data == "TOGGLE_Q":
-                cur.execute(
+                _cur.execute(
                     "UPDATE quizzes SET shuffle_q = 1 - shuffle_q WHERE quiz_id=?",
                     (quiz_id,)
                 )
             else:
-                cur.execute(
+                _cur.execute(
                     "UPDATE quizzes SET shuffle_a = 1 - shuffle_a WHERE quiz_id=?",
                     (quiz_id,)
                 )
+            _conn.commit()
+            _conn.close()
 
-            conn.commit()
     except Exception as e:
         print("⚠️ Failed to toggle shuffle:", e)
         await query.answer("❌ Failed to update setting.", show_alert=True)
@@ -3344,16 +3352,15 @@ async def show_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     quiz_id = context.user_data.get("active_quiz_id")
     if not quiz_id:
         return
-    if "q_page" not in context.user_data:
-        context.user_data["q_page"] = 0
-    page = context.user_data["q_page"]
 
-    # 🔁 Always start from page 1 when entering
     if context.user_data.get("reset_q_page", True):
         context.user_data["q_page"] = 0
         context.user_data["reset_q_page"] = False
 
-    cur.execute(
+    page = context.user_data.get("q_page", 0)
+
+    _conn, _cur = get_db()
+    _cur.execute(
         """
         SELECT qb.id, qb.question
         FROM quiz_question_links ql
@@ -3363,31 +3370,22 @@ async def show_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """,
         (quiz_id,)
     )
-    rows = cur.fetchall()
+    rows = _cur.fetchall()
+    _conn.close()
 
     total = len(rows)
     start = page * QUESTIONS_PER_PAGE
     end = start + QUESTIONS_PER_PAGE
-    page_rows = rows[start:end]
 
     keyboard = []
-
-    # ➕ Add new question
     keyboard.append([InlineKeyboardButton("➕ Add from Question Bank", callback_data="QB_PICK_FOLDER")])
 
-    # Question buttons (10 max)
-    selected = context.user_data.get("selected_questions", set())
-
-    for i, (qid, q) in enumerate(page_rows, start=start + 1):
+    for i, (qid, q) in enumerate(rows[start:end], start=start + 1):
         keyboard.append([
-            InlineKeyboardButton(
-                f"{i}. {q[:40]}",
-                callback_data=f"Q_{qid}"
-            )
+            InlineKeyboardButton(f"{i}. {q[:40]}", callback_data=f"Q_{qid}")
         ])
 
-    # Pagination
-    pages = (total - 1) // QUESTIONS_PER_PAGE + 1
+    pages = (total - 1) // QUESTIONS_PER_PAGE + 1 if total else 1
     if pages > 1:
         nav = []
         if page > 0:
@@ -3397,7 +3395,6 @@ async def show_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             nav.append(InlineKeyboardButton("Next ▶️", callback_data="QPAGE_NEXT"))
         keyboard.append(nav)
 
-    # Back button
     keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="EDIT_THIS")])
 
     await query.message.edit_text(
@@ -3425,11 +3422,12 @@ async def show_questions_from_message(message, context):
     quiz_id = context.user_data.get("active_quiz_id")
     if not quiz_id:
         return
+
     page = context.user_data.get("q_page", 0)
     context.user_data["preview_mode"] = "QUIZ"
 
-    # 🔑 Load questions linked to this quiz FROM QUESTION BANK
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         """
         SELECT qb.id, qb.question
         FROM quiz_question_links ql
@@ -3439,53 +3437,34 @@ async def show_questions_from_message(message, context):
         """,
         (quiz_id,)
     )
-    rows = cur.fetchall()
+    rows = _cur.fetchall()
+    _conn.close()
 
     total = len(rows)
     start = page * QUESTIONS_PER_PAGE
     end = start + QUESTIONS_PER_PAGE
-    page_rows = rows[start:end]
 
     keyboard = []
-
-    # ➕ Add from Question Bank
     keyboard.append([
-        InlineKeyboardButton(
-            "➕ Add from Question Bank",
-            callback_data="QB_PICK_FOLDER"
-        )
+        InlineKeyboardButton("➕ Add from Question Bank", callback_data="QB_PICK_FOLDER")
     ])
 
-    # Question list
-    for i, (qid, q) in enumerate(page_rows, start=start + 1):
+    for i, (qid, q) in enumerate(rows[start:end], start=start + 1):
         keyboard.append([
-            InlineKeyboardButton(
-                f"{i}. {q[:40]}",
-                callback_data=f"Q_{qid}"
-            )
+            InlineKeyboardButton(f"{i}. {q[:40]}", callback_data=f"Q_{qid}")
         ])
 
-    # Pagination
     pages = (total - 1) // QUESTIONS_PER_PAGE + 1 if total else 1
     if pages > 1:
         nav = []
         if page > 0:
-            nav.append(
-                InlineKeyboardButton("◀️ Prev", callback_data="QPAGE_PREV")
-            )
-        nav.append(
-            InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QPAGE_NOP")
-        )
+            nav.append(InlineKeyboardButton("◀️ Prev", callback_data="QPAGE_PREV"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QPAGE_NOP"))
         if page < pages - 1:
-            nav.append(
-                InlineKeyboardButton("Next ▶️", callback_data="QPAGE_NEXT")
-            )
+            nav.append(InlineKeyboardButton("Next ▶️", callback_data="QPAGE_NEXT"))
         keyboard.append(nav)
 
-    # Back
-    keyboard.append([
-        InlineKeyboardButton("⬅️ Back", callback_data="EDIT_THIS")
-    ])
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="EDIT_THIS")])
 
     await message.edit_text(
         "❓ Questions in this quiz:",
@@ -3582,33 +3561,34 @@ async def choose_correct_answer(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def save_new_question(message, context):
     q = context.user_data["new_question"]
-
     options_text = "||".join(q["options"])
-
-    # 🔑 Resolve Question Bank folder (Default for now)
     active_uid = get_active_user_id(context)
-    cur.execute(
-        """
-        SELECT id
-        FROM question_bank_folders
-        WHERE owner_id=? AND name='Default'
-        """,
+
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name='Default'",
         (active_uid,)
     )
-    folder_row = cur.fetchone()
+    folder_row = _cur.fetchone()
+    _conn.close()
 
-    # 🛡️ Auto-create Default QB folder if missing (subscriber edge case)
     if not folder_row:
-        cur.execute(
-            "INSERT OR IGNORE INTO question_bank_folders (owner_id, name) VALUES (?, 'Default')",
-            (active_uid,)
-        )
-        conn.commit()
-        cur.execute(
+        async with DB_LOCK:
+            _conn2, _cur2 = get_db()
+            _cur2.execute(
+                "INSERT OR IGNORE INTO question_bank_folders (owner_id, name) VALUES (?, 'Default')",
+                (active_uid,)
+            )
+            _conn2.commit()
+            _conn2.close()
+
+        _conn3, _cur3 = get_db()
+        _cur3.execute(
             "SELECT id FROM question_bank_folders WHERE owner_id=? AND name='Default'",
             (active_uid,)
         )
-        folder_row = cur.fetchone()
+        folder_row = _cur3.fetchone()
+        _conn3.close()
 
     if not folder_row:
         await message.reply_text("❌ Failed to resolve question folder. Please contact the bot admin.")
@@ -3618,47 +3598,34 @@ async def save_new_question(message, context):
 
     folder_id = folder_row[0]
 
-    # ✅ 1. INSERT INTO QUESTION BANK (SOURCE OF TRUTH)
-    cur.execute(
-        """
-        INSERT INTO question_bank (
-            folder_id,
-            question,
-            image_file_id,
-            options,
-            correct,
-            explanation
+    async with DB_LOCK:
+        _conn4, _cur4 = get_db()
+        _cur4.execute(
+            """
+            INSERT INTO question_bank (folder_id, question, image_file_id, options, correct, explanation)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                folder_id,
+                q["text"],
+                q.get("image"),
+                options_text,
+                q["correct"],
+                q.get("explanation")
+            )
         )
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            folder_id,
-            q["text"],
-            q.get("image"),
-            options_text,
-            q["correct"],
-            q.get("explanation")
-        )
-    )
+        _conn4.commit()
+        _conn4.close()
 
-    question_id = cur.lastrowid
-
-    conn.commit()
-
-    # 🔄 Reset creation state
     context.user_data.pop("add_q_state", None)
     context.user_data.pop("new_question", None)
 
-    # ✅ Send confirmation and track it
     confirm = await message.reply_text("✅ Question saved to Question Bank.")
-
     context.user_data.setdefault("question_flow_msgs", []).append(confirm.message_id)
 
     await asyncio.sleep(2)
 
     chat_id = message.chat_id
-
-    # 🧹 BULK DELETE ALL QUESTION FLOW MESSAGES
     delete_tasks = [
         context.bot.delete_message(chat_id, msg_id)
         for msg_id in context.user_data.get("question_flow_msgs", [])
@@ -3666,25 +3633,17 @@ async def save_new_question(message, context):
     if delete_tasks:
         await asyncio.gather(*delete_tasks, return_exceptions=True)
 
-    # 🧹 Clear tracker
     context.user_data.pop("question_flow_msgs", None)
 
-    # =========================
-    # CONTEXT-AWARE RETURN
-    # =========================
-
-    # 🔹 CASE 1: Question was added while editing a quiz
     if context.user_data.get("active_quiz_id"):
         context.user_data["reset_q_page"] = True
         await show_questions_from_message(message, context)
         return
 
-    # 🔹 CASE 2: Question created from HOME (Question Bank mode)
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
     ])
 
-    # ✅ Reset state FIRST — before sending new prompt
     context.user_data["add_q_state"] = "NEW_Q_TEXT"
     context.user_data["new_question"] = {"options": []}
 
@@ -3693,7 +3652,6 @@ async def save_new_question(message, context):
         reply_markup=keyboard
     )
 
-    # ✅ Start a FRESH tracker AFTER bulk delete is done
     context.user_data["question_flow_msgs"] = [msg.message_id]
     context.user_data["create_q_prompt_msg_id"] = msg.message_id
 
@@ -3703,7 +3661,6 @@ async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = query.message.chat_id
 
-    # 🔥 Delete the previous preview message (photo or text) if it exists
     old_preview_id = context.user_data.pop("question_preview_msg_id", None)
     if old_preview_id:
         try:
@@ -3711,7 +3668,6 @@ async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    # The current message (the question list) will be deleted or edited below
     old_list_id = query.message.message_id
 
     qid = int(query.data.replace("Q_", ""))
@@ -3720,15 +3676,14 @@ async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data["active_question_id"] = qid
 
-    cur.execute(
-        """
-        SELECT question, image_file_id, options, correct, explanation
-        FROM question_bank
-        WHERE id=?
-        """,
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT question, image_file_id, options, correct, explanation FROM question_bank WHERE id=?",
         (qid,)
     )
-    row = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
+
     if not row:
         await context.bot.send_message(chat_id, "❌ Question not found.")
         return
@@ -3740,31 +3695,24 @@ async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, opt in enumerate(options):
         marker = "✅" if i == correct else "◻️"
         text += f"{marker} {escape_md(opt)}\n"
-
     if explanation:
         text += f"\n🧾 _{escape_md(explanation)}_"
 
     preview_mode = context.user_data.get("preview_mode", "QUIZ")
-
-    if preview_mode == "DATABASE":
-        delete_callback = "DELETE_Q_FROM_DB"
-    else:
-        delete_callback = "DELETE_Q_FROM_QUIZ"
+    delete_callback = "DELETE_Q_FROM_DB" if preview_mode == "DATABASE" else "DELETE_Q_FROM_QUIZ"
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✏️ Edit", callback_data="EDIT_Q"),
+            InlineKeyboardButton("✏️ Edit",   callback_data="EDIT_Q"),
             InlineKeyboardButton("⚙️ Manage", callback_data="MANAGE_Q"),
         ],
         [
-            InlineKeyboardButton("🗑 Delete", callback_data=delete_callback),
-            InlineKeyboardButton("↩️ Return", callback_data="RETURN_TO_QUESTIONS"),
+            InlineKeyboardButton("🗑 Delete",   callback_data=delete_callback),
+            InlineKeyboardButton("↩️ Return",   callback_data="RETURN_TO_QUESTIONS"),
         ]
     ])
 
-    # ✅ TRUE MEDIA LOGIC
     if image:
-        # Can't edit a text message into a photo — delete and resend
         try:
             await context.bot.delete_message(chat_id, old_list_id)
         except:
@@ -3805,11 +3753,14 @@ async def rebuild_question_preview(chat_id, context):
     if not qid:
         return
 
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         "SELECT question, image_file_id, options, correct, explanation FROM question_bank WHERE id=?",
         (qid,)
     )
-    row = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
+
     if not row:
         return
 
@@ -3824,25 +3775,21 @@ async def rebuild_question_preview(chat_id, context):
         text += f"\n🧾 _{escape_md(explanation)}_"
 
     preview_mode = context.user_data.get("preview_mode", "QUIZ")
-    if preview_mode == "DATABASE":
-        delete_callback = "DELETE_Q_FROM_DB"
-    else:
-        delete_callback = "DELETE_Q_FROM_QUIZ"
+    delete_callback = "DELETE_Q_FROM_DB" if preview_mode == "DATABASE" else "DELETE_Q_FROM_QUIZ"
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✏️ Edit", callback_data="EDIT_Q"),
+            InlineKeyboardButton("✏️ Edit",   callback_data="EDIT_Q"),
             InlineKeyboardButton("⚙️ Manage", callback_data="MANAGE_Q"),
         ],
         [
-            InlineKeyboardButton("🗑 Delete", callback_data=delete_callback),
-            InlineKeyboardButton("↩️ Return", callback_data="RETURN_TO_QUESTIONS"),
+            InlineKeyboardButton("🗑 Delete",  callback_data=delete_callback),
+            InlineKeyboardButton("↩️ Return",  callback_data="RETURN_TO_QUESTIONS"),
         ]
     ])
 
     existing_msg_id = context.user_data.get("question_preview_msg_id")
 
-    # ── Try editing in place first ──────────────────────────
     if existing_msg_id:
         try:
             if image:
@@ -3861,17 +3808,14 @@ async def rebuild_question_preview(chat_id, context):
                     reply_markup=keyboard,
                     parse_mode="Markdown"
                 )
-            return  # ✅ edited in place — done
+            return
         except Exception:
-            # Media type mismatch (text→photo or photo→text), or message gone.
-            # Always attempt deletion before resending.
             try:
                 await context.bot.delete_message(chat_id, existing_msg_id)
             except Exception:
                 pass
             context.user_data.pop("question_preview_msg_id", None)
 
-    # ── Fallback: send new message ──────────────────────────
     if image:
         msg = await context.bot.send_photo(
             chat_id=chat_id,
@@ -3888,7 +3832,6 @@ async def rebuild_question_preview(chat_id, context):
             parse_mode="Markdown"
         )
 
-    # ✅ Always update stored ID to point at the live message
     context.user_data["question_preview_msg_id"] = msg.message_id
 
 async def show_question_preview_by_id(chat_id, context):
@@ -3901,7 +3844,8 @@ async def show_question_preview_by_id(chat_id, context):
     if not qid:
         return
 
-    cur.execute(
+    _conn_p, _cur_p = get_db()
+    _cur_p.execute(
         """
         SELECT question, image_file_id, options, correct, explanation
         FROM question_bank
@@ -3909,8 +3853,8 @@ async def show_question_preview_by_id(chat_id, context):
         """,
         (qid,)
     )
-
-    row = cur.fetchone()
+    row = _cur_p.fetchone()
+    _conn_p.close()
     if not row:
         return
 
@@ -4074,11 +4018,13 @@ async def remove_question_image(update: Update, context: ContextTypes.DEFAULT_TY
     # 🔐 SAFE WRITE SECTION
     try:
         async with DB_LOCK:
-            cur.execute(
+            _conn, _cur = get_db()
+            _cur.execute(
                 "UPDATE question_bank SET image_file_id=NULL WHERE id=?",
                 (qid,)
             )
-            conn.commit()
+            _conn.commit()
+            _conn.close()
     except Exception as e:
         print("⚠️ Failed to remove image:", e)
         await query.answer("❌ Failed to remove image.", show_alert=True)
@@ -4130,11 +4076,13 @@ async def edit_question_options_start(update: Update, context: ContextTypes.DEFA
         return
 
     # 🔑 Load existing options from QUESTION BANK
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         "SELECT options FROM question_bank WHERE id=?",
         (qid,)
     )
-    row = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
     if not row:
         await flash_message(context.bot, query.message.chat_id, "❌ Question not found.")
         return
@@ -4180,11 +4128,11 @@ async def edit_question_correct_start(update: Update, context: ContextTypes.DEFA
         await flash_message(context.bot, query.message.chat_id, "❌ No question selected.")
         return
 
-    cur.execute(
-        "SELECT options, correct FROM question_bank WHERE id=?",
-        (qid,)
-    )
-    row = cur.fetchone()
+    _conn, _cur = get_db()
+    _cur.execute("SELECT options, correct FROM question_bank WHERE id=?", (qid,))
+    row = _cur.fetchone()
+    _conn.close()
+
     if not row:
         await flash_message(context.bot, query.message.chat_id, "❌ Question not found.")
         return
@@ -4193,7 +4141,6 @@ async def edit_question_correct_start(update: Update, context: ContextTypes.DEFA
     opts = options_text.split("||")
     labels = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
 
-    # ✅ Show current correct answer with green check pre-highlighted
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(
             f"{'✅ ' if i == current_correct else ''}{labels[i]} {opts[i]}",
@@ -4208,7 +4155,6 @@ async def edit_question_correct_start(update: Update, context: ContextTypes.DEFA
         parse_mode="Markdown"
     )
 
-    # Track for cleanup
     context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
 
 async def edit_question_correct_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4222,27 +4168,24 @@ async def edit_question_correct_apply(update: Update, context: ContextTypes.DEFA
 
     correct_index = int(query.data.replace("EDIT_CORRECT_", ""))
 
-    # 🔐 SAFE WRITE SECTION
-    try:
-        async with DB_LOCK:
-            cur.execute(
-                "UPDATE question_bank SET correct=? WHERE id=?",
-                (correct_index, qid)
-            )
-            conn.commit()
-    except Exception as e:
-        print("⚠️ Failed to update correct answer:", e)
-        await query.answer("❌ Failed to update.", show_alert=True)
-        return
+    async with DB_LOCK:
+        _conn, _cur = get_db()
+        _cur.execute(
+            "UPDATE question_bank SET correct=? WHERE id=?",
+            (correct_index, qid)
+        )
+        _conn.commit()
+        _conn.close()
 
     chat_id = query.message.chat_id
 
-    # ✅ Flash green check on selected option before deleting
-    opts_text_row = cur.execute(
-        "SELECT options FROM question_bank WHERE id=?", (qid,)
-    ).fetchone()
-    if opts_text_row:
-        opts = opts_text_row[0].split("||")
+    _conn2, _cur2 = get_db()
+    _cur2.execute("SELECT options FROM question_bank WHERE id=?", (qid,))
+    opts_row = _cur2.fetchone()
+    _conn2.close()
+
+    if opts_row:
+        opts = opts_row[0].split("||")
         labels = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
         flash_keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(
@@ -4257,27 +4200,18 @@ async def edit_question_correct_apply(update: Update, context: ContextTypes.DEFA
             pass
         await asyncio.sleep(1)
 
-    # 🧹 Delete the "Choose correct answer" message
     try:
         await query.message.delete()
     except:
         pass
 
-    # ✅ Show temporary confirmation
-    confirm_msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text="✅ Correct answer updated."
-    )
-
+    confirm_msg = await context.bot.send_message(chat_id=chat_id, text="✅ Correct answer updated.")
     await asyncio.sleep(2)
-
-    # 🧹 Delete confirmation message
     try:
         await confirm_msg.delete()
     except:
         pass
 
-    # 🔄 Rebuild updated preview cleanly
     await rebuild_question_preview(chat_id, context)
 
 async def edit_question_explanation_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4289,30 +4223,26 @@ async def edit_question_explanation_start(update: Update, context: ContextTypes.
         await flash_message(context.bot, query.message.chat_id, "❌ No question selected.")
         return
 
-    # Load current explanation
-    cur.execute(
-        "SELECT explanation FROM question_bank WHERE id=?",
-        (qid,)
-    )
-    row = cur.fetchone()
-    current = row[0] if row and row[0] else "— none —"
+    _conn, _cur = get_db()
+    _cur.execute("SELECT explanation FROM question_bank WHERE id=?", (qid,))
+    row = _cur.fetchone()
+    _conn.close()
 
+    current = row[0] if row and row[0] else "— none —"
     context.user_data["edit_q_field"] = "EXPLANATION"
 
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🗑 Remove Explanation", callback_data="EDIT_Q_EXPL_REMOVE"),
-            InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_EDIT_Q_EXPL"),
+            InlineKeyboardButton("❌ Cancel",             callback_data="CANCEL_EDIT_Q_EXPL"),
         ]
     ])
 
     msg = await query.message.reply_text(
-        f"🧾 Current explanation:\n\n{current}\n\n"
-        "✏️ Send new explanation text:",
+        f"🧾 Current explanation:\n\n{current}\n\n✏️ Send new explanation text:",
         reply_markup=keyboard
     )
 
-    # Track prompt message for cleanup
     context.user_data["edit_expl_prompt_id"] = msg.message_id
 
 async def edit_question_explanation_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4326,11 +4256,14 @@ async def edit_question_explanation_remove(update: Update, context: ContextTypes
     chat_id = query.message.chat_id
 
     # Remove explanation from DB
-    cur.execute(
-        "UPDATE question_bank SET explanation=NULL WHERE id=?",
-        (qid,)
-    )
-    conn.commit()
+    async with DB_LOCK:
+        _conn, _cur = get_db()
+        _cur.execute(
+            "UPDATE question_bank SET explanation=NULL WHERE id=?",
+            (qid,)
+        )
+        _conn.commit()
+        _conn.close()
 
     # Delete prompt message
     prompt_id = context.user_data.pop("edit_expl_prompt_id", None)
@@ -4503,24 +4436,17 @@ async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await flash_message(context.bot, query.message.chat_id, "❌ Quiz not found.")
         return
 
-    # Load quiz settings
-    cur.execute(
-        "SELECT shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
-        (quiz_id,)
-    )
-    row = cur.fetchone()
+    _conn, _cur = get_db()
+    _cur.execute("SELECT shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?", (quiz_id,))
+    row = _cur.fetchone()
+    _conn.close()
+
     shuffle_q, shuffle_a = row if row else (0, 0)
 
-    # Load questions
-    cur.execute(
+    _conn2, _cur2 = get_db()
+    _cur2.execute(
         """
-        SELECT
-            qb.id,
-            qb.question,
-            qb.image_file_id,
-            qb.options,
-            qb.correct,
-            qb.explanation
+        SELECT qb.id, qb.question, qb.image_file_id, qb.options, qb.correct, qb.explanation
         FROM quiz_question_links ql
         JOIN question_bank qb ON qb.id = ql.question_id
         WHERE ql.quiz_id=?
@@ -4528,7 +4454,8 @@ async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """,
         (quiz_id,)
     )
-    rows = cur.fetchall()
+    rows = _cur2.fetchall()
+    _conn2.close()
 
     if not rows:
         await flash_message(context.bot, query.message.chat_id, "❌ This quiz has no questions.")
@@ -4538,12 +4465,10 @@ async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for qid, text, image, options, correct, explanation in rows:
         opts = options.split("||")
         if shuffle_a:
-            import random
             indexed = list(enumerate(opts))
             random.shuffle(indexed)
             opts = [o for _, o in indexed]
             correct = [i for i, (old_i, _) in enumerate(indexed) if old_i == correct][0]
-
         questions.append({
             "id": qid,
             "text": text,
@@ -4554,25 +4479,18 @@ async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
 
     if shuffle_q:
-        import random
         random.shuffle(questions)
 
-    # 🔑 CREATE PLAY SESSION
     context.user_data["play"] = {
         "questions": questions,
         "index": 0,
         "score": 0,
         "quiz_id": quiz_id,
         "user_name": format_user_name(query.from_user),
-
         "locked": False,
         "timer_task": None,
         "timer_message_ids": [],
-
-        # 🧠 NEW: store quiz question message IDs for cleanup
         "question_message_ids": [],
-
-        # 🔐 HARD ASYNC LOCK
         "context_lock": asyncio.Lock(),
     }
 
@@ -4584,7 +4502,6 @@ async def send_next_question(user_id, context):
     if not play:
         return
 
-    # ⛔ Stop previous timer safely (from outside the task)
     old_task = play.get("timer_task")
     if old_task:
         old_task.cancel()
@@ -4592,9 +4509,12 @@ async def send_next_question(user_id, context):
 
     quiz_id = play["quiz_id"]
 
-    # ⏱ Load timer value
-    cur.execute("SELECT timer FROM quizzes WHERE quiz_id=?", (quiz_id,))
-    timer_seconds = cur.fetchone()[0]
+    _conn, _cur = get_db()
+    _cur.execute("SELECT timer FROM quizzes WHERE quiz_id=?", (quiz_id,))
+    row = _cur.fetchone()
+    _conn.close()
+
+    timer_seconds = row[0] if row else 15
 
     index = play["index"]
     total = len(play["questions"])
@@ -4612,14 +4532,12 @@ async def send_next_question(user_id, context):
         f"{options_text}"
     )
 
-    # 🔘 Inline buttons
     keyboard = [[
         InlineKeyboardButton(labels[i], callback_data=f"PLAY_ANSWER_{i}")
         for i in range(len(q["options"]))
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # 📨 Send question (image-safe)
     if q.get("image"):
         try:
             msg = await context.bot.send_photo(
@@ -4641,16 +4559,11 @@ async def send_next_question(user_id, context):
             reply_markup=reply_markup
         )
 
-    # 🔑 AUTHORITATIVE question message (used by timer + answer)
     play["current_question_message_id"] = msg.message_id
-
-    # 🧹 Keep history for cleanup
     play.setdefault("question_message_ids", [])
     play["question_message_ids"].append(msg.message_id)
-
     play["locked"] = False
 
-    # 🕒 Send timer message
     timer_msg = await context.bot.send_message(
         chat_id=user_id,
         text=f"⏱ Time left: {timer_seconds}s"
@@ -4658,7 +4571,6 @@ async def send_next_question(user_id, context):
     play.setdefault("timer_message_ids", [])
     play["timer_message_ids"].append(timer_msg.message_id)
 
-    # ⏳ Start timer task
     play["timer_task"] = asyncio.create_task(
         countdown_timer(user_id, context, timer_seconds, play)
     )
@@ -4813,15 +4725,16 @@ async def countdown_timer(user_id, context, seconds, play):
 ####################################################################################################################################################################################################################################
 
 async def show_leaderboard(chat_id, quiz_id, bot):
-    cur.execute("""
+    _conn, _cur = get_db()
+    _cur.execute("""
         SELECT username, score
         FROM leaderboard
         WHERE quiz_id=? AND chat_id=?
         ORDER BY score DESC
         LIMIT 10
     """, (quiz_id, chat_id))
-
-    rows = cur.fetchall()
+    rows = _cur.fetchall()
+    _conn.close()
 
     if not rows:
         text = "📊 **Quiz Leaderboard**\n\n_No participants yet._"
@@ -4835,7 +4748,6 @@ async def show_leaderboard(chat_id, quiz_id, bot):
         text=text,
         parse_mode="Markdown"
     )
-
 
 def build_group_post_keyboard(quiz_id: str, token: str, leaderboard_key: str, pages: int = 0, page: int = 0) -> InlineKeyboardMarkup:
     buttons = []
@@ -4860,61 +4772,38 @@ def build_group_post_keyboard(quiz_id: str, token: str, leaderboard_key: str, pa
 
 
 async def send_quiz_to_group(chat_id, quiz_id, context, token):
-    # =========================
-    # BUILD LEADERBOARD KEY
-    # =========================
     leaderboard_key = make_leaderboard_key(quiz_id, token)
 
-    # =========================
-    # LOAD QUIZ INFO
-    # =========================
-    cur.execute("""
-        SELECT title, description, timer, shuffle_q, shuffle_a
-        FROM quizzes
-        WHERE quiz_id=?
-    """, (quiz_id,))
-    title, desc, timer, sq, sa = cur.fetchone()
-
-    cur.execute(
-        "SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?",
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT title, description, timer, shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
         (quiz_id,)
     )
-    total_questions = cur.fetchone()[0]
+    row = _cur.fetchone()
+    _conn.close()
 
-    # =========================
-    # BUILD MESSAGE TEXT
-    # =========================
+    if not row:
+        return
+    title, desc, timer, sq, sa = row
+
+    _conn2, _cur2 = get_db()
+    _cur2.execute("SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?", (quiz_id,))
+    total_questions = _cur2.fetchone()[0]
+    _conn2.close()
+
     text = f"📘 *{title}*\n"
-
     if desc:
         text += f"📝 _{desc}_\n"
-
-    # Spacer line (visual breathing room)
     text += "\n"
-
-    # Quiz stats
     text += f"🧠 *{total_questions} Questions* • ⏱ *{timer}s*\n"
-
-    # Shuffle settings
     text += (
         f"🔀 Questions: {'ON' if sq else 'OFF'} • "
         f"Answers: {'ON' if sa else 'OFF'}\n\n"
     )
+    text += "🏆 *Leaderboard*\n— No attempts yet —"
 
-    # Leaderboard header
-    text += (
-        "🏆 *Leaderboard*\n"
-        "— No attempts yet —"
-    )
-
-    # =========================
-    # START BUTTON (TOKEN-BOUND)
-    # =========================
     keyboard = build_group_post_keyboard(quiz_id, token, leaderboard_key)
 
-    # =========================
-    # SEND MESSAGE TO GROUP
-    # =========================
     msg = await context.bot.send_message(
         chat_id=chat_id,
         text=text,
@@ -4922,9 +4811,6 @@ async def send_quiz_to_group(chat_id, quiz_id, context, token):
         parse_mode="Markdown"
     )
 
-    # =========================
-    # REGISTER LEADERBOARD STATE (SINGLE SOURCE OF TRUTH)
-    # =========================
     GROUP_LB_MESSAGES[leaderboard_key] = {
         "quiz_id": quiz_id,
         "token": token,
@@ -4933,104 +4819,79 @@ async def send_quiz_to_group(chat_id, quiz_id, context, token):
         "page": 0,
     }
 
-    # 💾 Persist leaderboard message info to DB so it survives restarts
     try:
         async with DB_LOCK:
-            cur.execute("""
+            _conn3, _cur3 = get_db()
+            _cur3.execute("""
                 INSERT OR REPLACE INTO group_lb_messages
                 (leaderboard_key, quiz_id, token, chat_id, message_id, page)
                 VALUES (?, ?, ?, ?, ?, 0)
             """, (leaderboard_key, quiz_id, token, chat_id, msg.message_id))
-            conn.commit()
+            _conn3.commit()
+            _conn3.close()
     except Exception as e:
         print("⚠️ Failed to persist lb message info:", e)
 
     GROUP_LEADERBOARDS[leaderboard_key] = {}
 
 def build_group_quiz_text(leaderboard_key, page=0):
-    # 🔑 Split leaderboard key
     try:
         quiz_id, _ = leaderboard_key.split(":", 1)
     except ValueError:
         return "❌ Invalid leaderboard.", 0
-    # Load quiz info
-    cur.execute(
+
+    _conn, _cur = get_db()
+    _cur.execute(
         "SELECT title, description, timer, shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
         (quiz_id,)
     )
-    title, desc, timer, sq, sa = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
 
-    cur.execute(
-        "SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?",
-        (quiz_id,)
-    )
-    total_questions = cur.fetchone()[0]
+    if not row:
+        return "❌ Quiz not found.", 0
+    title, desc, timer, sq, sa = row
 
-    # =========================
-    # BUILD QUIZ PREVIEW (ADMIN-LIKE FORMAT)
-    # =========================
+    _conn2, _cur2 = get_db()
+    _cur2.execute("SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?", (quiz_id,))
+    total_questions = _cur2.fetchone()[0]
+    _conn2.close()
+
     text = f"📘 *{title}*\n"
-
     if desc:
         text += f"📝 _{desc}_\n"
-
-    # Spacer
     text += "\n"
-
-    # Quiz stats
     text += f"🧠 *{total_questions} Questions* • ⏱ *{timer}s*\n"
-
-    # Shuffle settings
     text += (
         f"🔀 Questions: {'ON' if sq else 'OFF'} • "
         f"Answers: {'ON' if sa else 'OFF'}\n\n"
     )
-
-    # =========================
-    # LEADERBOARD SECTION
-    # =========================
     text += "🏆 *Leaderboard*\n"
 
-    # 🔄 HYBRID MODE: Use memory if available, otherwise load from DB
     if leaderboard_key in GROUP_LEADERBOARDS and GROUP_LEADERBOARDS[leaderboard_key]:
         leaderboard = [
-            {
-                "user_id": uid,
-                "name": data["name"],
-                "score": data["score"]
-            }
+            {"user_id": uid, "name": data["name"], "score": data["score"]}
             for uid, data in GROUP_LEADERBOARDS[leaderboard_key].items()
         ]
     else:
-        # 🔁 Load from DB
-        cur.execute("""
-            SELECT user_id, name, score
-            FROM group_leaderboard
-            WHERE leaderboard_key=?
-        """, (leaderboard_key,))
-        rows = cur.fetchall()
+        _conn3, _cur3 = get_db()
+        _cur3.execute(
+            "SELECT user_id, name, score FROM group_leaderboard WHERE leaderboard_key=?",
+            (leaderboard_key,)
+        )
+        rows = _cur3.fetchall()
+        _conn3.close()
 
         leaderboard = []
-
-        # 🔄 Rebuild memory from DB
         GROUP_LEADERBOARDS.setdefault(leaderboard_key, {})
-
         for user_id, name, score in rows:
-            GROUP_LEADERBOARDS[leaderboard_key][user_id] = {
-                "name": name,
-                "score": score
-            }
-            leaderboard.append({
-                "user_id": user_id,
-                "name": name,
-                "score": score
-            })
+            GROUP_LEADERBOARDS[leaderboard_key][user_id] = {"name": name, "score": score}
+            leaderboard.append({"user_id": user_id, "name": name, "score": score})
 
     if not leaderboard:
         text += "_No attempts yet_\n"
         return text, 0
 
-    # Sort by score (highest first)
     leaderboard.sort(key=lambda x: x["score"], reverse=True)
 
     per_page = 5
@@ -5040,17 +4901,11 @@ def build_group_quiz_text(leaderboard_key, page=0):
     start = page * per_page
     end = start + per_page
 
-    medals = {
-        1: "🥇",
-        2: "🥈",
-        3: "🥉"
-    }
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
 
     for i, user in enumerate(leaderboard[start:end], start=start + 1):
         prefix = medals.get(i, f"{i}.")
-        label = f"{prefix} {user['name']} — {user['score']}"
-
-        text += label + "\n"
+        text += f"{prefix} {user['name']} — {user['score']}\n"
 
     return text, pages
 
@@ -5102,11 +4957,13 @@ async def update_group_leaderboard(leaderboard_key, context):
             # 🔐 Remove database records safely
             try:
                 async with DB_LOCK:
-                    cur.execute("DELETE FROM group_leaderboard WHERE leaderboard_key=?", (leaderboard_key,))
+                    _conn, _cur = get_db()
+                    _cur.execute("DELETE FROM group_leaderboard WHERE leaderboard_key=?", (leaderboard_key,))
                     quiz_id, token = leaderboard_key.split(":", 1)
-                    cur.execute("DELETE FROM quiz_post_tokens WHERE token=? AND quiz_id=?", (token, quiz_id))
-                    cur.execute("DELETE FROM group_lb_messages WHERE leaderboard_key=?", (leaderboard_key,))
-                    conn.commit()
+                    _cur.execute("DELETE FROM quiz_post_tokens WHERE token=? AND quiz_id=?", (token, quiz_id))
+                    _cur.execute("DELETE FROM group_lb_messages WHERE leaderboard_key=?", (leaderboard_key,))
+                    _conn.commit()
+                    _conn.close()
             except Exception as db_error:
                 print("⚠️ Failed to clean DB leaderboard:", db_error)
 
@@ -5115,19 +4972,18 @@ async def update_group_leaderboard(leaderboard_key, context):
             print("⚠️ Failed to edit leaderboard message:", e)
 
 async def refresh_all_group_posts_for_quiz(quiz_id: str, context):
-    cur.execute("""
-        SELECT leaderboard_key, chat_id, message_id, page
-        FROM group_lb_messages
-        WHERE quiz_id = ?
-    """, (quiz_id,))
-
-    posts = cur.fetchall()
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT leaderboard_key, chat_id, message_id, page FROM group_lb_messages WHERE quiz_id=?",
+        (quiz_id,)
+    )
+    posts = _cur.fetchall()
+    _conn.close()
 
     if not posts:
         return
 
     for leaderboard_key, chat_id, message_id, page in posts:
-
         text, pages = build_group_quiz_text(leaderboard_key, page)
 
         try:
@@ -5151,12 +5007,15 @@ async def refresh_all_group_posts_for_quiz(quiz_id: str, context):
                 pass
             elif "message to edit not found" in error_text:
                 print(f"🧹 Cleaning deleted post: {leaderboard_key}")
-                cur.execute(
-                    "DELETE FROM group_lb_messages WHERE leaderboard_key=?",
-                    (leaderboard_key,)
-                )
+                async with DB_LOCK:
+                    _conn2, _cur2 = get_db()
+                    _cur2.execute(
+                        "DELETE FROM group_lb_messages WHERE leaderboard_key=?",
+                        (leaderboard_key,)
+                    )
+                    _conn2.commit()
+                    _conn2.close()
                 GROUP_LB_MESSAGES.pop(leaderboard_key, None)
-                conn.commit()
             else:
                 print(f"⚠️ Failed to refresh group post {leaderboard_key}:", e)
 
@@ -5176,14 +5035,17 @@ async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # 💾 Save token safely (WRITE LOCK)
     try:
         async with DB_LOCK:
-            cur.execute(
+            _conn, _cur = get_db()
+            _cur.execute(
                 """
                 INSERT INTO quiz_post_tokens (token, quiz_id, owner_id, created_at)
                 VALUES (?, ?, ?, ?)
                 """,
                 (token, quiz_id, get_active_user_id(context), timestamp)
             )
-            conn.commit()
+            _conn.commit()
+            _conn.close()
+
     except Exception as e:
         print("⚠️ Failed to save post token:", e)
         await flash_message(context.bot, query.message.chat_id, "❌ Failed to generate post link.")
@@ -5221,23 +5083,14 @@ async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     payload = args[0]
 
-    # =========================
-    # PARSE: /post <quiz_id>_<token>
-    # =========================
     try:
         quiz_id, token = payload.rsplit("_", 1)
     except ValueError:
         await update.message.reply_text("❌ Invalid post command format.")
         return
 
-    # =========================
-    # OWNER-ONLY PROTECTION
-    # =========================
     if not is_authorized(user_id):
-        warn_msg = await update.message.reply_text(
-            "❌ Only the Bot Admin can post quizzes."
-        )
-
+        warn_msg = await update.message.reply_text("❌ Only the Bot Admin can post quizzes.")
         async def delete_later():
             await asyncio.sleep(3)
             try:
@@ -5248,28 +5101,19 @@ async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.delete()
             except:
                 pass
-
         asyncio.create_task(delete_later())
         return
 
-    # =========================
-    # TOKEN VALIDATION
-    # =========================
-    cur.execute(
-        """
-        SELECT token
-        FROM quiz_post_tokens
-        WHERE token=? AND quiz_id=?
-        """,
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT token FROM quiz_post_tokens WHERE token=? AND quiz_id=?",
         (token, quiz_id)
     )
-    row = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
 
     if not row:
-        warn_msg = await update.message.reply_text(
-            "❌ This quiz post command is invalid or expired."
-        )
-
+        warn_msg = await update.message.reply_text("❌ This quiz post command is invalid or expired.")
         async def delete_later():
             await asyncio.sleep(3)
             try:
@@ -5280,20 +5124,19 @@ async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.delete()
             except:
                 pass
-
         asyncio.create_task(delete_later())
         return
 
-    # ── OWNERSHIP CHECK: only the quiz creator can post this quiz ──
-    cur.execute(
+    _conn2, _cur2 = get_db()
+    _cur2.execute(
         "SELECT owner_id FROM quiz_post_tokens WHERE token=? AND quiz_id=?",
         (token, quiz_id)
     )
-    owner_row = cur.fetchone()
+    owner_row = _cur2.fetchone()
+    _conn2.close()
+
     if not owner_row or owner_row[0] != user_id:
-        warn_msg = await update.message.reply_text(
-            "❌ You can only post quizzes that you created."
-        )
+        warn_msg = await update.message.reply_text("❌ You can only post quizzes that you created.")
         async def delete_later():
             await asyncio.sleep(3)
             try:
@@ -5307,17 +5150,8 @@ async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(delete_later())
         return
 
-    # =========================
-    # POST QUIZ TO GROUP
-    # =========================
     await send_quiz_to_group(chat.id, quiz_id, context, token)
 
-    # =========================
-    # MARK TOKEN AS USED FOR POSTING (OPTIONAL)
-    # =========================
-    # ⚠️ DO NOT DELETE TOKEN — it is still needed for PLAY links
-    # If you want to prevent re-posting, add a `used_for_post` column later
-    # 🧹 Clean up the /post command message in group
     try:
         await update.message.delete()
     except:
@@ -5404,37 +5238,33 @@ async def copy_question_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["state"] = "COPY_QUESTION"
     page = context.user_data.get("copy_q_page", 0)
 
-    # 🔑 Load all quizzes owned by user
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         "SELECT quiz_id, title FROM quizzes WHERE owner_id=? ORDER BY title",
         (get_active_user_id(context),)
     )
-    quizzes = cur.fetchall()
+    quizzes = _cur.fetchall()
+    _conn.close()
 
-    # 🔑 Filter quizzes where question is NOT already linked
     available = []
     for quiz_id, title in quizzes:
         if quiz_id == source_quiz_id:
             continue
-
-        cur.execute(
-            """
-            SELECT 1
-            FROM quiz_question_links
-            WHERE quiz_id=? AND question_id=?
-            """,
+        _conn2, _cur2 = get_db()
+        _cur2.execute(
+            "SELECT 1 FROM quiz_question_links WHERE quiz_id=? AND question_id=?",
             (quiz_id, qid)
         )
-        if cur.fetchone():
+        already = _cur2.fetchone()
+        _conn2.close()
+        if already:
             continue
-
         available.append((quiz_id, title))
 
     if not available:
         await flash_message(context.bot, query.message.chat_id, "ℹ️ This question is already linked to all quizzes.")
         return
 
-    # Pagination
     PER_PAGE = 5
     pages = (len(available) - 1) // PER_PAGE + 1
     page = max(0, min(page, pages - 1))
@@ -5446,10 +5276,7 @@ async def copy_question_start(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     for quiz_id, title in available[start:end]:
         keyboard.append([
-            InlineKeyboardButton(
-                f"📘 {title}",
-                callback_data=f"COPY_TO|{quiz_id}"
-            )
+            InlineKeyboardButton(f"📘 {title}", callback_data=f"COPY_TO|{quiz_id}")
         ])
 
     if pages > 1:
@@ -5461,9 +5288,7 @@ async def copy_question_start(update: Update, context: ContextTypes.DEFAULT_TYPE
             nav.append(InlineKeyboardButton("Next ▶", callback_data="COPY_Q_NEXT"))
         keyboard.append(nav)
 
-    keyboard.append([
-        InlineKeyboardButton("⬅️ Cancel", callback_data="EDIT_QUESTIONS")
-    ])
+    keyboard.append([InlineKeyboardButton("⬅️ Cancel", callback_data="EDIT_QUESTIONS")])
 
     await query.message.edit_text(
         "📋 *Add question to another quiz*\n\nSelect target quiz:",
@@ -5483,31 +5308,33 @@ async def copy_question_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # 🔒 Prevent duplicate links
-    cur.execute(
-        """
-        SELECT 1
-        FROM quiz_question_links
-        WHERE quiz_id=? AND question_id=?
-        """,
+    _conn_chk, _cur_chk = get_db()
+    _cur_chk.execute(
+        "SELECT 1 FROM quiz_question_links WHERE quiz_id=? AND question_id=?",
         (target_quiz_id, qid)
     )
-    if cur.fetchone():
+    already = _cur_chk.fetchone()
+    _conn_chk.close()
+    if already:
         await flash_message(context.bot, query.message.chat_id, "ℹ️ Question already exists in this quiz.")
         return
 
     # 🔑 Insert link ONLY (no duplication)
-    cur.execute(
-        """
-        INSERT INTO quiz_question_links (quiz_id, question_id, position)
-        VALUES (?, ?, (
-            SELECT COALESCE(MAX(position), 0) + 1
-            FROM quiz_question_links
-            WHERE quiz_id=?
-        ))
-        """,
-        (target_quiz_id, qid, target_quiz_id)
-    )
-    conn.commit()
+    async with DB_LOCK:
+        _conn_ins, _cur_ins = get_db()
+        _cur_ins.execute(
+            """
+            INSERT INTO quiz_question_links (quiz_id, question_id, position)
+            VALUES (?, ?, (
+                SELECT COALESCE(MAX(position), 0) + 1
+                FROM quiz_question_links
+                WHERE quiz_id=?
+            ))
+            """,
+            (target_quiz_id, qid, target_quiz_id)
+        )
+        _conn_ins.commit()
+        _conn_ins.close()
 
     context.user_data.pop("state", None)
 
@@ -5551,14 +5378,17 @@ async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             async with DB_LOCK:
-                cur.execute(
+                _conn, _cur = get_db()
+                _cur.execute(
                     """
                     DELETE FROM quiz_question_links
                     WHERE quiz_id=? AND question_id=?
                     """,
                     (quiz_id, qid)
                 )
-                conn.commit()
+                _conn.commit()
+                _conn.close()
+
         except Exception as e:
             print("⚠️ Failed to unlink question:", e)
             await flash_message(context.bot, query.message.chat_id, "❌ Failed to remove.")
@@ -5607,15 +5437,18 @@ async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             async with DB_LOCK:
-                cur.execute(
+                _conn, _cur = get_db()
+                _cur.execute(
                     "DELETE FROM quiz_question_links WHERE quiz_id=?",
                     (quiz_id,)
                 )
-                cur.execute(
+                _cur.execute(
                     "DELETE FROM quizzes WHERE quiz_id=?",
                     (quiz_id,)
                 )
-                conn.commit()
+                _conn.commit()
+                _conn.close()
+
         except Exception as e:
             print("⚠️ Failed to delete quiz:", e)
             await flash_message(context.bot, query.message.chat_id, "❌ Quiz delete failed.")
@@ -5661,30 +5494,32 @@ async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             async with DB_LOCK:
+                _conn, _cur = get_db()
 
-                cur.execute(
+                _cur.execute(
                     "SELECT quiz_id FROM quizzes WHERE folder=?",
                     (folder,)
                 )
-                quiz_ids = [row[0] for row in cur.fetchall()]
+                quiz_ids = [row[0] for row in _cur.fetchall()]
 
                 for qid in quiz_ids:
-                    cur.execute(
+                    _cur.execute(
                         "DELETE FROM quiz_question_links WHERE quiz_id=?",
                         (qid,)
                     )
 
-                cur.execute(
+                _cur.execute(
                     "DELETE FROM quizzes WHERE folder=?",
                     (folder,)
                 )
 
-                cur.execute(
+                _cur.execute(
                     "DELETE FROM folders WHERE name=?",
                     (folder,)
                 )
 
-                conn.commit()
+                _conn.commit()
+                _conn.close()
 
         except Exception as e:
             print("⚠️ Failed to delete folder:", e)
@@ -5837,16 +5672,14 @@ async def finish_quiz(user_id, context):
     if not play:
         return
 
-    # 🔒 Ensure finish logic runs ONCE
     if play.get("finish_sent"):
         return
     play["finish_sent"] = True
 
     quiz_id = play["quiz_id"]
-    score = play["score"]
-    total = len(play["questions"])
+    score   = play["score"]
+    total   = len(play["questions"])
 
-    # ⛔ Stop timers and lock state FIRST
     play["locked"] = True
 
     task = play.get("timer_task")
@@ -5855,9 +5688,6 @@ async def finish_quiz(user_id, context):
         task.cancel()
     play["timer_task"] = None
 
-    # =========================
-    # 🏆 GROUP LEADERBOARD (HYBRID + SAFE WRITE)
-    # =========================
     leaderboard_key = context.user_data.get("leaderboard_key")
 
     if leaderboard_key:
@@ -5866,74 +5696,57 @@ async def finish_quiz(user_id, context):
         if lb_info:
             GROUP_LEADERBOARDS.setdefault(leaderboard_key, {})
 
-            # ✅ FIRST ATTEMPT ONLY
             if user_id not in GROUP_LEADERBOARDS[leaderboard_key]:
 
-                # 1️⃣ Save to MEMORY
                 GROUP_LEADERBOARDS[leaderboard_key][user_id] = {
-                    "name": play["user_name"],
+                    "name":  play["user_name"],
                     "score": score,
                 }
 
-                # 2️⃣ Save to DATABASE safely
                 try:
                     async with DB_LOCK:
-                        cur.execute("""
+                        _conn, _cur = get_db()
+                        _cur.execute("""
                             INSERT OR IGNORE INTO group_leaderboard
                             (leaderboard_key, user_id, name, score)
                             VALUES (?, ?, ?, ?)
-                        """, (
-                            leaderboard_key,
-                            user_id,
-                            play["user_name"],
-                            score
-                        ))
-                        conn.commit()
+                        """, (leaderboard_key, user_id, play["user_name"], score))
+                        _conn.commit()
+                        _conn.close()
                 except Exception as e:
                     print("⚠️ Failed to save leaderboard:", e)
 
-                # 3️⃣ Update group message
                 try:
                     await update_group_leaderboard(leaderboard_key, context)
                 except Exception as e:
                     print("⚠️ Leaderboard update failed:", e)
 
-    # =========================
-    # 🧹 INSTANT BULK DELETE
-    # =========================
-
     delete_tasks = []
-
     for msg_id in play.get("question_message_ids", []):
         delete_tasks.append(
             context.bot.delete_message(chat_id=user_id, message_id=msg_id)
         )
-
     for timer_msg_id in play.get("timer_message_ids", []):
         delete_tasks.append(
             context.bot.delete_message(chat_id=user_id, message_id=timer_msg_id)
         )
-
     if delete_tasks:
         await asyncio.gather(*delete_tasks, return_exceptions=True)
 
-    # =========================
-    # 📘 LOAD QUIZ META (READ ONLY – NO LOCK NEEDED)
-    # =========================
-    cur.execute(
+    _conn2, _cur2 = get_db()
+    _cur2.execute(
         "SELECT title, timer FROM quizzes WHERE quiz_id=?",
         (quiz_id,)
     )
-    row = cur.fetchone()
+    row = _cur2.fetchone()
+    _conn2.close()
+
     title, timer = row if row else ("Quiz", 0)
 
-    # =========================
-    # 🏁 FINAL SCORE MESSAGE
-    # =========================
     buttons = [
         [
-            InlineKeyboardButton("🔁 Start Again", callback_data="PLAY_START"),
-            InlineKeyboardButton("🗑 Delete", callback_data="DELETE_FINISH_MSG"),
+            InlineKeyboardButton("🔁 Start Again",  callback_data="PLAY_START"),
+            InlineKeyboardButton("🗑 Delete",        callback_data="DELETE_FINISH_MSG"),
         ]
     ]
 
@@ -6040,14 +5853,39 @@ async def qb_question_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await qb_open_folder(update, context)
 
 def ensure_default_qb_folder():
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         """
         INSERT OR IGNORE INTO question_bank_folders (owner_id, name)
         VALUES (?, 'Default')
         """,
         (OWNER_USER_ID,)
     )
-    conn.commit()
+    _conn.commit()
+    _conn.close()
+
+def ensure_all_subscriber_default_folders():
+    """
+    One-time repair: ensures every active subscriber has both
+    Default quiz folder and Default question bank folder.
+    Safe to run on every startup — INSERT OR IGNORE is a no-op if already exists.
+    """
+    _conn, _cur = get_db()
+    _cur.execute("SELECT user_id FROM subscribers WHERE is_active = 1")
+    subscriber_ids = [row[0] for row in _cur.fetchall()]
+
+    for uid in subscriber_ids:
+        _cur.execute(
+            "INSERT OR IGNORE INTO folders (owner_id, name) VALUES (?, 'Default')",
+            (uid,)
+        )
+        _cur.execute(
+            "INSERT OR IGNORE INTO question_bank_folders (owner_id, name) VALUES (?, 'Default')",
+            (uid,)
+        )
+
+    _conn.commit()
+    _conn.close()
 
 async def quiz_folder_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -6106,17 +5944,17 @@ async def show_qb_move_folders(message, context):
     page = context.user_data.get("qb_move_page", 0)
     PER_PAGE = 5
 
-    # Load Question Bank folders
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         """
-        SELECT id, name
-        FROM question_bank_folders
+        SELECT id, name FROM question_bank_folders
         WHERE owner_id=?
         ORDER BY name COLLATE NOCASE
         """,
         (get_active_user_id(context),)
     )
-    folders = cur.fetchall()
+    folders = _cur.fetchall()
+    _conn.close()
 
     total = len(folders)
     pages = (total - 1) // PER_PAGE + 1 if total else 1
@@ -6136,23 +5974,15 @@ async def show_qb_move_folders(message, context):
             )
         ])
 
-    # Pagination controls
     if pages > 1:
         nav = []
         if page > 0:
-            nav.append(
-                InlineKeyboardButton("◀ Prev", callback_data="QB_MOVE_PREV")
-            )
-        nav.append(
-            InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QB_MOVE_NOP")
-        )
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data="QB_MOVE_PREV"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QB_MOVE_NOP"))
         if page < pages - 1:
-            nav.append(
-                InlineKeyboardButton("Next ▶", callback_data="QB_MOVE_NEXT")
-            )
+            nav.append(InlineKeyboardButton("Next ▶", callback_data="QB_MOVE_NEXT"))
         keyboard.append(nav)
 
-    # Back button
     keyboard.append([
         InlineKeyboardButton("⬅️ Cancel", callback_data="EDIT_QUESTIONS")
     ])
@@ -6180,11 +6010,14 @@ async def qb_move_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🔐 WRITE SECTION (LOCKED)
     try:
         async with DB_LOCK:
-            cur.execute(
+            _conn, _cur = get_db()
+            _cur.execute(
                 "UPDATE question_bank SET folder_id=? WHERE id=?",
                 (folder_id, qid)
             )
-            conn.commit()
+            _conn.commit()
+            _conn.close()
+
     except Exception as e:
         print("⚠️ Failed to move question:", e)
         await flash_message(context.bot, query.message.chat_id, "❌ Failed to move question.")
@@ -6199,79 +6032,48 @@ async def qb_open_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    # =========================
-    # 🔑 Determine folder name
-    # =========================
     if query.data.startswith("QB_OPEN_FOLDER|"):
         folder_name = query.data.split("|", 1)[1]
         context.user_data["qb_folder_name"] = folder_name
-        context.user_data["qb_q_page"] = 0  # reset page on new folder
+        context.user_data["qb_q_page"] = 0
         context.user_data.setdefault("qb_selected", set())
     else:
         folder_name = context.user_data.get("qb_folder_name")
 
     if not folder_name:
-        await flash_message(
-            context.bot,
-            query.message.chat_id,
-            "❌ Folder context lost. Please reopen the folder."
-        )
+        await flash_message(context.bot, query.message.chat_id, "❌ Folder context lost.")
         return
 
-    # =========================
-    # 📁 Check if folder exists
-    # =========================
-    cur.execute(
-        """
-        SELECT id
-        FROM question_bank_folders
-        WHERE owner_id=? AND name=?
-        """,
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
         (get_active_user_id(context), folder_name)
     )
-    row = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
 
     if not row:
-        await flash_message(
-            context.bot,
-            query.message.chat_id,
-            "❌ Folder not found."
-        )
+        await flash_message(context.bot, query.message.chat_id, "❌ Folder not found.")
         return
-
     folder_id = row[0]
 
-    # =========================
-    # 📚 Check if folder has questions
-    # =========================
-    cur.execute(
-        """
-        SELECT COUNT(*)
-        FROM question_bank
-        WHERE folder_id=?
-        """,
-        (folder_id,)
-    )
-    count = cur.fetchone()[0]
+    _conn2, _cur2 = get_db()
+    _cur2.execute("SELECT COUNT(*) FROM question_bank WHERE folder_id=?", (folder_id,))
+    count = _cur2.fetchone()[0]
+    _conn2.close()
 
     if count == 0:
         msg = await query.message.reply_text(
             f"📁 **{folder_name}**\n\n_No questions in this folder._",
             parse_mode="Markdown"
         )
-
         await asyncio.sleep(2)
-
         try:
             await msg.delete()
         except:
             pass
-
         return
 
-    # ======================================================
-    # 🔥 SINGLE SOURCE OF TRUTH FOR KEYBOARD
-    # ======================================================
     reply_markup = build_qb_question_keyboard(context)
 
     await query.message.edit_text(
@@ -6389,7 +6191,8 @@ async def force_stop_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # 2️⃣ Save to DATABASE
             try:
                 async with DB_LOCK:
-                    cur.execute("""
+                    _conn, _cur = get_db()
+                    _cur.execute("""
                         INSERT OR IGNORE INTO group_leaderboard
                         (leaderboard_key, user_id, name, score)
                         VALUES (?, ?, ?, ?)
@@ -6399,7 +6202,8 @@ async def force_stop_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         play["user_name"],
                         play["score"]
                     ))
-                    conn.commit()
+                    _conn.commit()
+                    _conn.close()
             except Exception as e:
                 print("⚠️ Failed to save leaderboard on stop:", e)
 
@@ -6565,26 +6369,33 @@ def build_qb_question_keyboard(context):
     quiz_id = context.user_data.get("active_quiz_id")
     PER_PAGE = 10
 
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
         (get_active_user_id(context), folder_name)
     )
-    row = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
+
     if not row:
         return InlineKeyboardMarkup([])
     folder_id = row[0]
 
-    cur.execute(
+    _conn2, _cur2 = get_db()
+    _cur2.execute(
         "SELECT id, question FROM question_bank WHERE folder_id=? ORDER BY question COLLATE NOCASE",
         (folder_id,)
     )
-    questions = cur.fetchall()
+    questions = _cur2.fetchall()
+    _conn2.close()
 
-    cur.execute(
+    _conn3, _cur3 = get_db()
+    _cur3.execute(
         "SELECT question_id FROM quiz_question_links WHERE quiz_id=?",
         (quiz_id,)
     )
-    linked_questions = {row[0] for row in cur.fetchall()}
+    linked_questions = {row[0] for row in _cur3.fetchall()}
+    _conn3.close()
 
     total = len(questions)
     pages = (total - 1) // PER_PAGE + 1 if total else 1
@@ -6597,19 +6408,15 @@ def build_qb_question_keyboard(context):
 
     keyboard = []
 
-    # ── ROW 1: Add this Page ────────────────────────────────
     keyboard.append([
         InlineKeyboardButton("📄 Add this Page", callback_data="QB_ADD_THIS_PAGE"),
     ])
-
-    # ── ROW 2: Add 10 / 50 / 100 ───────────────────────────
     keyboard.append([
         InlineKeyboardButton("🎲 Add 10",  callback_data="QB_AUTO_ADD|10"),
         InlineKeyboardButton("🎲 Add 50",  callback_data="QB_AUTO_ADD|50"),
         InlineKeyboardButton("🎲 Add 100", callback_data="QB_AUTO_ADD|100"),
     ])
 
-    # ── Question list ───────────────────────────────────────
     for qid, text in page_items:
         already_added = qid in linked_questions
         if already_added:
@@ -6621,7 +6428,6 @@ def build_qb_question_keyboard(context):
             callback = f"QB_SELECT_Q|{qid}"
         keyboard.append([InlineKeyboardButton(label, callback_data=callback)])
 
-    # ── Pagination (above Clear/Add) ────────────────────────
     if pages > 1:
         nav = []
         if page > 0:
@@ -6631,13 +6437,10 @@ def build_qb_question_keyboard(context):
             nav.append(InlineKeyboardButton("Next ▶", callback_data="QB_Q_NEXT"))
         keyboard.append(nav)
 
-    # ── Clear Selection + Add Selected ─────────────────────
     keyboard.append([
-        InlineKeyboardButton("🧹 Clear Selection",       callback_data="QB_CLEAR_SELECTED"),
+        InlineKeyboardButton("🧹 Clear Selection",              callback_data="QB_CLEAR_SELECTED"),
         InlineKeyboardButton(f"➕ Add Selected ({len(selected)})", callback_data="QB_ADD_SELECTED"),
     ])
-
-    # ── Back ────────────────────────────────────────────────
     keyboard.append([
         InlineKeyboardButton("⬅️ Back", callback_data="QB_PICK_FOLDER")
     ])
@@ -6667,7 +6470,7 @@ async def qb_add_selected_questions(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     await query.answer()
 
-    quiz_id = context.user_data.get("active_quiz_id")
+    quiz_id  = context.user_data.get("active_quiz_id")
     selected = context.user_data.get("qb_selected", set())
 
     if not quiz_id or not selected:
@@ -6678,41 +6481,29 @@ async def qb_add_selected_questions(update: Update, context: ContextTypes.DEFAUL
 
     try:
         async with DB_LOCK:
-            cur.execute(
-                """
-                SELECT COALESCE(MAX(position), 0)
-                FROM quiz_question_links
-                WHERE quiz_id=?
-                """,
+            _conn, _cur = get_db()
+            _cur.execute(
+                "SELECT COALESCE(MAX(position), 0) FROM quiz_question_links WHERE quiz_id=?",
                 (quiz_id,)
             )
-            position = cur.fetchone()[0]
+            position = _cur.fetchone()[0]
 
             for qid in selected:
-                cur.execute(
-                    """
-                    SELECT 1
-                    FROM quiz_question_links
-                    WHERE quiz_id=? AND question_id=?
-                    """,
+                _cur.execute(
+                    "SELECT 1 FROM quiz_question_links WHERE quiz_id=? AND question_id=?",
                     (quiz_id, qid)
                 )
-                if cur.fetchone():
+                if _cur.fetchone():
                     continue
-
                 position += 1
-
-                cur.execute(
-                    """
-                    INSERT INTO quiz_question_links (quiz_id, question_id, position)
-                    VALUES (?, ?, ?)
-                    """,
+                _cur.execute(
+                    "INSERT INTO quiz_question_links (quiz_id, question_id, position) VALUES (?, ?, ?)",
                     (quiz_id, qid, position)
                 )
-
                 added += 1
 
-            conn.commit()
+            _conn.commit()
+            _conn.close()
 
     except Exception as e:
         print("⚠️ Failed to add selected questions:", e)
@@ -6722,59 +6513,59 @@ async def qb_add_selected_questions(update: Update, context: ContextTypes.DEFAUL
     context.user_data["qb_selected"] = set()
     context.user_data.pop("qb_q_page", None)
 
-    await flash_message(context.bot, query.message.chat_id,
+    await flash_message(
+        context.bot, query.message.chat_id,
         f"✅ {added} question(s) added to the quiz."
     )
 
-    # 🔄 SYNC: Refresh all active group posts for this quiz
-    asyncio.create_task(
-        refresh_all_group_posts_for_quiz(quiz_id, context)
-    )
+    asyncio.create_task(refresh_all_group_posts_for_quiz(quiz_id, context))
 
     context.user_data["reset_q_page"] = True
     await show_questions_from_message(query.message, context)
 
 async def qb_add_this_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Selects all questions visible on the current page."""
     query = update.callback_query
     await query.answer()
 
     folder_name = context.user_data.get("qb_folder_name")
-    page = context.user_data.get("qb_q_page", 0)
-    selected = context.user_data.setdefault("qb_selected", set())
-    quiz_id = context.user_data.get("active_quiz_id")
-    PER_PAGE = 10
+    page        = context.user_data.get("qb_q_page", 0)
+    selected    = context.user_data.setdefault("qb_selected", set())
+    quiz_id     = context.user_data.get("active_quiz_id")
+    PER_PAGE    = 10
 
-    # Resolve folder_id
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
         (get_active_user_id(context), folder_name)
     )
-    row = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
+
     if not row:
         return
     folder_id = row[0]
 
-    # Load questions in folder
-    cur.execute(
+    _conn2, _cur2 = get_db()
+    _cur2.execute(
         "SELECT id FROM question_bank WHERE folder_id=? ORDER BY question COLLATE NOCASE",
         (folder_id,)
     )
-    all_questions = [row[0] for row in cur.fetchall()]
+    all_questions = [row[0] for row in _cur2.fetchall()]
+    _conn2.close()
 
-    # Load already linked questions
-    cur.execute(
+    _conn3, _cur3 = get_db()
+    _cur3.execute(
         "SELECT question_id FROM quiz_question_links WHERE quiz_id=?",
         (quiz_id,)
     )
-    linked = {row[0] for row in cur.fetchall()}
+    linked = {row[0] for row in _cur3.fetchall()}
+    _conn3.close()
 
-    # Get current page items that are NOT already linked
-    total = len(all_questions)
-    pages = (total - 1) // PER_PAGE + 1 if total else 1
-    page = max(0, min(page, pages - 1))
-    start = page * PER_PAGE
-    end = start + PER_PAGE
+    total  = len(all_questions)
+    pages  = (total - 1) // PER_PAGE + 1 if total else 1
+    page   = max(0, min(page, pages - 1))
+    start  = page * PER_PAGE
+    end    = start + PER_PAGE
 
     for qid in all_questions[start:end]:
         if qid not in linked:
@@ -6795,14 +6586,16 @@ async def qb_remove_question_from_quiz(update: Update, context: ContextTypes.DEF
 
     try:
         async with DB_LOCK:
-            cur.execute(
+            _conn, _cur = get_db()
+            _cur.execute(
                 """
                 DELETE FROM quiz_question_links
                 WHERE quiz_id=? AND question_id=?
                 """,
                 (quiz_id, qid)
             )
-            conn.commit()
+            _conn.commit()
+            _conn.close()
     except Exception as e:
         print("⚠️ Failed to remove question:", e)
         await query.answer("❌ Failed to remove question.", show_alert=True)
@@ -6820,78 +6613,51 @@ async def qb_auto_add_questions(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
 
-    # How many to select (10 / 50 / 100)
-    limit = int(query.data.split("|")[1])
-
-    active_uid = get_active_user_id(context)
-    quiz_id = context.user_data.get("active_quiz_id")
+    limit       = int(query.data.split("|")[1])
+    active_uid  = get_active_user_id(context)
+    quiz_id     = context.user_data.get("active_quiz_id")
     folder_name = context.user_data.get("qb_folder_name")
 
     if not quiz_id or not folder_name:
         return
 
-    # =========================
-    # Resolve folder_id
-    # =========================
-    cur.execute(
-        """
-        SELECT id
-        FROM question_bank_folders
-        WHERE owner_id=? AND name=?
-        """,
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
         (active_uid, folder_name)
     )
-    row = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
+
     if not row:
         return
-
     folder_id = row[0]
 
-    # =========================
-    # Load ALL questions in folder
-    # =========================
-    cur.execute(
-        """
-        SELECT id
-        FROM question_bank
-        WHERE folder_id=?
-        """,
+    _conn2, _cur2 = get_db()
+    _cur2.execute(
+        "SELECT id FROM question_bank WHERE folder_id=?",
         (folder_id,)
     )
-    all_questions = {row[0] for row in cur.fetchall()}
+    all_questions = {row[0] for row in _cur2.fetchall()}
+    _conn2.close()
 
-    # =========================
-    # Load already linked questions
-    # =========================
-    cur.execute(
-        """
-        SELECT question_id
-        FROM quiz_question_links
-        WHERE quiz_id=?
-        """,
+    _conn3, _cur3 = get_db()
+    _cur3.execute(
+        "SELECT question_id FROM quiz_question_links WHERE quiz_id=?",
         (quiz_id,)
     )
-    already_linked = {row[0] for row in cur.fetchall()}
+    already_linked = {row[0] for row in _cur3.fetchall()}
+    _conn3.close()
 
-    # =========================
-    # Selection state (SINGLE SOURCE OF TRUTH)
-    # =========================
-    selected = context.user_data.setdefault("qb_selected", set())
-
-    # Candidates = not linked AND not already selected
+    selected   = context.user_data.setdefault("qb_selected", set())
     candidates = list(all_questions - already_linked - selected)
 
     if not candidates:
         return
 
-    import random
     random.shuffle(candidates)
+    selected.update(candidates[:limit])
 
-    # 🔥 Add to selection set instead of inserting into DB
-    to_select = candidates[:limit]
-    selected.update(to_select)
-
-    # 🔁 Rebuild keyboard only (no full reload)
     reply_markup = build_qb_question_keyboard(context)
     await query.edit_message_reply_markup(reply_markup=reply_markup)
 
@@ -6902,25 +6668,25 @@ async def show_quiz_action_menu_by_id(chat_id, message_id, context):
     if not verify_quiz_owner(quiz_id, context):
         return
 
-    cur.execute("""
+    _conn, _cur = get_db()
+    _cur.execute("""
         SELECT q.title, q.description, q.timer, q.shuffle_q, q.shuffle_a,
                COUNT(ql.question_id)
         FROM quizzes q
-        LEFT JOIN quiz_question_links ql
-            ON q.quiz_id = ql.quiz_id
+        LEFT JOIN quiz_question_links ql ON q.quiz_id = ql.quiz_id
         WHERE q.quiz_id=?
         GROUP BY q.quiz_id
     """, (quiz_id,))
+    row = _cur.fetchone()
+    _conn.close()
 
-    title, desc, timer, sq, sa, total_questions = cur.fetchone()
+    if not row:
+        return
+    title, desc, timer, sq, sa, total_questions = row
 
-    # 📘 Title
     text = f"📘 **{escape_md(title)}**"
-
-    # 📝 Description (if any)
     if desc:
         text += f"\n📝 _{escape_md(desc)}_"
-
     text += "\n\n"
     text += f"📊 Questions: {total_questions}    ⏱ Timer: {timer}s"
     text += (
@@ -6931,15 +6697,15 @@ async def show_quiz_action_menu_by_id(chat_id, message_id, context):
     keyboard = [
         [
             InlineKeyboardButton("▶️ Start this Quiz", callback_data="START_THIS"),
-            InlineKeyboardButton("📤 Post this Quiz", callback_data="POST_QUIZ"),
+            InlineKeyboardButton("📤 Post this Quiz",  callback_data="POST_QUIZ"),
         ],
         [
-            InlineKeyboardButton("✏️ Edit this Quiz", callback_data="EDIT_THIS"),
-            InlineKeyboardButton("📁 Move this Quiz", callback_data="MOVE_QUIZ"),
+            InlineKeyboardButton("✏️ Edit this Quiz",  callback_data="EDIT_THIS"),
+            InlineKeyboardButton("📁 Move this Quiz",  callback_data="MOVE_QUIZ"),
         ],
         [
             InlineKeyboardButton("🗑 Delete this Quiz", callback_data="DELETE_QUIZ"),
-            InlineKeyboardButton("⬅️ Back", callback_data="BACK_TO_QUIZZES"),
+            InlineKeyboardButton("⬅️ Back",            callback_data="BACK_TO_QUIZZES"),
         ],
     ]
 
@@ -6997,7 +6763,8 @@ async def apply_new_options_correct(update: Update, context: ContextTypes.DEFAUL
     # 🔐 SAFE WRITE SECTION
     try:
         async with DB_LOCK:
-            cur.execute(
+            _conn, _cur = get_db()
+            _cur.execute(
                 """
                 UPDATE question_bank
                 SET options=?, correct=?
@@ -7005,7 +6772,9 @@ async def apply_new_options_correct(update: Update, context: ContextTypes.DEFAUL
                 """,
                 (options_text, correct_index, qid)
             )
-            conn.commit()
+            _conn.commit()
+            _conn.close()
+
     except Exception as e:
         print("⚠️ Failed to update options:", e)
         await query.answer("❌ Failed to update options.", show_alert=True)
@@ -7151,71 +6920,72 @@ async def back_to_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_db_questions_from_message(message, context):
     active_uid = get_active_user_id(context)
-    """
-    Rebuilds the database folder question list on an existing message object.
-    Used by back_to_questions when returning from a DATABASE preview.
-    """
     folder_name = context.user_data.get("db_folder_name")
     if not folder_name:
         return
+
     page = context.user_data.get("db_q_page", 0)
     PER_PAGE = 10
-    # Resolve folder_id
-    cur.execute(
+
+    _conn, _cur = get_db()
+    _cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
         (active_uid, folder_name)
     )
-    row = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
+
     if not row:
         return
     folder_id = row[0]
-    # Load questions
-    cur.execute(
+
+    _conn2, _cur2 = get_db()
+    _cur2.execute(
         """
-        SELECT id, question
-        FROM question_bank
+        SELECT id, question FROM question_bank
         WHERE folder_id=?
         ORDER BY question COLLATE NOCASE
         """,
         (folder_id,)
     )
-    rows = cur.fetchall()
+    rows = _cur2.fetchall()
+    _conn2.close()
+
     keyboard = []
-    # Empty folder case
+
     if not rows:
         if folder_name != "Default":
             keyboard.append([
                 InlineKeyboardButton("✏️ Rename", callback_data=f"DB_RENAME_FOLDER|{folder_name}"),
                 InlineKeyboardButton("📥 Move Questions In", callback_data=f"DB_MOVE_IN|{folder_name}")
             ])
-        if folder_name != "Default":
             keyboard.append([
                 InlineKeyboardButton("🗑 Delete Folder", callback_data=f"DB_DELETE_FOLDER|{folder_name}"),
                 InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
             ])
         else:
-            keyboard.append([
-                InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
-            ])
+            keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")])
+
         await message.edit_text(
             f"📁 **{folder_name}**\n\n_No questions in this folder yet._",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
         return
-    # Pagination
+
     total = len(rows)
     pages = (total - 1) // PER_PAGE + 1
     page = max(0, min(page, pages - 1))
     context.user_data["db_q_page"] = page
+
     start = page * PER_PAGE
     end = start + PER_PAGE
-    page_rows = rows[start:end]
-    for qid, text in page_rows:
+
+    for qid, text in rows[start:end]:
         keyboard.append([
             InlineKeyboardButton(text[:50], callback_data=f"Q_{qid}")
         ])
-    # Pagination controls
+
     if pages > 1:
         nav = []
         if page > 0:
@@ -7224,20 +6994,19 @@ async def show_db_questions_from_message(message, context):
         if page < pages - 1:
             nav.append(InlineKeyboardButton("Next ▶", callback_data="DB_Q_NEXT"))
         keyboard.append(nav)
+
     if folder_name != "Default":
         keyboard.append([
             InlineKeyboardButton("✏️ Rename", callback_data=f"DB_RENAME_FOLDER|{folder_name}"),
             InlineKeyboardButton("📥 Move Questions In", callback_data=f"DB_MOVE_IN|{folder_name}")
         ])
-    if folder_name != "Default":
         keyboard.append([
             InlineKeyboardButton("🗑 Delete Folder", callback_data=f"DB_DELETE_FOLDER|{folder_name}"),
             InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
         ])
     else:
-        keyboard.append([
-            InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
-        ])
+        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")])
+
     await message.edit_text(
         f"📁 **{folder_name}**\n\nSelect a question:",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -7268,17 +7037,16 @@ async def show_move_copy_folders(message, context):
     PER_PAGE = 5
     page = context.user_data.get("mc_folder_page", 0)
 
-    # 🔑 Load folders (Default first)
-    cur.execute("""
-        SELECT name
-        FROM folders
+    _conn, _cur = get_db()
+    _cur.execute("""
+        SELECT name FROM folders
         WHERE owner_id=?
         ORDER BY
             CASE WHEN name='Default' THEN 0 ELSE 1 END,
             name COLLATE NOCASE
     """, (get_active_user_id(context),))
-
-    folders = [row[0] for row in cur.fetchall()]
+    folders = [row[0] for row in _cur.fetchall()]
+    _conn.close()
 
     total = len(folders)
     pages = (total - 1) // PER_PAGE + 1 if total else 1
@@ -7292,14 +7060,13 @@ async def show_move_copy_folders(message, context):
     keyboard = []
 
     for folder_name in page_items:
-        # 🔢 Count quizzes inside folder
-        cur.execute("""
-            SELECT COUNT(*)
-            FROM quizzes
+        _conn2, _cur2 = get_db()
+        _cur2.execute("""
+            SELECT COUNT(*) FROM quizzes
             WHERE owner_id=? AND folder=?
         """, (get_active_user_id(context), folder_name))
-
-        count = cur.fetchone()[0]
+        count = _cur2.fetchone()[0]
+        _conn2.close()
 
         keyboard.append([
             InlineKeyboardButton(
@@ -7308,7 +7075,6 @@ async def show_move_copy_folders(message, context):
             )
         ])
 
-    # 🔄 Pagination
     if pages > 1:
         nav = []
         if page > 0:
@@ -7358,25 +7124,25 @@ async def move_copy_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # 🔐 FULL WRITE SECTION (LOCK EVERYTHING DB-RELATED)
         async with DB_LOCK:
+            _conn, _cur = get_db()
 
             # COPY or MOVE logic
             if mode == "MOVE":
-                # Remove from current quiz
-                cur.execute(
+                _cur.execute(
                     "DELETE FROM quiz_question_links WHERE quiz_id=? AND question_id=?",
                     (current_quiz_id, qid)
                 )
 
             # Check if already exists in target
-            cur.execute(
+            _cur.execute(
                 "SELECT 1 FROM quiz_question_links WHERE quiz_id=? AND question_id=?",
                 (target_quiz_id, qid)
             )
 
-            if not cur.fetchone():
+            if not _cur.fetchone():
 
                 # 🔢 Get next position safely
-                cur.execute(
+                _cur.execute(
                     """
                     SELECT COALESCE(MAX(position), 0) + 1
                     FROM quiz_question_links
@@ -7384,10 +7150,9 @@ async def move_copy_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     """,
                     (target_quiz_id,)
                 )
-                next_position = cur.fetchone()[0]
+                next_position = _cur.fetchone()[0]
 
-                # Insert into target quiz
-                cur.execute(
+                _cur.execute(
                     """
                     INSERT INTO quiz_question_links (quiz_id, question_id, position)
                     VALUES (?, ?, ?)
@@ -7395,26 +7160,19 @@ async def move_copy_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     (target_quiz_id, qid, next_position)
                 )
 
-            conn.commit()
+            _conn.commit()
+            _conn.close()
 
     except Exception as e:
         print("⚠️ Failed to move/copy question:", e)
         await query.answer("❌ Operation failed.", show_alert=True)
         return
 
-    confirm_msg = await flash_message(context.bot, query.message.chat_id, "✅ Operation completed.")
-
-    await asyncio.sleep(2)
+    await flash_message(context.bot, query.message.chat_id, "✅ Operation completed.")
 
     # 🧹 Delete folder/quiz list message
     try:
         await query.message.delete()
-    except:
-        pass
-
-    # 🧹 Delete confirmation
-    try:
-        await confirm_msg.delete()
     except:
         pass
 
@@ -7508,14 +7266,14 @@ async def show_move_copy_quizzes(message, context):
     page   = context.user_data.get("mc_quiz_page", 0)
     folder = context.user_data.get("mc_folder")
 
-    cur.execute("""
-        SELECT quiz_id, title
-        FROM quizzes
+    _conn, _cur = get_db()
+    _cur.execute("""
+        SELECT quiz_id, title FROM quizzes
         WHERE owner_id=? AND folder=?
     """, (get_active_user_id(context), folder))
-    quizzes = cur.fetchall()
+    quizzes = _cur.fetchall()
+    _conn.close()
 
-    # Natural sort
     quizzes = sorted(quizzes, key=lambda r: natural_sort_key(r[1]))
 
     total  = len(quizzes)
@@ -7542,7 +7300,9 @@ async def show_move_copy_quizzes(message, context):
             nav.append(InlineKeyboardButton("Next ▶", callback_data="MC_QUIZ_NEXT"))
         keyboard.append(nav)
 
-    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="MOVE_Q_START")])
+    keyboard.append([
+        InlineKeyboardButton("⬅️ Back", callback_data="MOVE_Q_START")
+    ])
 
     await safe_edit_message(
         message,
@@ -7571,7 +7331,6 @@ async def mc_quiz_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_move_copy_quizzes(query.message, context)
 
 def is_rate_limited(user_id):
-    import time
     now = time.time()
     last = USER_RATE_LIMIT.get(user_id, 0)
 
@@ -7579,6 +7338,13 @@ def is_rate_limited(user_id):
         return True
 
     USER_RATE_LIMIT[user_id] = now
+
+    # Prune entries older than 60 seconds to prevent unbounded growth
+    cutoff = now - 60
+    stale_keys = [uid for uid, t in USER_RATE_LIMIT.items() if t < cutoff]
+    for uid in stale_keys:
+        del USER_RATE_LIMIT[uid]
+
     return False
 
 async def manage_question_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7615,17 +7381,16 @@ async def show_manage_folders(message, context):
     PER_PAGE = 5
     page = context.user_data.get("manage_folder_page", 0)
 
-    # Load folders (Default first, alphabetical)
-    cur.execute("""
-        SELECT name
-        FROM folders
+    _conn, _cur = get_db()
+    _cur.execute("""
+        SELECT name FROM folders
         WHERE owner_id=?
         ORDER BY
             CASE WHEN name='Default' THEN 0 ELSE 1 END,
             name COLLATE NOCASE
     """, (get_active_user_id(context),))
-
-    folders = [row[0] for row in cur.fetchall()]
+    folders = [row[0] for row in _cur.fetchall()]
+    _conn.close()
 
     total = len(folders)
     pages = (total - 1) // PER_PAGE + 1 if total else 1
@@ -7639,15 +7404,13 @@ async def show_manage_folders(message, context):
     keyboard = []
 
     for folder in page_items:
-
-        # Count quizzes inside folder
-        cur.execute("""
-            SELECT COUNT(*)
-            FROM quizzes
+        _conn2, _cur2 = get_db()
+        _cur2.execute("""
+            SELECT COUNT(*) FROM quizzes
             WHERE owner_id=? AND folder=?
         """, (get_active_user_id(context), folder))
-
-        count = cur.fetchone()[0]
+        count = _cur2.fetchone()[0]
+        _conn2.close()
 
         keyboard.append([
             InlineKeyboardButton(
@@ -7656,7 +7419,6 @@ async def show_manage_folders(message, context):
             )
         ])
 
-    # Pagination
     if pages > 1:
         nav = []
         if page > 0:
@@ -7708,18 +7470,23 @@ async def show_manage_quizzes(message, context):
     folder = context.user_data.get("manage_folder")
     qid    = context.user_data.get("active_question_id")
 
-    cur.execute("""
-        SELECT quiz_id, title
-        FROM quizzes
+    _conn, _cur = get_db()
+    _cur.execute("""
+        SELECT quiz_id, title FROM quizzes
         WHERE owner_id=? AND folder=?
     """, (get_active_user_id(context), folder))
-    quizzes = cur.fetchall()
+    quizzes = _cur.fetchall()
+    _conn.close()
 
-    # Natural sort
     quizzes = sorted(quizzes, key=lambda r: natural_sort_key(r[1]))
 
-    cur.execute("SELECT quiz_id FROM quiz_question_links WHERE question_id=?", (qid,))
-    linked = {row[0] for row in cur.fetchall()}
+    _conn2, _cur2 = get_db()
+    _cur2.execute(
+        "SELECT quiz_id FROM quiz_question_links WHERE question_id=?",
+        (qid,)
+    )
+    linked = {row[0] for row in _cur2.fetchall()}
+    _conn2.close()
 
     total  = len(quizzes)
     pages  = (total - 1) // PER_PAGE + 1 if total else 1
@@ -7734,7 +7501,10 @@ async def show_manage_quizzes(message, context):
     for quiz_id, title in page_items:
         checked = "☑" if quiz_id in linked else "⬜"
         keyboard.append([
-            InlineKeyboardButton(f"{checked} {title}", callback_data=f"MANAGE_TOGGLE|{quiz_id}")
+            InlineKeyboardButton(
+                f"{checked} {title}",
+                callback_data=f"MANAGE_TOGGLE|{quiz_id}"
+            )
         ])
 
     if pages > 1:
@@ -7746,7 +7516,9 @@ async def show_manage_quizzes(message, context):
             nav.append(InlineKeyboardButton("Next ▶", callback_data="MANAGE_QUIZ_NEXT"))
         keyboard.append(nav)
 
-    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="MANAGE_BACK_TO_FOLDERS")])
+    keyboard.append([
+        InlineKeyboardButton("⬅️ Back", callback_data="MANAGE_BACK_TO_FOLDERS")
+    ])
 
     await safe_edit_message(
         message,
@@ -7759,37 +7531,41 @@ async def manage_toggle_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
 
     quiz_id = query.data.split("|")[1]
-    qid = context.user_data.get("active_question_id")
+    qid     = context.user_data.get("active_question_id")
 
-    # Check if already linked
-    cur.execute("""
+    _conn, _cur = get_db()
+    _cur.execute("""
         SELECT 1 FROM quiz_question_links
         WHERE quiz_id=? AND question_id=?
     """, (quiz_id, qid))
+    already_linked = _cur.fetchone()
+    _conn.close()
 
-    if cur.fetchone():
-        # Remove link
-        cur.execute("""
-            DELETE FROM quiz_question_links
-            WHERE quiz_id=? AND question_id=?
-        """, (quiz_id, qid))
+    if already_linked:
+        async with DB_LOCK:
+            _conn2, _cur2 = get_db()
+            _cur2.execute("""
+                DELETE FROM quiz_question_links
+                WHERE quiz_id=? AND question_id=?
+            """, (quiz_id, qid))
+            _conn2.commit()
+            _conn2.close()
     else:
-        # Add link
-        cur.execute("""
-            SELECT COALESCE(MAX(position), 0) + 1
-            FROM quiz_question_links
-            WHERE quiz_id=?
-        """, (quiz_id,))
-        position = cur.fetchone()[0]
+        async with DB_LOCK:
+            _conn3, _cur3 = get_db()
+            _cur3.execute("""
+                SELECT COALESCE(MAX(position), 0) + 1
+                FROM quiz_question_links
+                WHERE quiz_id=?
+            """, (quiz_id,))
+            position = _cur3.fetchone()[0]
+            _cur3.execute("""
+                INSERT INTO quiz_question_links (quiz_id, question_id, position)
+                VALUES (?, ?, ?)
+            """, (quiz_id, qid, position))
+            _conn3.commit()
+            _conn3.close()
 
-        cur.execute("""
-            INSERT INTO quiz_question_links (quiz_id, question_id, position)
-            VALUES (?, ?, ?)
-        """, (quiz_id, qid, position))
-
-    conn.commit()
-
-    # Refresh same message
     await show_manage_quizzes(query.message, context)
 
 async def manage_quiz_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7830,11 +7606,13 @@ async def qb_clear_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         async with DB_LOCK:
-            cur.execute(
+            _conn, _cur = get_db()
+            _cur.execute(
                 "DELETE FROM quiz_question_links WHERE quiz_id=?",
                 (quiz_id,)
             )
-            conn.commit()
+            _conn.commit()
+            _conn.close()
     except Exception as e:
         print("⚠️ Failed to unlink questions:", e)
         await query.answer("❌ Failed to clear quiz.", show_alert=True)
@@ -7905,7 +7683,6 @@ async def delete_question_from_database(update: Update, context: ContextTypes.DE
 
     context.user_data["db_delete_q_confirm_msg_id"] = msg.message_id
 
-
 async def db_delete_question_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -7926,9 +7703,11 @@ async def db_delete_question_confirm(update: Update, context: ContextTypes.DEFAU
 
     try:
         async with DB_LOCK:
-            cur.execute("DELETE FROM quiz_question_links WHERE question_id=?", (qid,))
-            cur.execute("DELETE FROM question_bank WHERE id=?", (qid,))
-            conn.commit()
+            _conn, _cur = get_db()
+            _cur.execute("DELETE FROM quiz_question_links WHERE question_id=?", (qid,))
+            _cur.execute("DELETE FROM question_bank WHERE id=?", (qid,))
+            _conn.commit()
+            _conn.close()
     except Exception as e:
         print("⚠️ Failed to permanently delete question:", e)
         await flash_message(context.bot, chat_id, "❌ Failed to delete.")
@@ -7947,7 +7726,6 @@ async def db_delete_question_confirm(update: Update, context: ContextTypes.DEFAU
         await show_db_questions_from_message(query.message, context)
     else:
         await show_database_menu(query.message, context)
-
 
 async def db_delete_question_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -8189,43 +7967,44 @@ async def db_move_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_db_move_folder_list(message, context):
     target_folder = context.user_data.get("db_move_target_folder")
-    page = context.user_data.get("db_move_folder_page", 0)
-    PER_PAGE = 5
+    page          = context.user_data.get("db_move_folder_page", 0)
+    PER_PAGE      = 5
 
-    # Load all folders
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         """
-        SELECT id, name
-        FROM question_bank_folders
+        SELECT id, name FROM question_bank_folders
         WHERE owner_id=?
         ORDER BY name COLLATE NOCASE
         """,
         (get_active_user_id(context),)
     )
-    all_folders = cur.fetchall()
+    all_folders = _cur.fetchall()
+    _conn.close()
 
-    # Pin Default to top, sort rest alphabetically
     default_entry = [(fid, name) for fid, name in all_folders if name == "Default"]
     other_folders = [(fid, name) for fid, name in all_folders if name != "Default"]
-    folders = default_entry + other_folders
+    folders       = default_entry + other_folders
 
     total = len(folders)
     pages = (total - 1) // PER_PAGE + 1 if total else 1
-    page = max(0, min(page, pages - 1))
+    page  = max(0, min(page, pages - 1))
     context.user_data["db_move_folder_page"] = page
 
     start = page * PER_PAGE
-    end = start + PER_PAGE
+    end   = start + PER_PAGE
     page_items = folders[start:end]
 
     keyboard = []
 
     for folder_id, folder_name in page_items:
-        cur.execute(
+        _conn2, _cur2 = get_db()
+        _cur2.execute(
             "SELECT COUNT(*) FROM question_bank WHERE folder_id=?",
             (folder_id,)
         )
-        count = cur.fetchone()[0]
+        count = _cur2.fetchone()[0]
+        _conn2.close()
 
         keyboard.append([
             InlineKeyboardButton(
@@ -8234,7 +8013,6 @@ async def show_db_move_folder_list(message, context):
             )
         ])
 
-    # Pagination row
     if pages > 1:
         nav = []
         if page > 0:
@@ -8244,7 +8022,6 @@ async def show_db_move_folder_list(message, context):
             nav.append(InlineKeyboardButton("Next ▶", callback_data="DB_MOVE_FOLDER_NEXT"))
         keyboard.append(nav)
 
-    # Cancel button
     keyboard.append([
         InlineKeyboardButton("⬅️ Cancel", callback_data=f"DB_OPEN|{target_folder}")
     ])
@@ -8290,62 +8067,63 @@ async def db_move_add_this_page(update: Update, context: ContextTypes.DEFAULT_TY
 
     source_folder = context.user_data.get("db_move_source_folder")
     target_folder = context.user_data.get("db_move_target_folder")
-    page = context.user_data.get("db_move_page", 0)
-    PER_PAGE = 10
-    selected = context.user_data.setdefault("db_move_selected", set())
+    page          = context.user_data.get("db_move_page", 0)
+    PER_PAGE      = 10
+    selected      = context.user_data.setdefault("db_move_selected", set())
 
-    # Resolve source folder_id
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
         (active_uid, source_folder)
     )
-    row = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
+
     if not row:
         return
     source_folder_id = row[0]
 
-    # Resolve target folder_id
-    cur.execute(
+    _conn2, _cur2 = get_db()
+    _cur2.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
         (active_uid, target_folder)
     )
-    row = cur.fetchone()
-    if not row:
-        return
-    target_folder_id = row[0]
+    row2 = _cur2.fetchone()
+    _conn2.close()
 
-    # Load all questions in source folder
-    cur.execute(
+    if not row2:
+        return
+    target_folder_id = row2[0]
+
+    _conn3, _cur3 = get_db()
+    _cur3.execute(
         """
-        SELECT id, question
-        FROM question_bank
+        SELECT id, question FROM question_bank
         WHERE folder_id=?
         ORDER BY question COLLATE NOCASE
         """,
         (source_folder_id,)
     )
-    all_questions = cur.fetchall()
+    all_questions = _cur3.fetchall()
+    _conn3.close()
 
-    # Load questions already in target folder
-    cur.execute(
+    _conn4, _cur4 = get_db()
+    _cur4.execute(
         "SELECT id FROM question_bank WHERE folder_id=?",
         (target_folder_id,)
     )
-    already_in_target = {row[0] for row in cur.fetchall()}
+    already_in_target = {row[0] for row in _cur4.fetchall()}
+    _conn4.close()
 
-    # Same filter as show_db_move_question_list
     available = [(qid, text) for qid, text in all_questions if qid not in already_in_target]
 
-    # Get exactly the current page items
-    total = len(available)
-    pages = (total - 1) // PER_PAGE + 1 if total else 1
-    page = max(0, min(page, pages - 1))
-    start = page * PER_PAGE
-    end = start + PER_PAGE
-    page_items = available[start:end]
+    total  = len(available)
+    pages  = (total - 1) // PER_PAGE + 1 if total else 1
+    page   = max(0, min(page, pages - 1))
+    start  = page * PER_PAGE
+    end    = start + PER_PAGE
 
-    # Add all visible page questions to selection
-    for qid, text in page_items:
+    for qid, text in available[start:end]:
         selected.add(qid)
 
     await show_db_move_question_list(query.message, context)
@@ -8355,105 +8133,111 @@ async def db_move_auto_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    n = int(query.data.split("|", 1)[1])
-
+    n             = int(query.data.split("|", 1)[1])
     source_folder = context.user_data.get("db_move_source_folder")
     target_folder = context.user_data.get("db_move_target_folder")
-    selected = context.user_data.setdefault("db_move_selected", set())
+    selected      = context.user_data.setdefault("db_move_selected", set())
 
-    # Resolve source folder_id
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
         (active_uid, source_folder)
     )
-    row = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
+
     if not row:
         return
     source_folder_id = row[0]
 
-    # Resolve target folder_id
-    cur.execute(
+    _conn2, _cur2 = get_db()
+    _cur2.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
         (active_uid, target_folder)
     )
-    row = cur.fetchone()
-    if not row:
-        return
-    target_folder_id = row[0]
+    row2 = _cur2.fetchone()
+    _conn2.close()
 
-    # Load all questions in source folder
-    cur.execute(
+    if not row2:
+        return
+    target_folder_id = row2[0]
+
+    _conn3, _cur3 = get_db()
+    _cur3.execute(
         "SELECT id FROM question_bank WHERE folder_id=?",
         (source_folder_id,)
     )
-    all_questions = {row[0] for row in cur.fetchall()}
+    all_questions = {row[0] for row in _cur3.fetchall()}
+    _conn3.close()
 
-    # Load questions already in target folder
-    cur.execute(
+    _conn4, _cur4 = get_db()
+    _cur4.execute(
         "SELECT id FROM question_bank WHERE folder_id=?",
         (target_folder_id,)
     )
-    already_in_target = {row[0] for row in cur.fetchall()}
+    already_in_target = {row[0] for row in _cur4.fetchall()}
+    _conn4.close()
 
-    # Candidates: not in target AND not already selected
     candidates = list(all_questions - already_in_target - selected)
-
-    import random
     random.shuffle(candidates)
     selected.update(candidates[:n])
 
     await show_db_move_question_list(query.message, context)
 
 async def show_db_move_question_list(message, context):
-    active_uid = get_active_user_id(context)
+    active_uid    = get_active_user_id(context)
     target_folder = context.user_data.get("db_move_target_folder")
     source_folder = context.user_data.get("db_move_source_folder")
-    selected = context.user_data.setdefault("db_move_selected", set())
-    page = context.user_data.get("db_move_page", 0)
-    PER_PAGE = 10
+    selected      = context.user_data.setdefault("db_move_selected", set())
+    page          = context.user_data.get("db_move_page", 0)
+    PER_PAGE      = 10
 
-    # Resolve source folder_id
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
         (active_uid, source_folder)
     )
-    row = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
+
     if not row:
         await message.edit_text("❌ Source folder not found.")
         return
     source_folder_id = row[0]
 
-    # Resolve target folder_id
-    cur.execute(
+    _conn2, _cur2 = get_db()
+    _cur2.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
         (active_uid, target_folder)
     )
-    row = cur.fetchone()
-    if not row:
+    row2 = _cur2.fetchone()
+    _conn2.close()
+
+    if not row2:
         await message.edit_text("❌ Target folder not found.")
         return
-    target_folder_id = row[0]
+    target_folder_id = row2[0]
 
-    # Load all questions in source folder
-    cur.execute(
+    _conn3, _cur3 = get_db()
+    _cur3.execute(
         """
-        SELECT id, question
-        FROM question_bank
+        SELECT id, question FROM question_bank
         WHERE folder_id=?
         ORDER BY question COLLATE NOCASE
         """,
         (source_folder_id,)
     )
-    all_questions = cur.fetchall()
+    all_questions = _cur3.fetchall()
+    _conn3.close()
 
-    # Load questions already in target folder
-    cur.execute(
+    _conn4, _cur4 = get_db()
+    _cur4.execute(
         "SELECT id FROM question_bank WHERE folder_id=?",
         (target_folder_id,)
     )
-    already_in_target = {row[0] for row in cur.fetchall()}
+    already_in_target = {row[0] for row in _cur4.fetchall()}
+    _conn4.close()
 
-    # Filter: only show questions NOT yet in target
     available = [(qid, text) for qid, text in all_questions if qid not in already_in_target]
 
     if not available:
@@ -8466,30 +8250,26 @@ async def show_db_move_question_list(message, context):
         )
         return
 
-    # Paginate
     total = len(available)
     pages = (total - 1) // PER_PAGE + 1
-    page = max(0, min(page, pages - 1))
+    page  = max(0, min(page, pages - 1))
     context.user_data["db_move_page"] = page
+
     start = page * PER_PAGE
-    end = start + PER_PAGE
+    end   = start + PER_PAGE
     page_items = available[start:end]
 
     keyboard = []
 
-    # Row 1: Add this Page + Add 10
     keyboard.append([
         InlineKeyboardButton("📄 Add this Page", callback_data="DB_MOVE_ADD_PAGE"),
-        InlineKeyboardButton("🎲 Add 10", callback_data="DB_MOVE_AUTO_ADD|10"),
+        InlineKeyboardButton("🎲 Add 10",        callback_data="DB_MOVE_AUTO_ADD|10"),
     ])
-
-    # Row 2: Add 50 + Add 100
     keyboard.append([
-        InlineKeyboardButton("🎲 Add 50", callback_data="DB_MOVE_AUTO_ADD|50"),
+        InlineKeyboardButton("🎲 Add 50",  callback_data="DB_MOVE_AUTO_ADD|50"),
         InlineKeyboardButton("🎲 Add 100", callback_data="DB_MOVE_AUTO_ADD|100"),
     ])
 
-    # Question list with checkboxes
     for qid, text in page_items:
         checked = "☑" if qid in selected else "⬜"
         keyboard.append([
@@ -8499,7 +8279,6 @@ async def show_db_move_question_list(message, context):
             )
         ])
 
-    # Pagination row
     if pages > 1:
         nav = []
         if page > 0:
@@ -8509,7 +8288,6 @@ async def show_db_move_question_list(message, context):
             nav.append(InlineKeyboardButton("Next ▶", callback_data="DB_MOVE_NEXT"))
         keyboard.append(nav)
 
-    # Bottom action row
     keyboard.append([
         InlineKeyboardButton(
             f"📦 Move Selected ({len(selected)})",
@@ -8528,21 +8306,22 @@ async def db_move_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    active_uid = get_active_user_id(context)
+    active_uid    = get_active_user_id(context)
     target_folder = context.user_data.get("db_move_target_folder")
-    selected = context.user_data.get("db_move_selected", set())
+    selected      = context.user_data.get("db_move_selected", set())
 
     if not selected:
         await query.answer("⚠️ No questions selected.", show_alert=True)
         return
 
-    # Resolve target folder_id
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
         (active_uid, target_folder)
     )
+    row = _cur.fetchone()
+    _conn.close()
 
-    row = cur.fetchone()
     if not row:
         await query.answer("❌ Target folder not found.", show_alert=True)
         return
@@ -8550,12 +8329,14 @@ async def db_move_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         async with DB_LOCK:
+            _conn2, _cur2 = get_db()
             for qid in selected:
-                cur.execute(
+                _cur2.execute(
                     "UPDATE question_bank SET folder_id=? WHERE id=?",
                     (target_folder_id, qid)
                 )
-            conn.commit()
+            _conn2.commit()
+            _conn2.close()
     except Exception as e:
         print("⚠️ Failed to move questions:", e)
         await query.answer("❌ Move failed.", show_alert=True)
@@ -8563,7 +8344,6 @@ async def db_move_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     moved = len(selected)
 
-    # Clean up ALL move-related state
     context.user_data.pop("db_move_selected", None)
     context.user_data.pop("db_move_page", None)
     context.user_data.pop("db_move_target_folder", None)
@@ -8576,7 +8356,6 @@ async def db_move_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ {moved} question(s) moved to 📁 {target_folder}"
     )
 
-    # Return to target folder question list cleanly
     context.user_data["db_folder_name"] = target_folder
     context.user_data["db_q_page"] = 0
 
@@ -8592,31 +8371,32 @@ async def db_delete_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ Cannot delete the Default folder.", show_alert=True)
         return
 
-    # Resolve folder_id
-    cur.execute(
+    _conn, _cur = get_db()
+    _cur.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
         (get_active_user_id(context), folder_name)
     )
-    row = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
+
     if not row:
         await query.answer("❌ Folder not found.", show_alert=True)
         return
-
     folder_id = row[0]
 
-    # Resolve Default folder_id
-    cur.execute(
+    _conn2, _cur2 = get_db()
+    _cur2.execute(
         "SELECT id FROM question_bank_folders WHERE owner_id=? AND name='Default'",
         (get_active_user_id(context),)
     )
-    default_row = cur.fetchone()
+    default_row = _cur2.fetchone()
+    _conn2.close()
+
     if not default_row:
         await query.answer("❌ Default folder not found.", show_alert=True)
         return
-
     default_folder_id = default_row[0]
 
-    # Store for confirmation
     context.user_data["db_delete_folder_id"] = folder_id
     context.user_data["db_delete_folder_name"] = folder_name
     context.user_data["db_delete_default_folder_id"] = default_folder_id
@@ -8624,7 +8404,7 @@ async def db_delete_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Yes, Delete", callback_data="DB_DELETE_FOLDER_CONFIRM"),
-            InlineKeyboardButton("❌ Cancel", callback_data=f"DB_OPEN|{folder_name}"),
+            InlineKeyboardButton("❌ Cancel",      callback_data=f"DB_OPEN|{folder_name}"),
         ]
     ])
 
@@ -8650,17 +8430,18 @@ async def db_delete_folder_confirm(update: Update, context: ContextTypes.DEFAULT
 
     try:
         async with DB_LOCK:
-            # Move all questions to Default
-            cur.execute(
+            _conn, _cur = get_db()
+            _cur.execute(
                 "UPDATE question_bank SET folder_id=? WHERE folder_id=?",
                 (default_folder_id, folder_id)
             )
-            # Delete the folder
-            cur.execute(
+            _cur.execute(
                 "DELETE FROM question_bank_folders WHERE id=?",
                 (folder_id,)
             )
-            conn.commit()
+            _conn.commit()
+            _conn.close()
+
     except Exception as e:
         print("⚠️ Failed to delete DB folder:", e)
         await query.answer("❌ Delete failed.", show_alert=True)
@@ -8788,11 +8569,13 @@ async def reset_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🔐 Clear database
     try:
         async with DB_LOCK:
-            cur.execute(
+            _conn, _cur = get_db()
+            _cur.execute(
                 "DELETE FROM group_leaderboard WHERE leaderboard_key=?",
                 (leaderboard_key,)
             )
-            conn.commit()
+            _conn.commit()
+            _conn.close()
     except Exception as e:
         print("⚠️ Reset score DB error:", e)
         return
@@ -8845,8 +8628,10 @@ async def auto_declutter_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def refresh_all_group_posts(context):
     """Refreshes ALL active group posts across all quizzes."""
-    cur.execute("SELECT DISTINCT quiz_id FROM group_lb_messages")
-    quiz_ids = [row[0] for row in cur.fetchall()]
+    _conn_r, _cur_r = get_db()
+    _cur_r.execute("SELECT DISTINCT quiz_id FROM group_lb_messages")
+    quiz_ids = [row[0] for row in _cur_r.fetchall()]
+    _conn_r.close()
     for quiz_id in quiz_ids:
         await refresh_all_group_posts_for_quiz(quiz_id, context)
 
@@ -8944,8 +8729,10 @@ async def sub_apply_duration(update, context):
 
     # ── PROBLEM 2 FIX: When renewing, ADD duration to remaining time ──
     if is_renew and sub_type != "Lifetime":
-        cur.execute("SELECT expires_at, subscription_type FROM subscribers WHERE user_id=?", (user_id,))
-        row = cur.fetchone()
+        _conn_r, _cur_r = get_db()
+        _cur_r.execute("SELECT expires_at, subscription_type FROM subscribers WHERE user_id=?", (user_id,))
+        row = _cur_r.fetchone()
+        _conn_r.close()
         if row:
             current_expires, current_type = row
             if current_type == "Lifetime":
@@ -8967,7 +8754,8 @@ async def sub_apply_duration(update, context):
     try:
         async with DB_LOCK:
             if is_renew:
-                cur.execute("""
+                _conn, _cur = get_db()
+                _cur.execute("""
                     UPDATE subscribers
                     SET subscription_type = ?,
                         expires_at        = ?,
@@ -8977,23 +8765,28 @@ async def sub_apply_duration(update, context):
                     WHERE user_id = ?
                 """, (sub_type, expires_at, now, user_id))
             else:
-                cur.execute("""
+                _conn, _cur = get_db()
+                _cur.execute("""
                     INSERT OR REPLACE INTO subscribers
                     (user_id, name, subscription_type, expires_at, is_active, subscribed_at, needs_notice)
                     VALUES (?, ?, ?, ?, 1, ?, 1)
                 """, (user_id, name, sub_type, expires_at, now))
-            conn.commit()
+            _conn.commit()
+            _conn.close()
 
         # ✅ Auto-create Default folders for new subscriber
-        cur.execute(
-            "INSERT OR IGNORE INTO folders (owner_id, name) VALUES (?, 'Default')",
-            (user_id,)
-        )
-        cur.execute(
-            "INSERT OR IGNORE INTO question_bank_folders (owner_id, name) VALUES (?, 'Default')",
-            (user_id,)
-        )
-        conn.commit()
+        async with DB_LOCK:
+            _conn2, _cur2 = get_db()
+            _cur2.execute(
+                "INSERT OR IGNORE INTO folders (owner_id, name) VALUES (?, 'Default')",
+                (user_id,)
+            )
+            _cur2.execute(
+                "INSERT OR IGNORE INTO question_bank_folders (owner_id, name) VALUES (?, 'Default')",
+                (user_id,)
+            )
+            _conn2.commit()
+            _conn2.close()
 
     except Exception as e:
         print("⚠️ Failed to save subscriber:", e)
@@ -9050,18 +8843,12 @@ async def sub_list_next(update, context):
     await _show_sub_list(query.message, context, active=active, page=page)
 
 async def _show_sub_list(message, context, active: bool, page: int = 0):
-    """
-    Shared renderer for active / inactive subscriber lists.
-    Each subscriber appears as a single inline button:
-        [Name — X days remaining]   (active)
-        [Name — Expired]            (inactive)
-    Tapping opens sub_overview.
-    """
     now = int(time.time())
 
-    # ── PROBLEM 1 FIX: Auto-expire any overdue subscribers before listing ──
+    # Auto-expire overdue subscriptions
     async with DB_LOCK:
-        cur.execute("""
+        _conn, _cur = get_db()
+        _cur.execute("""
             UPDATE subscribers
             SET is_active = 0
             WHERE subscription_type != 'Lifetime'
@@ -9069,10 +8856,12 @@ async def _show_sub_list(message, context, active: bool, page: int = 0):
               AND expires_at <= ?
               AND is_active = 1
         """, (now,))
-        conn.commit()
+        _conn.commit()
+        _conn.close()
 
+    _conn2, _cur2 = get_db()
     if active:
-        cur.execute("""
+        _cur2.execute("""
             SELECT user_id, name, subscription_type, expires_at
             FROM subscribers
             WHERE is_active = 1
@@ -9080,41 +8869,48 @@ async def _show_sub_list(message, context, active: bool, page: int = 0):
             ORDER BY
                 CASE WHEN subscription_type = 'Lifetime' THEN 9999999999 ELSE expires_at END ASC
         """, (now,))
-        header = "✅ *Active Subscriptions*"
+        header     = "✅ *Active Subscriptions*"
         empty_text = "✅ *Active Subscriptions*\n\n_No active subscribers yet._"
     else:
-        cur.execute("""
+        _cur2.execute("""
             SELECT user_id, name, subscription_type, expires_at
             FROM subscribers
             WHERE is_active = 0
                OR (subscription_type != 'Lifetime' AND expires_at <= ?)
             ORDER BY expires_at ASC
         """, (now,))
-        header = "❌ *Inactive Subscriptions*"
+        header     = "❌ *Inactive Subscriptions*"
         empty_text = "❌ *Inactive Subscriptions*\n\n_No inactive subscribers._"
 
-    rows = cur.fetchall()
+    rows = _cur2.fetchall()
+    _conn2.close()
+
     keyboard = []
 
     if not rows:
-        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="HOME_MANAGE_SUBSCRIBERS")])
-        await message.edit_text(empty_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        keyboard.append([
+            InlineKeyboardButton("⬅️ Back", callback_data="HOME_MANAGE_SUBSCRIBERS")
+        ])
+        await message.edit_text(
+            empty_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
         return
 
     PER_PAGE = 10
     total = len(rows)
     pages = (total - 1) // PER_PAGE + 1
-    page = max(0, min(page, pages - 1))
+    page  = max(0, min(page, pages - 1))
 
     start = page * PER_PAGE
-    end = start + PER_PAGE
-    page_rows = rows[start:end]
+    end   = start + PER_PAGE
 
-    for user_id, name, s_type, expires_at in page_rows:
+    for user_id, name, s_type, expires_at in rows[start:end]:
         if s_type == "Lifetime":
             badge = "Lifetime"
         elif expires_at and expires_at > now:
-            days = (expires_at - now) // 86400
+            days  = (expires_at - now) // 86400
             badge = f"{days}d left"
         else:
             badge = "Expired"
@@ -9137,10 +8933,12 @@ async def _show_sub_list(message, context, active: bool, page: int = 0):
             nav.append(InlineKeyboardButton("Next ▶", callback_data=f"SUB_LIST_NEXT|{list_type}"))
         keyboard.append(nav)
 
-    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="HOME_MANAGE_SUBSCRIBERS")])
+    keyboard.append([
+        InlineKeyboardButton("⬅️ Back", callback_data="HOME_MANAGE_SUBSCRIBERS")
+    ])
 
     context.user_data["sub_list_type"] = list_type
-    context.user_data["sub_list_page"] = page
+    context.user_data["sub_list_page"]  = page
 
     await message.edit_text(
         header,
@@ -9149,10 +8947,6 @@ async def _show_sub_list(message, context, active: bool, page: int = 0):
     )
 
 async def sub_overview(update, context):
-    """
-    Shows full details of one subscriber.
-    Buttons: [Revoke] [Renew] [Back]
-    """
     query = update.callback_query
     await query.answer()
 
@@ -9161,12 +8955,13 @@ async def sub_overview(update, context):
 
     now = int(time.time())
 
-    cur.execute("""
+    _conn, _cur = get_db()
+    _cur.execute("""
         SELECT user_id, name, subscription_type, expires_at, is_active, subscribed_at
-        FROM subscribers
-        WHERE user_id = ?
+        FROM subscribers WHERE user_id=?
     """, (target_id,))
-    row = cur.fetchone()
+    row = _cur.fetchone()
+    _conn.close()
 
     if not row:
         await query.answer("❌ Subscriber not found.", show_alert=True)
@@ -9174,22 +8969,24 @@ async def sub_overview(update, context):
 
     user_id, name, s_type, expires_at, is_active, subscribed_at = row
 
-    # ── Subscription Date ──────────────────────────────────────
     if subscribed_at and subscribed_at > 0:
-        sub_date = datetime.datetime.fromtimestamp(subscribed_at, datetime.timezone.utc).strftime("%B %d, %Y")
+        sub_date = datetime.datetime.fromtimestamp(
+            subscribed_at, datetime.timezone.utc
+        ).strftime("%B %d, %Y")
         sub_date_label = "Last Renewed"
     else:
         sub_date = "—"
         sub_date_label = "Subscribed"
 
-    # ── Days Remaining ─────────────────────────────────────
     if not is_active:
         remaining_text = "0 days (Revoked)"
     elif s_type == "Lifetime":
         remaining_text = "Lifetime (no expiry)"
     elif expires_at and expires_at > now:
         days = (expires_at - now) // 86400
-        expiry_date = datetime.datetime.fromtimestamp(expires_at, datetime.timezone.utc).strftime("%B %d, %Y")
+        expiry_date = datetime.datetime.fromtimestamp(
+            expires_at, datetime.timezone.utc
+        ).strftime("%B %d, %Y")
         remaining_text = f"{days} day(s) (expires {expiry_date})"
     else:
         remaining_text = "Expired"
@@ -9213,12 +9010,13 @@ async def sub_overview(update, context):
     keyboard = InlineKeyboardMarkup([
         [
             action_button,
-            InlineKeyboardButton("🔄 Renew",   callback_data=f"SUB_RENEW|{user_id}"),
-            InlineKeyboardButton("⬅️ Back",    callback_data=back_cb),
+            InlineKeyboardButton("🔄 Renew", callback_data=f"SUB_RENEW|{user_id}"),
+            InlineKeyboardButton("⬅️ Back",  callback_data=back_cb),
         ]
     ])
 
     await query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
 
 
 async def sub_renew(update, context):
@@ -9230,8 +9028,10 @@ async def sub_renew(update, context):
     context.user_data["sub_renew_id"] = target_id
 
     # Pre-fill name so sub_apply_duration can use it
-    cur.execute("SELECT name FROM subscribers WHERE user_id=?", (target_id,))
-    row = cur.fetchone()
+    _conn, _cur = get_db()
+    _cur.execute("SELECT name FROM subscribers WHERE user_id=?", (target_id,))
+    row = _cur.fetchone()
+    _conn.close()
     name = row[0] if row else str(target_id)
     context.user_data["sub_new_name"] = name
     context.user_data["sub_new_user_id"] = target_id
@@ -9258,8 +9058,10 @@ async def sub_revoke_confirm(update, context):
 
     target_id = int(query.data.split("|", 1)[1])
 
-    cur.execute("SELECT name FROM subscribers WHERE user_id=?", (target_id,))
-    row = cur.fetchone()
+    _conn, _cur = get_db()
+    _cur.execute("SELECT name FROM subscribers WHERE user_id=?", (target_id,))
+    row = _cur.fetchone()
+    _conn.close()
     name = row[0] if row else str(target_id)
 
     context.user_data["sub_revoke_id"] = target_id
@@ -9287,12 +9089,14 @@ async def sub_revoke_apply(update, context):
 
     try:
         async with DB_LOCK:
-            cur.execute("""
+            _conn, _cur = get_db()
+            _cur.execute("""
                 UPDATE subscribers
                 SET is_active = 0, expires_at = 0
                 WHERE user_id = ?
             """, (target_id,))
-            conn.commit()
+            _conn.commit()
+            _conn.close()
     except Exception as e:
         print("⚠️ Revoke failed:", e)
         return
@@ -9313,8 +9117,10 @@ async def auto_expire_subscribers(context):
     ONE_YEAR = 365 * 24 * 3600
 
     async with DB_LOCK:
+        _conn, _cur = get_db()
+
         # Step 1: Mark overdue active subscriptions as inactive
-        cur.execute("""
+        _cur.execute("""
             UPDATE subscribers
             SET is_active = 0
             WHERE subscription_type != 'Lifetime'
@@ -9322,50 +9128,44 @@ async def auto_expire_subscribers(context):
               AND expires_at <= ?
               AND is_active = 1
         """, (now,))
-        conn.commit()
+        _conn.commit()
 
         # Step 2: Find inactive subscribers who expired more than 1 year ago
         cutoff = now - ONE_YEAR
-        cur.execute("""
+        _cur.execute("""
             SELECT user_id FROM subscribers
             WHERE is_active = 0
               AND expires_at > 0
               AND expires_at <= ?
         """, (cutoff,))
-        stale_users = [row[0] for row in cur.fetchall()]
+        stale_users = [row[0] for row in _cur.fetchall()]
 
         for uid in stale_users:
             print(f"🗑 Auto-purging data for inactive user {uid} (expired >1 year ago)")
 
-            # Delete quiz question links
-            cur.execute("""
+            _cur.execute("""
                 DELETE FROM quiz_question_links
                 WHERE quiz_id IN (
                     SELECT quiz_id FROM quizzes WHERE owner_id=?
                 )
             """, (uid,))
 
-            # Delete quizzes
-            cur.execute("DELETE FROM quizzes WHERE owner_id=?", (uid,))
+            _cur.execute("DELETE FROM quizzes WHERE owner_id=?", (uid,))
 
-            # Delete quiz folders
-            cur.execute("DELETE FROM folders WHERE owner_id=?", (uid,))
+            _cur.execute("DELETE FROM folders WHERE owner_id=?", (uid,))
 
-            # Get question bank folder IDs for this user
-            cur.execute("SELECT id FROM question_bank_folders WHERE owner_id=?", (uid,))
-            qb_folder_ids = [row[0] for row in cur.fetchall()]
+            _cur.execute("SELECT id FROM question_bank_folders WHERE owner_id=?", (uid,))
+            qb_folder_ids = [row[0] for row in _cur.fetchall()]
 
             for fid in qb_folder_ids:
-                # Delete questions in each folder
-                cur.execute("DELETE FROM question_bank WHERE folder_id=?", (fid,))
+                _cur.execute("DELETE FROM question_bank WHERE folder_id=?", (fid,))
 
-            # Delete question bank folders
-            cur.execute("DELETE FROM question_bank_folders WHERE owner_id=?", (uid,))
+            _cur.execute("DELETE FROM question_bank_folders WHERE owner_id=?", (uid,))
 
-            # Delete the subscriber record itself
-            cur.execute("DELETE FROM subscribers WHERE user_id=?", (uid,))
+            _cur.execute("DELETE FROM subscribers WHERE user_id=?", (uid,))
 
-        conn.commit()
+        _conn.commit()
+        _conn.close()
 
 async def subscriber_agree_notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the subscriber tapping 'I Agree' on the first-access notice."""
@@ -9377,11 +9177,13 @@ async def subscriber_agree_notice(update: Update, context: ContextTypes.DEFAULT_
     # Mark notice as acknowledged in DB
     try:
         async with DB_LOCK:
-            cur.execute(
+            _conn, _cur = get_db()
+            _cur.execute(
                 "UPDATE subscribers SET needs_notice=0 WHERE user_id=?",
                 (user_id,)
             )
-            conn.commit()
+            _conn.commit()
+            _conn.close()
     except Exception as e:
         print("⚠️ Failed to clear notice flag:", e)
 
@@ -9436,14 +9238,18 @@ async def sub_delete(update, context):
 
     target_id = int(query.data.split("|", 1)[1])
 
-    cur.execute("SELECT name FROM subscribers WHERE user_id=?", (target_id,))
-    row = cur.fetchone()
+    _conn, _cur = get_db()
+    _cur.execute("SELECT name FROM subscribers WHERE user_id=?", (target_id,))
+    row = _cur.fetchone()
+    _conn.close()
     name = row[0] if row else str(target_id)
 
     try:
         async with DB_LOCK:
-            cur.execute("DELETE FROM subscribers WHERE user_id=?", (target_id,))
-            conn.commit()
+            _conn, _cur = get_db()
+            _cur.execute("DELETE FROM subscribers WHERE user_id=?", (target_id,))
+            _conn.commit()
+            _conn.close()
     except Exception as e:
         print("⚠️ Failed to delete subscriber:", e)
         await flash_message(context.bot, query.message.chat_id, "❌ Delete failed.")
@@ -9458,9 +9264,10 @@ async def sub_delete(update, context):
 # load_owner_from_db()
 ensure_default_folder()
 ensure_default_qb_folder()
+ensure_all_subscriber_default_folders()
 ensure_indexes()
-restore_group_lb_messages()
 fix_leaderboard_key_format()
+restore_group_lb_messages()
 
 from telegram.ext import ApplicationBuilder
 
