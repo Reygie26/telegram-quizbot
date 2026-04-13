@@ -16,6 +16,8 @@ import datetime
 from telegram.ext import ApplicationHandlerStop
 from telegram import InputMediaPhoto
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import SwitchInlineQueryChosenChat
+from telegram.ext import ChosenInlineResultHandler
 
 from telegram import (
     Update,
@@ -753,6 +755,11 @@ async def create_quiz(update_or_message, context: ContextTypes.DEFAULT_TYPE):
 # TEXT HANDLER
 # =========================
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 🔒 Ignore channel posts forwarded to groups
+    if update.effective_user is None:
+        return
+    if update.effective_chat and update.effective_chat.type in ("channel",):
+        return
     if context.user_data.get("add_q_state"):
         context.user_data.setdefault("question_flow_msgs", []).append(update.message.message_id)
 
@@ -839,6 +846,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 🔒 Ignore channel posts forwarded to groups
+    if update.effective_user is None:
+        return
+    if update.effective_chat and update.effective_chat.type in ("channel",):
+        return
     # Track user message
     context.user_data.setdefault("chat_messages", []).append(update.message.message_id)
 
@@ -1861,6 +1873,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.get_chat(new_user_id)
         except Exception:
+            # 🧹 Delete the old prompt message
+            old_prompt_id = context.user_data.pop("sub_prompt_id", None)
+            if old_prompt_id:
+                try:
+                    await context.bot.delete_message(chat_id, old_prompt_id)
+                except:
+                    pass
+
+            # 🧹 Delete the user's typed invalid ID message
+            try:
+                await context.bot.delete_message(chat_id, update.message.message_id)
+            except:
+                pass
+
+            # Send new error prompt
             err = await context.bot.send_message(
                 chat_id,
                 f"❌ User ID `{new_user_id}` not found on Telegram.\n\nPlease send a valid User ID:",
@@ -4419,6 +4446,12 @@ async def play_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🔴 HARD ASYNC BOUNDARY
     await asyncio.sleep(0)
 
+    # ✅ Always reset advancing flag before calling advance_quiz
+    # This prevents the quiz from freezing if a previous timer left it stuck True
+    play = context.user_data.get("play")
+    if play:
+        play["advancing"] = False
+
     # ▶️ Advance quiz safely
     await advance_quiz(query.from_user.id, context)
 
@@ -4696,20 +4729,28 @@ async def countdown_timer(user_id, context, seconds, play):
         # =========================
         # ▶️ Advance Safely (guard against race with answer button)
         # =========================
-        # Re-check locked state one final time before advancing
         play = context.user_data.get("play")
-        if not play or play.get("advancing") or play.get("finished"):
+        if not play or play.get("finished"):
             return
 
+        # ✅ Do NOT hold context_lock while calling advance_quiz —
+        # advance_quiz acquires the same lock and asyncio.Lock is NOT reentrant.
+        # Instead: check advancing, set it, release lock, then call advance_quiz.
+        acquired = False
         async with play["context_lock"]:
             if play.get("advancing") or play.get("finished"):
                 return
             play["advancing"] = True
+            acquired = True
+
+        if not acquired:
+            return
 
         if play["index"] >= len(play["questions"]) - 1:
             play["advancing"] = False
             await finish_quiz(user_id, context)
         else:
+            play["advancing"] = False   # ← release BEFORE calling advance_quiz
             await advance_quiz(user_id, context)
 
     except asyncio.CancelledError:
@@ -4790,9 +4831,9 @@ async def send_quiz_to_group(chat_id, quiz_id, context, token):
     total_questions = _cur2.fetchone()[0]
     _conn2.close()
 
-    text = f"📘 *{title}*\n"
+    text = f"📘 *{escape_md(title)}*\n"
     if desc:
-        text += f"📝 _{desc}_\n"
+        text += f"📝 _{escape_md(desc)}_\n"
     text += "\n"
     text += f"🧠 *{total_questions} Questions* • ⏱ *{timer}s*\n"
     text += (
@@ -4856,9 +4897,9 @@ def build_group_quiz_text(leaderboard_key, page=0):
     total_questions = _cur2.fetchone()[0]
     _conn2.close()
 
-    text = f"📘 *{title}*\n"
+    text = f"📘 *{escape_md(title)}*\n"
     if desc:
-        text += f"📝 _{desc}_\n"
+        text += f"📝 _{escape_md(desc)}_\n"
     text += "\n"
     text += f"🧠 *{total_questions} Questions* • ⏱ *{timer}s*\n"
     text += (
@@ -4934,14 +4975,26 @@ async def update_group_leaderboard(leaderboard_key, context):
     # 🔑 Build keyboard from single source of truth
     keyboard = build_group_post_keyboard(quiz_id, token, leaderboard_key, pages=pages, page=page)
 
+    inline_message_id = info.get("inline_message_id")
+
     try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-            reply_markup=keyboard,
-            parse_mode="Markdown"
-        )
+        if inline_message_id:
+            # Posted via inline query — edit using inline_message_id
+            await context.bot.edit_message_text(
+                inline_message_id=inline_message_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+        else:
+            # Posted via /post command — edit using chat_id + message_id
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
     except Exception as e:
         error_text = str(e).lower()
 
@@ -5028,7 +5081,7 @@ async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     # 🔑 Generate a unique token every time
-    token = secrets.token_urlsafe(8)
+    token = secrets.token_hex(6)
     timestamp = int(time.time())
 
     # 💾 Save token safely (WRITE LOCK)
@@ -5050,20 +5103,179 @@ async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await flash_message(context.bot, query.message.chat_id, "❌ Failed to generate post link.")
         return
 
-    # 📤 Send unique post command to admin
+    # 📤 Send unique post command to admin — use a code block so Telegram
+    # does NOT execute it as a live command, and the user can copy it cleanly.
     msg = await query.message.reply_text(
-        f"/post {quiz_id}_{token}"
+        f"📋 Copy and send this command in your group:\n\n"
+        f"`/post {quiz_id}::{token}`",
+        parse_mode="Markdown"
     )
 
-    # ⏳ Auto-delete the message after 5 seconds
+    # ⏳ Auto-delete the message after 60 seconds (more time to copy)
     async def delete_later():
-        await asyncio.sleep(5)
+        await asyncio.sleep(60)
         try:
             await msg.delete()
         except Exception:
             pass
 
     asyncio.create_task(delete_later())
+
+async def inline_query_post_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Fires when the owner picks a group via the switch_inline_query_chosen_chat button.
+    Telegram sends an inline query with the payload; we respond with the quiz card.
+    The chosen_inline_result handler then fires to actually persist the leaderboard.
+    """
+    inline_query = update.inline_query
+    if not inline_query:
+        return
+
+    query_text = inline_query.query.strip()
+
+    # Only handle our POST_ payloads
+    if not query_text.startswith("POST_"):
+        await inline_query.answer([], cache_time=0)
+        return
+
+    try:
+        _, quiz_id, token = query_text.split("_", 2)
+    except ValueError:
+        await inline_query.answer([], cache_time=0)
+        return
+
+    # Fetch quiz info for the card preview
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT title, description, timer, shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
+        (quiz_id,)
+    )
+    row = _cur.fetchone()
+    _conn.close()
+
+    if not row:
+        await inline_query.answer([], cache_time=0)
+        return
+
+    title, desc, timer, sq, sa = row
+
+    _conn2, _cur2 = get_db()
+    _cur2.execute("SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?", (quiz_id,))
+    total_questions = _cur2.fetchone()[0]
+    _conn2.close()
+
+    text = f"📘 *{escape_md(title)}*\n"
+    if desc:
+        text += f"📝 _{escape_md(desc)}_\n"
+    text += "\n"
+    text += f"🧠 *{total_questions} Questions* • ⏱ *{timer}s*\n"
+    text += (
+        f"🔀 Questions: {'ON' if sq else 'OFF'} • "
+        f"Answers: {'ON' if sa else 'OFF'}\n\n"
+    )
+    text += "🏆 *Leaderboard*\n— No attempts yet —"
+
+    leaderboard_key = make_leaderboard_key(quiz_id, token)
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "▶️ Start Quiz",
+                url=f"https://t.me/{BOT_USERNAME}?start=PLAY_{quiz_id}_{token}"
+            )
+        ]
+    ])
+
+    result = InlineQueryResultArticle(
+        id=token,
+        title=f"📘 {title}",
+        description=f"{total_questions} questions • {timer}s timer",
+        input_message_content=InputTextMessageContent(
+            message_text=text,
+            parse_mode="Markdown"
+        ),
+        reply_markup=keyboard,
+    )
+
+    await inline_query.answer(
+        results=[result],
+        cache_time=0,
+        is_personal=True,
+    )
+
+
+async def chosen_inline_result_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Fires after the owner selects the quiz card from the inline results and
+    Telegram confirms it was sent to the group.
+    We use this to register the leaderboard and persist the group message info.
+    """
+    result = update.chosen_inline_result
+    if not result:
+        return
+
+    inline_message_id = result.inline_message_id
+    query_text = result.query.strip()
+
+    if not query_text.startswith("POST_"):
+        return
+
+    try:
+        _, quiz_id, token = query_text.split("_", 2)
+    except ValueError:
+        return
+
+    leaderboard_key = make_leaderboard_key(quiz_id, token)
+
+    # We don't have chat_id/message_id from chosen_inline_result,
+    # so we store the inline_message_id instead and use edit_message_text
+    # for inline messages going forward.
+    GROUP_LEADERBOARDS[leaderboard_key] = {}
+
+    GROUP_LB_MESSAGES[leaderboard_key] = {
+        "quiz_id": quiz_id,
+        "token": token,
+        "chat_id": None,             # Not available for inline messages
+        "message_id": None,
+        "inline_message_id": inline_message_id,
+        "page": 0,
+    }
+
+    # Persist to DB (use inline_message_id as a stand-in for message_id)
+    try:
+        async with DB_LOCK:
+            _conn, _cur = get_db()
+            _cur.execute("""
+                INSERT OR REPLACE INTO group_lb_messages
+                (leaderboard_key, quiz_id, token, chat_id, message_id, page)
+                VALUES (?, ?, ?, ?, ?, 0)
+            """, (leaderboard_key, quiz_id, token, 0, 0))
+            _conn.commit()
+            _conn.close()
+    except Exception as e:
+        print("⚠️ Failed to persist inline lb message:", e)
+
+    # Clean up the post prompt message in the admin's DM
+    prompt_id = context.user_data.pop("post_quiz_prompt_msg_id", None)
+    if prompt_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=result.from_user.id,
+                message_id=prompt_id
+            )
+        except:
+            pass
+
+    # Flash confirmation to the admin
+    try:
+        confirm = await context.bot.send_message(
+            chat_id=result.from_user.id,
+            text="✅ Quiz posted to group successfully!"
+        )
+        await asyncio.sleep(3)
+        await confirm.delete()
+    except:
+        pass
 
 async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -5080,13 +5292,13 @@ async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Missing quiz post token.")
         return
 
-    payload = args[0]
+    # Join all args in case Telegram or the client split the payload on spaces
+    payload = "".join(args)
 
-    try:
-        quiz_id, token = payload.rsplit("_", 1)
-    except ValueError:
+    if "::" not in payload:
         await update.message.reply_text("❌ Invalid post command format.")
         return
+    quiz_id, token = payload.split("::", 1)
 
     if not is_authorized(user_id):
         warn_msg = await update.message.reply_text("❌ Only the Bot Admin can post quizzes.")
@@ -5103,13 +5315,20 @@ async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(delete_later())
         return
 
-    _conn, _cur = get_db()
-    _cur.execute(
-        "SELECT token FROM quiz_post_tokens WHERE token=? AND quiz_id=?",
-        (token, quiz_id)
-    )
-    row = _cur.fetchone()
-    _conn.close()
+    # 🔄 Retry up to 5× with 1s delay — handles race condition where
+    # the token DB write hasn't committed yet when this handler fires.
+    row = None
+    for attempt in range(5):
+        _conn, _cur = get_db()
+        _cur.execute(
+            "SELECT token FROM quiz_post_tokens WHERE token=? AND quiz_id=?",
+            (token, quiz_id)
+        )
+        row = _cur.fetchone()
+        _conn.close()
+        if row:
+            break
+        await asyncio.sleep(1)
 
     if not row:
         warn_msg = await update.message.reply_text("❌ This quiz post command is invalid or expired.")
@@ -6825,9 +7044,10 @@ async def cancel_edit_question_options(update: Update, context: ContextTypes.DEF
 
 async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    current_msg_id = update.message.message_id
 
     # Track /clear message itself
-    context.user_data.setdefault("chat_messages", []).append(update.message.message_id)
+    context.user_data.setdefault("chat_messages", []).append(current_msg_id)
 
     # 🔒 Block /clear during an active quiz to prevent corruption
     if context.user_data.get("play"):
@@ -6846,21 +7066,37 @@ async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    message_ids = context.user_data.get("chat_messages", [])
+    # ── Collect ALL known tracked message IDs ──────────────────────────
+    tracked = set(context.user_data.get("chat_messages", []))
+    tracked.update(context.user_data.get("question_flow_msgs", []))
 
-    # Delete all stored messages
-    for msg_id in message_ids:
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-        except:
-            pass
+    preview_id = context.user_data.get("question_preview_msg_id")
+    if preview_id:
+        tracked.add(preview_id)
 
-    # Preserve critical session keys before clearing
+    play = context.user_data.get("play")
+    if play:
+        for mid in play.get("question_message_ids", []):
+            tracked.add(mid)
+        for mid in play.get("timer_message_ids", []):
+            tracked.add(mid)
+
+    # ── Also scan backwards up to 200 messages from current position ──
+    # This catches any bot messages that were never tracked
+    scan_range = range(current_msg_id, max(1, current_msg_id - 200), -1)
+    all_ids = tracked | set(scan_range)
+
+    # ── Delete everything ──────────────────────────────────────────────
+    delete_tasks = [
+        context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        for mid in all_ids
+    ]
+    if delete_tasks:
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+    # ── Preserve critical session keys before clearing ─────────────────
     active_user_id = context.user_data.get("active_user_id")
-
     context.user_data.clear()
-
-    # Restore critical session keys
     if active_user_id:
         context.user_data["active_user_id"] = active_user_id
 
@@ -7006,11 +7242,19 @@ async def show_db_questions_from_message(message, context):
     else:
         keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")])
 
-    await message.edit_text(
-        f"📁 **{folder_name}**\n\nSelect a question:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
+    try:
+        await message.edit_text(
+            f"📁 {folder_name}\n\nSelect a question:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    except Exception:
+        try:
+            await message.edit_text(
+                f"📁 {folder_name}\n\nSelect a question:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        except Exception:
+            pass
 
 async def move_q_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -9257,6 +9501,35 @@ async def sub_delete(update, context):
     await flash_message(context.bot, query.message.chat_id, f"🗑 {name} removed from subscribers.")
     await home_manage_subscribers_from_message(query.message, context)
 
+async def cancel_post_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+
+    # Clean up the pending token from DB to avoid orphaned tokens
+    quiz_id = context.user_data.pop("pending_post_quiz_id", None)
+    token   = context.user_data.pop("pending_post_token", None)
+    if quiz_id and token:
+        try:
+            async with DB_LOCK:
+                _conn, _cur = get_db()
+                _cur.execute(
+                    "DELETE FROM quiz_post_tokens WHERE token=? AND quiz_id=?",
+                    (token, quiz_id)
+                )
+                _conn.commit()
+                _conn.close()
+        except:
+            pass
+
+    context.user_data.pop("post_quiz_prompt_msg_id", None)
+
+    try:
+        await query.message.delete()
+    except:
+        pass
+
 # =========================
 # HANDLERS
 # =========================
@@ -9293,6 +9566,9 @@ app.add_handler(CommandHandler("post", post_quiz_command))
 app.add_handler(CallbackQueryHandler(global_quiz_guard), group=-1)
 # =========================
 app.add_handler(CommandHandler("refresh", refresh_command))
+app.add_handler(InlineQueryHandler(inline_query_post_quiz))
+app.add_handler(ChosenInlineResultHandler(chosen_inline_result_handler))
+app.add_handler(CallbackQueryHandler(cancel_post_quiz, pattern="^CANCEL_POST_QUIZ$"))
 app.add_handler(CallbackQueryHandler(home_manage_subscribers, pattern="^HOME_MANAGE_SUBSCRIBERS$"))
 app.add_handler(CallbackQueryHandler(sub_add_start,           pattern="^SUB_ADD$"))
 app.add_handler(CallbackQueryHandler(sub_apply_duration,      pattern="^SUB_DURATION\\|"))
