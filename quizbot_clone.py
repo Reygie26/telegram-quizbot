@@ -5084,7 +5084,7 @@ async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     token = secrets.token_hex(6)
     timestamp = int(time.time())
 
-    # 💾 Save token safely (WRITE LOCK)
+    # 💾 Save token to DB
     try:
         async with DB_LOCK:
             _conn, _cur = get_db()
@@ -5097,23 +5097,44 @@ async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             _conn.commit()
             _conn.close()
-
     except Exception as e:
         print("⚠️ Failed to save post token:", e)
         await flash_message(context.bot, query.message.chat_id, "❌ Failed to generate post link.")
         return
 
-    # 📤 Send unique post command to admin — use a code block so Telegram
-    # does NOT execute it as a live command, and the user can copy it cleanly.
+    # 📤 Build the inline share button — tapping it opens Telegram's group picker
+    share_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📤 Share to Group",
+                switch_inline_query_chosen_chat=SwitchInlineQueryChosenChat(
+                    query=f"POST_{quiz_id}_{token}",
+                    allow_group_chats=True,
+                    allow_channel_posts=False,
+                    allow_bot_chats=False,
+                    allow_user_chats=False,
+                )
+            )
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_POST_QUIZ")
+        ]
+    ])
+
     msg = await query.message.reply_text(
-        f"📋 Copy and send this command in your group:\n\n"
-        f"`/post {quiz_id}::{token}`",
+        "📤 *Post this Quiz to a Group*\n\n"
+        "Tap the button below, then choose which group to share it to.\n\n"
+        "⚠️ Make sure the bot is already added to that group.",
+        reply_markup=share_keyboard,
         parse_mode="Markdown"
     )
 
-    # ⏳ Auto-delete the message after 60 seconds (more time to copy)
+    # 🔑 Store this message ID so chosen_inline_result_handler can delete it
+    context.user_data["post_quiz_prompt_msg_id"] = msg.message_id
+
+    # ⏳ Auto-delete after 5 minutes if not used
     async def delete_later():
-        await asyncio.sleep(60)
+        await asyncio.sleep(300)
         try:
             await msg.delete()
         except Exception:
