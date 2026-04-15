@@ -149,23 +149,24 @@ def ensure_indexes():
 def restore_group_lb_messages():
     _conn, _cur = get_db()
     _cur.execute("""
-        SELECT leaderboard_key, quiz_id, token, chat_id, message_id, page
+        SELECT leaderboard_key, quiz_id, token, chat_id, message_id, page, inline_message_id
         FROM group_lb_messages
     """)
     rows = _cur.fetchall()
     _conn.close()
 
     restored = 0
-    for leaderboard_key, quiz_id, token, chat_id, message_id, page in rows:
+    for leaderboard_key, quiz_id, token, chat_id, message_id, page, inline_message_id in rows:
         # Rebuild the key from quiz_id + token to guarantee format consistency
         rebuilt_key = make_leaderboard_key(quiz_id, token)
 
         GROUP_LB_MESSAGES[rebuilt_key] = {
-            "quiz_id":    quiz_id,
-            "token":      token,
-            "chat_id":    chat_id,
-            "message_id": message_id,
-            "page":       page,
+            "quiz_id":           quiz_id,
+            "token":             token,
+            "chat_id":           chat_id,
+            "message_id":        message_id,
+            "page":              page,
+            "inline_message_id": inline_message_id,
         }
         restored += 1
 
@@ -444,15 +445,23 @@ CREATE TABLE IF NOT EXISTS group_leaderboard (
 
     _cur.execute("""
 CREATE TABLE IF NOT EXISTS group_lb_messages (
-    leaderboard_key TEXT PRIMARY KEY,
-    quiz_id         TEXT,
-    token           TEXT,
-    chat_id         INTEGER,
-    message_id      INTEGER,
-    page            INTEGER DEFAULT 0
+    leaderboard_key  TEXT PRIMARY KEY,
+    quiz_id          TEXT,
+    token            TEXT,
+    chat_id          INTEGER,
+    message_id       INTEGER,
+    page             INTEGER DEFAULT 0,
+    inline_message_id TEXT
 )
 """)
     _conn.commit()
+
+    # Safe migration — ignored if column already exists
+    try:
+        _cur.execute("ALTER TABLE group_lb_messages ADD COLUMN inline_message_id TEXT")
+        _conn.commit()
+    except Exception:
+        pass
 
     _cur.execute("""
 CREATE TABLE IF NOT EXISTS subscribers (
@@ -647,7 +656,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("✅ I Agree", callback_data="SUB_AGREE_NOTICE")]
             ])
             msg = await update.message.reply_text(
-                "🧠 **Welcome to TeleQuiz Admin Panel**\n\n"
+                "🧠 **Welcome to TeleQuiz (Admin Panel)**\n\n"
                 "⚠️ *Important Notice*\n\n"
                 "All folders, quizzes, and questions you create are tied to your subscription. "
                 "If your subscription becomes inactive and is not renewed within 1 year, "
@@ -671,7 +680,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
 
         msg = await update.message.reply_text(
-            "🧠 **Welcome to TeleQuiz (Admin Panel)**\n\nPlease choose an option to start 👇:",
+            "🧠 Welcome to TeleQuiz (Admin Panel)\n\nPlease choose an option to start 👇:",
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
@@ -704,7 +713,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     msg = await update.message.reply_text(
-        "🧠 **Welcome to TeleQuiz (Bot creator Panel)\nA smart Telegram Quiz Bot designed to make quizzes organized, competitive and fun**\n\nPlease choose an option to start 👇:",
+        "🧠 Welcome to TeleQuiz (Bot Creator Panel)\n\nPlease choose an option to start 👇:",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
@@ -3194,7 +3203,7 @@ async def go_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
 
     await query.message.edit_text(
-        "🏠 Home Menu",
+        "🧠 Welcome to TeleQuiz (Admin Panel)\n\nPlease choose an option to start 👇:",
         reply_markup=InlineKeyboardMarkup(rows)
     )
 
@@ -5026,7 +5035,7 @@ async def update_group_leaderboard(leaderboard_key, context):
 async def refresh_all_group_posts_for_quiz(quiz_id: str, context):
     _conn, _cur = get_db()
     _cur.execute(
-        "SELECT leaderboard_key, chat_id, message_id, page FROM group_lb_messages WHERE quiz_id=?",
+        "SELECT leaderboard_key, chat_id, message_id, page, inline_message_id FROM group_lb_messages WHERE quiz_id=?",
         (quiz_id,)
     )
     posts = _cur.fetchall()
@@ -5035,7 +5044,7 @@ async def refresh_all_group_posts_for_quiz(quiz_id: str, context):
     if not posts:
         return
 
-    for leaderboard_key, chat_id, message_id, page in posts:
+    for leaderboard_key, chat_id, message_id, page, inline_message_id in posts:
         text, pages = build_group_quiz_text(leaderboard_key, page)
 
         try:
@@ -5046,13 +5055,21 @@ async def refresh_all_group_posts_for_quiz(quiz_id: str, context):
         keyboard = build_group_post_keyboard(quiz_id, token, leaderboard_key, pages=pages, page=page)
 
         try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                reply_markup=keyboard,
-                parse_mode="Markdown"
-            )
+            if inline_message_id:
+                await context.bot.edit_message_text(
+                    inline_message_id=inline_message_id,
+                    text=text,
+                    reply_markup=keyboard,
+                    parse_mode="Markdown"
+                )
+            else:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    reply_markup=keyboard,
+                    parse_mode="Markdown"
+                )
         except Exception as e:
             error_text = str(e).lower()
             if "message is not modified" in error_text:
@@ -5110,7 +5127,6 @@ async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 switch_inline_query_chosen_chat=SwitchInlineQueryChosenChat(
                     query=f"POST_{quiz_id}_{token}",
                     allow_group_chats=True,
-                    allow_channel_posts=False,
                     allow_bot_chats=False,
                     allow_user_chats=False,
                 )
@@ -5262,15 +5278,15 @@ async def chosen_inline_result_handler(update: Update, context: ContextTypes.DEF
         "page": 0,
     }
 
-    # Persist to DB (use inline_message_id as a stand-in for message_id)
+    # Persist to DB — store inline_message_id so refreshes can use it
     try:
         async with DB_LOCK:
             _conn, _cur = get_db()
             _cur.execute("""
                 INSERT OR REPLACE INTO group_lb_messages
-                (leaderboard_key, quiz_id, token, chat_id, message_id, page)
-                VALUES (?, ?, ?, ?, ?, 0)
-            """, (leaderboard_key, quiz_id, token, 0, 0))
+                (leaderboard_key, quiz_id, token, chat_id, message_id, page, inline_message_id)
+                VALUES (?, ?, ?, ?, ?, 0, ?)
+            """, (leaderboard_key, quiz_id, token, 0, 0, inline_message_id))
             _conn.commit()
             _conn.close()
     except Exception as e:
@@ -9471,7 +9487,7 @@ async def subscriber_agree_notice(update: Update, context: ContextTypes.DEFAULT_
 
     msg = await context.bot.send_message(
         chat_id=query.message.chat_id,
-        text="🧠 **Welcome to TeleQuiz (Admin Panel)**\n\nPlease choose an option to start 👇:",
+        text="🧠 Welcome to TeleQuiz (Admin Panel)\n\nPlease choose an option to start 👇:",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
