@@ -16,8 +16,6 @@ import datetime
 from telegram.ext import ApplicationHandlerStop
 from telegram import InputMediaPhoto
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
-from telegram import SwitchInlineQueryChosenChat
-from telegram.ext import ChosenInlineResultHandler
 
 from telegram import (
     Update,
@@ -35,13 +33,8 @@ from telegram.ext import (
     filters,
 )
 
-from telegram.ext import InlineQueryHandler
-from telegram import InlineQueryResultArticle, InputTextMessageContent
-
 import random
 from difflib import SequenceMatcher
-
-
 
 ##### =============================================================================================
 ##### BOT TOKEN TO USE
@@ -84,8 +77,12 @@ QUIZ_FOLDERS_PER_PAGE = 5
 PLACEHOLDER_IMAGE_URL = "https://via.placeholder.com/1x1.png"
 PLACEHOLDER_IMAGE_FILE_ID = "AgACAgUAAxkBAAId1GmNwdjStLkxKCsKAodhZXjm9Fc5AAKJDGsbhHpxVPfj2MXOcpF3AQADAgADeQADOgQ"
 DB_LOCK = asyncio.Lock()
-MAX_QUESTION_LENGTH = 500
+MAX_QUESTION_LENGTH = 400
 MAX_OPTION_LENGTH = 200
+MAX_EXPLANATION_LENGTH = 400
+MAX_TITLE_LENGTH = 50
+MAX_DESC_LENGTH = 100
+MAX_FOLDER_NAME_LENGTH = 30
 SUBSCRIPTION_DURATIONS = {
     "Lifetime":   0,
     "1 Year":     365 * 24 * 3600,
@@ -102,17 +99,6 @@ SUBSCRIPTION_DURATIONS = {
 ## =========================
 ## HELPERS
 ## =========================
-
-async def send_tracked_message(update, context, text, **kwargs):
-    msg = await update.effective_chat.send_message(text=text, **kwargs)
-
-    # Store message ID
-    context.user_data.setdefault("chat_messages", []).append(msg.message_id)
-
-    return msg
-
-def track_bot_message(context, message_id):
-    context.user_data.setdefault("bot_messages", set()).add(message_id)
 
 # =========================
 # OWNER RESTORE
@@ -622,6 +608,52 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["chat_messages"].append(msg.message_id)
         return
 
+    # 📤 GROUP POST MODE (admin shared the startgroup link into a group)
+    if context.args and context.args[0].startswith("POST_"):
+        if chat_type not in ("group", "supergroup"):
+            return
+
+        # Format: POST_<quiz_id>_<token>
+        # quiz_id is a UUID (contains hyphens, no underscores)
+        # token is token_hex (only hex chars, no underscores)
+        # So splitting on "_" gives exactly: ["POST", "<uuid-part1>", ..., "<token>"]
+        # We join everything after "POST_" and split at the LAST underscore to isolate the token
+        try:
+            payload = context.args[0][len("POST_"):]   # strip the "POST_" prefix
+            last_underscore = payload.rfind("_")
+            if last_underscore == -1:
+                raise ValueError("No underscore found")
+            quiz_id = payload[:last_underscore]
+            token   = payload[last_underscore + 1:]
+        except (ValueError, IndexError):
+            return
+
+        # 🔒 Only authorized users can trigger a post
+        if not is_authorized(user_id):
+            return
+
+        # 🔍 Verify token exists and belongs to this user
+        _conn_t, _cur_t = get_db()
+        _cur_t.execute(
+            "SELECT owner_id FROM quiz_post_tokens WHERE token=? AND quiz_id=?",
+            (token, quiz_id)
+        )
+        token_row = _cur_t.fetchone()
+        _conn_t.close()
+
+        if not token_row or token_row[0] != user_id:
+            return
+
+        # ✅ Post the quiz to this group
+        await send_quiz_to_group(chat.id, quiz_id, context, token)
+
+        # 🧹 Delete the /start trigger message
+        try:
+            await update.message.delete()
+        except:
+            pass
+        return
+
     # ❌ Block /start inside groups & channels
     if chat_type in ("group", "supergroup", "channel"):
         return
@@ -685,7 +717,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         context.user_data["chat_messages"].append(msg.message_id)
-        track_bot_message(context, msg.message_id)
         return
 
     # ✅ OWNER — show admin home
@@ -720,9 +751,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 🔥 Track admin panel message
     context.user_data["chat_messages"].append(msg.message_id)
-
-    # (Optional — keep if you still use this elsewhere)
-    track_bot_message(context, msg.message_id)
 
 # =========================
 # CREATE QUIZ
@@ -771,9 +799,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if context.user_data.get("add_q_state"):
         context.user_data.setdefault("question_flow_msgs", []).append(update.message.message_id)
-
-    # 🔄 Reset inactivity timer on every photo
-    schedule_declutter(update.effective_user.id, update.effective_chat.id, context)
 
     # ================= EDIT QUESTION IMAGE (QUESTION BANK) =================
     if context.user_data.get("edit_q_field") == "IMAGE":
@@ -863,9 +888,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Track user message
     context.user_data.setdefault("chat_messages", []).append(update.message.message_id)
 
-    # 🔄 Reset inactivity timer on every message
-    schedule_declutter(update.effective_user.id, update.effective_chat.id, context)
-
     # ================= DATABASE TEXT FLOW (HARD ISOLATION) =================
     state = context.user_data.get("state")
     text = update.message.text.strip()
@@ -885,6 +907,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         normalized = folder.strip()
+
+        if len(normalized) > MAX_FOLDER_NAME_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Folder name is too long ({len(normalized)} characters).\n"
+                f"Maximum allowed: {MAX_FOLDER_NAME_LENGTH} characters.\n\nPlease shorten and send again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, update.message.message_id),
+                return_exceptions=True
+            )
+            return
 
         # ❌ Default is reserved
         if normalized.lower() == "default":
@@ -960,6 +995,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ❌ Empty name
         if not new_name:
             await update.message.reply_text("❌ Folder name cannot be empty.")
+            return
+
+        if len(new_name) > MAX_FOLDER_NAME_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Folder name is too long ({len(new_name)} characters).\n"
+                f"Maximum allowed: {MAX_FOLDER_NAME_LENGTH} characters.\n\nPlease shorten and send again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, update.message.message_id),
+                return_exceptions=True
+            )
             return
 
         # ❌ Default is reserved
@@ -1085,6 +1133,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         new_text = update.message.text.strip()
+
+        if len(new_text) > MAX_EXPLANATION_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Explanation is too long ({len(new_text)} characters).\n"
+                f"Maximum allowed: {MAX_EXPLANATION_LENGTH} characters.\n\nPlease shorten and send again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(update.effective_chat.id, err.message_id),
+                context.bot.delete_message(update.effective_chat.id, update.message.message_id),
+                return_exceptions=True
+            )
+            return
+
         chat_id = update.effective_chat.id
 
         # Update DB
@@ -1131,6 +1193,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         qid = context.user_data.get("active_question_id")
         if not qid:
             await update.message.reply_text("❌ No question selected.")
+            return
+
+        if len(text) > MAX_QUESTION_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Question is too long ({len(text)} characters).\n"
+                f"Maximum allowed: {MAX_QUESTION_LENGTH} characters.\n\nPlease shorten and send again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(update.effective_chat.id, err.message_id),
+                context.bot.delete_message(update.effective_chat.id, update.message.message_id),
+                return_exceptions=True
+            )
             return
 
         # 🔑 Update DB
@@ -1405,6 +1480,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ================= EXPLANATION (NEW QUESTION — DO NOT CHANGE) =================
     if q_state == "NEW_Q_EXPLANATION":
+        if len(text) > MAX_EXPLANATION_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Explanation is too long ({len(text)} characters).\n"
+                f"Maximum allowed: {MAX_EXPLANATION_LENGTH} characters.\n\nPlease shorten and send again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(update.effective_chat.id, err.message_id),
+                context.bot.delete_message(update.effective_chat.id, update.message.message_id),
+                return_exceptions=True
+            )
+            return
         context.user_data["new_question"]["explanation"] = text
         await save_new_question(update.message, context)
         return
@@ -1480,6 +1567,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         user_msg_id = update.message.message_id
         folder_name = text.strip()
+
+        if len(folder_name) > MAX_FOLDER_NAME_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Folder name is too long ({len(folder_name)} characters).\n"
+                f"Maximum allowed: {MAX_FOLDER_NAME_LENGTH} characters.\n\nPlease shorten and send again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, user_msg_id),
+                return_exceptions=True
+            )
+            return
 
         if folder_name == "Default":
             await update.message.reply_text("❌ You cannot create a folder named Default.")
@@ -1559,6 +1659,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         old = context.user_data["rename_folder"]
         new = text.strip()
 
+        if len(new) > MAX_FOLDER_NAME_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Folder name is too long ({len(new)} characters).\n"
+                f"Maximum allowed: {MAX_FOLDER_NAME_LENGTH} characters.\n\nPlease shorten and send again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, user_msg_id),
+                return_exceptions=True
+            )
+            return
+
         if new == "Default":
             await update.message.reply_text("❌ You cannot rename a folder to Default.")
             return
@@ -1629,6 +1742,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         user_msg_id = update.message.message_id
         title = text.strip()
+
+        if len(title) > MAX_TITLE_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Title is too long ({len(title)} characters).\n"
+                f"Maximum allowed: {MAX_TITLE_LENGTH} characters.\n\nPlease shorten and send again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, user_msg_id),
+                return_exceptions=True
+            )
+            return
 
         if not title:
             err = await update.message.reply_text("❌ Quiz title cannot be empty. Please send a title:")
@@ -1723,6 +1849,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_msg_id = update.message.message_id
         new_title = text.strip()
 
+        if len(new_title) > MAX_TITLE_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Title is too long ({len(new_title)} characters).\n"
+                f"Maximum allowed: {MAX_TITLE_LENGTH} characters.\n\nPlease shorten and send again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, user_msg_id),
+                return_exceptions=True
+            )
+            return
+
         if not new_title:
             err = await update.message.reply_text("❌ Title cannot be empty. Please send a title:")
             await asyncio.sleep(3)
@@ -1805,6 +1944,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         user_msg_id = update.message.message_id
+
+        if text.upper() != "CLEAR" and len(text) > MAX_DESC_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Description is too long ({len(text)} characters).\n"
+                f"Maximum allowed: {MAX_DESC_LENGTH} characters.\n\nPlease shorten and send again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(update.effective_chat.id, err.message_id),
+                context.bot.delete_message(update.effective_chat.id, user_msg_id),
+                return_exceptions=True
+            )
+            return
 
         async with DB_LOCK:
             _conn_d, _cur_d = get_db()
@@ -4143,12 +4295,13 @@ async def edit_question_options_start(update: Update, context: ContextTypes.DEFA
     msg = await query.message.reply_text(
         "✏️ Editing options\n\n"
         f"Current options:\n"
-        f"1️⃣ {old_options[0]}\n"
-        f"2️⃣ {old_options[1]}\n"
-        f"3️⃣ {old_options[2]}\n"
-        f"4️⃣ {old_options[3]}\n\n"
+        f"1️⃣ {escape_md(old_options[0])}\n"
+        f"2️⃣ {escape_md(old_options[1])}\n"
+        f"3️⃣ {escape_md(old_options[2])}\n"
+        f"4️⃣ {escape_md(old_options[3])}\n\n"
         "➡️ Send NEW option 1:",
-        reply_markup=keyboard
+        reply_markup=keyboard,
+        parse_mode="Markdown"
     )
 
     # 🔑 Store this message for later full declutter
@@ -5091,13 +5244,13 @@ async def refresh_all_group_posts_for_quiz(quiz_id: str, context):
 async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     quiz_id = context.user_data.get("active_quiz_id")
+
     if not quiz_id:
         await flash_message(context.bot, query.message.chat_id, "❌ No quiz selected.")
         return
 
-    # 🔑 Generate a unique token every time
+    # 🔑 Generate a unique token
     token = secrets.token_hex(6)
     timestamp = int(time.time())
 
@@ -5119,200 +5272,35 @@ async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await flash_message(context.bot, query.message.chat_id, "❌ Failed to generate post link.")
         return
 
-    # 📤 Build the inline share button — tapping it opens Telegram's group picker
-    share_keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "📤 Share to Group",
-                switch_inline_query_chosen_chat=SwitchInlineQueryChosenChat(
-                    query=f"POST_{quiz_id}_{token}",
-                    allow_group_chats=True,
-                    allow_bot_chats=False,
-                    allow_user_chats=False,
-                )
-            )
-        ],
-        [
-            InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_POST_QUIZ")
-        ]
-    ])
+    # 📋 Build the /postquiz command the admin will send in the group
+    post_command = f"/postquiz@{BOT_USERNAME} {quiz_id}_{token}"
+
+    # 📖 Fetch quiz title
+    _conn_q, _cur_q = get_db()
+    _cur_q.execute("SELECT title FROM quizzes WHERE quiz_id=?", (quiz_id,))
+    row_q = _cur_q.fetchone()
+    _conn_q.close()
+    quiz_title = row_q[0] if row_q else "Quiz"
 
     msg = await query.message.reply_text(
-        "📤 *Post this Quiz to a Group*\n\n"
-        "Tap the button below, then choose which group to share it to.\n\n"
-        "⚠️ Make sure the bot is already added to that group.",
-        reply_markup=share_keyboard,
+        f"📤 *Posting:* _{quiz_title}_\n\n"
+        f"To post this quiz to your group:\n\n"
+        f"1️⃣ Go to your group\n"
+        f"2️⃣ Send this exact command there:\n\n"
+        f"`{post_command}`\n\n"
+        f"_(Tap the command above to copy it, then paste it in the group)_\n\n"
+        f"⚠️ Make sure the bot is already an admin in the group.",
         parse_mode="Markdown"
     )
 
-    # 🔑 Store this message ID so chosen_inline_result_handler can delete it
-    context.user_data["post_quiz_prompt_msg_id"] = msg.message_id
-
-    # ⏳ Auto-delete after 5 minutes if not used
+    # ⏳ Auto-delete after 120 seconds
     async def delete_later():
-        await asyncio.sleep(300)
+        await asyncio.sleep(120)
         try:
             await msg.delete()
         except Exception:
             pass
-
     asyncio.create_task(delete_later())
-
-async def inline_query_post_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Fires when the owner picks a group via the switch_inline_query_chosen_chat button.
-    Telegram sends an inline query with the payload; we respond with the quiz card.
-    The chosen_inline_result handler then fires to actually persist the leaderboard.
-    """
-    inline_query = update.inline_query
-    if not inline_query:
-        return
-
-    query_text = inline_query.query.strip()
-
-    # Only handle our POST_ payloads
-    if not query_text.startswith("POST_"):
-        await inline_query.answer([], cache_time=0)
-        return
-
-    try:
-        _, quiz_id, token = query_text.split("_", 2)
-    except ValueError:
-        await inline_query.answer([], cache_time=0)
-        return
-
-    # Fetch quiz info for the card preview
-    _conn, _cur = get_db()
-    _cur.execute(
-        "SELECT title, description, timer, shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
-        (quiz_id,)
-    )
-    row = _cur.fetchone()
-    _conn.close()
-
-    if not row:
-        await inline_query.answer([], cache_time=0)
-        return
-
-    title, desc, timer, sq, sa = row
-
-    _conn2, _cur2 = get_db()
-    _cur2.execute("SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?", (quiz_id,))
-    total_questions = _cur2.fetchone()[0]
-    _conn2.close()
-
-    text = f"📘 *{escape_md(title)}*\n"
-    if desc:
-        text += f"📝 _{escape_md(desc)}_\n"
-    text += "\n"
-    text += f"🧠 *{total_questions} Questions* • ⏱ *{timer}s*\n"
-    text += (
-        f"🔀 Questions: {'ON' if sq else 'OFF'} • "
-        f"Answers: {'ON' if sa else 'OFF'}\n\n"
-    )
-    text += "🏆 *Leaderboard*\n— No attempts yet —"
-
-    leaderboard_key = make_leaderboard_key(quiz_id, token)
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "▶️ Start Quiz",
-                url=f"https://t.me/{BOT_USERNAME}?start=PLAY_{quiz_id}_{token}"
-            )
-        ]
-    ])
-
-    result = InlineQueryResultArticle(
-        id=token,
-        title=f"📘 {title}",
-        description=f"{total_questions} questions • {timer}s timer",
-        input_message_content=InputTextMessageContent(
-            message_text=text,
-            parse_mode="Markdown"
-        ),
-        reply_markup=keyboard,
-    )
-
-    await inline_query.answer(
-        results=[result],
-        cache_time=0,
-        is_personal=True,
-    )
-
-
-async def chosen_inline_result_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Fires after the owner selects the quiz card from the inline results and
-    Telegram confirms it was sent to the group.
-    We use this to register the leaderboard and persist the group message info.
-    """
-    result = update.chosen_inline_result
-    if not result:
-        return
-
-    inline_message_id = result.inline_message_id
-    query_text = result.query.strip()
-
-    if not query_text.startswith("POST_"):
-        return
-
-    try:
-        _, quiz_id, token = query_text.split("_", 2)
-    except ValueError:
-        return
-
-    leaderboard_key = make_leaderboard_key(quiz_id, token)
-
-    # We don't have chat_id/message_id from chosen_inline_result,
-    # so we store the inline_message_id instead and use edit_message_text
-    # for inline messages going forward.
-    GROUP_LEADERBOARDS[leaderboard_key] = {}
-
-    GROUP_LB_MESSAGES[leaderboard_key] = {
-        "quiz_id": quiz_id,
-        "token": token,
-        "chat_id": None,             # Not available for inline messages
-        "message_id": None,
-        "inline_message_id": inline_message_id,
-        "page": 0,
-    }
-
-    # Persist to DB — store inline_message_id so refreshes can use it
-    try:
-        async with DB_LOCK:
-            _conn, _cur = get_db()
-            _cur.execute("""
-                INSERT OR REPLACE INTO group_lb_messages
-                (leaderboard_key, quiz_id, token, chat_id, message_id, page, inline_message_id)
-                VALUES (?, ?, ?, ?, ?, 0, ?)
-            """, (leaderboard_key, quiz_id, token, 0, 0, inline_message_id))
-            _conn.commit()
-            _conn.close()
-    except Exception as e:
-        print("⚠️ Failed to persist inline lb message:", e)
-
-    # Clean up the post prompt message in the admin's DM
-    prompt_id = context.user_data.pop("post_quiz_prompt_msg_id", None)
-    if prompt_id:
-        try:
-            await context.bot.delete_message(
-                chat_id=result.from_user.id,
-                message_id=prompt_id
-            )
-        except:
-            pass
-
-    # Flash confirmation to the admin
-    try:
-        confirm = await context.bot.send_message(
-            chat_id=result.from_user.id,
-            text="✅ Quiz posted to group successfully!"
-        )
-        await asyncio.sleep(3)
-        await confirm.delete()
-    except:
-        pass
 
 async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -5332,10 +5320,19 @@ async def post_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Join all args in case Telegram or the client split the payload on spaces
     payload = "".join(args)
 
-    if "::" not in payload:
-        await update.message.reply_text("❌ Invalid post command format.")
+    if "_" not in payload:
+        err_msg = await update.message.reply_text("❌ Invalid post command format.")
+        await asyncio.sleep(2)
+        try:
+            await err_msg.delete()
+        except:
+            pass
+        try:
+            await update.message.delete()
+        except:
+            pass
         return
-    quiz_id, token = payload.split("::", 1)
+    quiz_id, token = payload.split("_", 1)
 
     if not is_authorized(user_id):
         warn_msg = await update.message.reply_text("❌ Only the Bot Admin can post quizzes.")
@@ -6528,17 +6525,24 @@ async def force_stop_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def global_quiz_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    # 🔐 Global Rate Limit
-    if is_rate_limited(query.from_user.id):
-        raise ApplicationHandlerStop
     if not query:
         return
 
-    # 🔄 Reset inactivity timer on every button press
-    if query.message and query.message.chat:
-        schedule_declutter(query.from_user.id, query.message.chat.id, context)
+    # 🔐 Global Rate Limit
+    if is_rate_limited(query.from_user.id):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        raise ApplicationHandlerStop
 
     data = query.data or ""
+
+    # 🔒 Only apply quiz guard in private chats
+    # Group callbacks (leaderboard buttons) should never trigger this
+    if update.effective_chat and update.effective_chat.type in ("group", "supergroup", "channel"):
+        return
+
     play = context.user_data.get("play")
 
     # ✅ No quiz running → allow everything
@@ -6565,14 +6569,16 @@ async def global_quiz_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     ])
 
-    msg = await query.message.reply_text(
-        "⚠️ A quiz is currently running.\n\n"
-        "Please stop or resume the quiz to continue. ⚠️ Stopping the quiz after 3 Questions will update the Score Leaderboard",
-        reply_markup=keyboard
-    )
-
-    # 🔒 Lock UI with warning message ID
-    play["warning_message_id"] = msg.message_id
+    try:
+        msg = await query.message.reply_text(
+            "⚠️ A quiz is currently running.\n\n"
+            "Please stop or resume the quiz to continue. ⚠️ Stopping the quiz after 3 Questions will update the Score Leaderboard",
+            reply_markup=keyboard
+        )
+        # 🔒 Lock UI with warning message ID
+        play["warning_message_id"] = msg.message_id
+    except Exception:
+        pass
 
     # 🚫 Stop all other handlers
     raise ApplicationHandlerStop
@@ -7078,64 +7084,6 @@ async def cancel_edit_question_options(update: Update, context: ContextTypes.DEF
  
     # Restore full preview buttons
     await rebuild_question_preview(chat_id, context)
-
-async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    current_msg_id = update.message.message_id
-
-    # Track /clear message itself
-    context.user_data.setdefault("chat_messages", []).append(current_msg_id)
-
-    # 🔒 Block /clear during an active quiz to prevent corruption
-    if context.user_data.get("play"):
-        try:
-            await update.message.delete()
-        except:
-            pass
-        msg = await context.bot.send_message(
-            chat_id,
-            "⚠️ Cannot clear chat while a quiz is running.\nStop the quiz first using the Stop Quiz button."
-        )
-        await asyncio.sleep(3)
-        try:
-            await msg.delete()
-        except:
-            pass
-        return
-
-    # ── Collect ALL known tracked message IDs ──────────────────────────
-    tracked = set(context.user_data.get("chat_messages", []))
-    tracked.update(context.user_data.get("question_flow_msgs", []))
-
-    preview_id = context.user_data.get("question_preview_msg_id")
-    if preview_id:
-        tracked.add(preview_id)
-
-    play = context.user_data.get("play")
-    if play:
-        for mid in play.get("question_message_ids", []):
-            tracked.add(mid)
-        for mid in play.get("timer_message_ids", []):
-            tracked.add(mid)
-
-    # ── Also scan backwards up to 200 messages from current position ──
-    # This catches any bot messages that were never tracked
-    scan_range = range(current_msg_id, max(1, current_msg_id - 200), -1)
-    all_ids = tracked | set(scan_range)
-
-    # ── Delete everything ──────────────────────────────────────────────
-    delete_tasks = [
-        context.bot.delete_message(chat_id=chat_id, message_id=mid)
-        for mid in all_ids
-    ]
-    if delete_tasks:
-        await asyncio.gather(*delete_tasks, return_exceptions=True)
-
-    # ── Preserve critical session keys before clearing ─────────────────
-    active_user_id = context.user_data.get("active_user_id")
-    context.user_data.clear()
-    if active_user_id:
-        context.user_data["active_user_id"] = active_user_id
 
 async def cancel_edit_question_explanation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -8804,28 +8752,6 @@ async def db_search_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["db_search_page"] = context.user_data.get("db_search_page", 0) + 1
     await show_db_search_results(query.message, context)
 
-def schedule_declutter(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Resets the 1-hour inactivity declutter timer.
-    Cancels any existing job for this user, then schedules a new one.
-    """
-    job_name = f"declutter_{user_id}"
-
-    # Cancel existing job if any
-    current_jobs = context.job_queue.get_jobs_by_name(job_name)
-    for job in current_jobs:
-        job.schedule_removal()
-
-    # Schedule new job — 1 hour from now
-    # NOTE: Do NOT pass chat_id/user_id as kwargs to run_once —
-    # they are not supported that way in PTB v20. Use job.data only.
-    context.job_queue.run_once(
-        auto_declutter_job,
-        when=3600,
-        data={"chat_id": chat_id, "user_id": user_id},
-        name=job_name,
-    )
-
 async def reset_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
 
@@ -8862,49 +8788,6 @@ async def reset_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 🔄 Refresh group post immediately
     await update_group_leaderboard(leaderboard_key, context)
-
-async def auto_declutter_job(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    chat_id = job.data.get("chat_id")
-    user_id = job.data.get("user_id")
-
-    if not chat_id:
-        return
-
-    # Get user_data for this user
-    user_data = context.application.user_data.get(user_id, {})
-
-    # 🧹 Delete all tracked chat messages
-    message_ids = list(user_data.get("chat_messages", []))
-    question_flow_ids = list(user_data.get("question_flow_msgs", []))
-    all_ids = list(set(message_ids + question_flow_ids))
-
-    # Also clean up any active quiz messages
-    play = user_data.get("play")
-    if play:
-        for mid in play.get("question_message_ids", []):
-            all_ids.append(mid)
-        for mid in play.get("timer_message_ids", []):
-            all_ids.append(mid)
-        task = play.get("timer_task")
-        if task:
-            task.cancel()
-
-    # Also clean question preview
-    preview_id = user_data.get("question_preview_msg_id")
-    if preview_id:
-        all_ids.append(preview_id)
-
-    # Delete all collected message IDs
-    delete_tasks = [
-        context.bot.delete_message(chat_id=chat_id, message_id=mid)
-        for mid in set(all_ids)
-    ]
-    if delete_tasks:
-        await asyncio.gather(*delete_tasks, return_exceptions=True)
-
-    # 🧼 Clear user data completely
-    context.application.user_data.pop(user_id, None)
 
 async def refresh_all_group_posts(context):
     """Refreshes ALL active group posts across all quizzes."""
@@ -9592,10 +9475,8 @@ app = (
 
 app.job_queue.run_repeating(auto_expire_subscribers, interval=3600, first=10)
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("clear", clear_chat))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-app.add_handler(CommandHandler("post", post_quiz_command))
 
 # =========================
 # Must Stay on Top of other CallbackQueryHandler
@@ -9603,9 +9484,7 @@ app.add_handler(CommandHandler("post", post_quiz_command))
 app.add_handler(CallbackQueryHandler(global_quiz_guard), group=-1)
 # =========================
 app.add_handler(CommandHandler("refresh", refresh_command))
-app.add_handler(InlineQueryHandler(inline_query_post_quiz))
-app.add_handler(ChosenInlineResultHandler(chosen_inline_result_handler))
-app.add_handler(CallbackQueryHandler(cancel_post_quiz, pattern="^CANCEL_POST_QUIZ$"))
+app.add_handler(CommandHandler("postquiz", post_quiz_command))
 app.add_handler(CallbackQueryHandler(home_manage_subscribers, pattern="^HOME_MANAGE_SUBSCRIBERS$"))
 app.add_handler(CallbackQueryHandler(sub_add_start,           pattern="^SUB_ADD$"))
 app.add_handler(CallbackQueryHandler(sub_apply_duration,      pattern="^SUB_DURATION\\|"))
