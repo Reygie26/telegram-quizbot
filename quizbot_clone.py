@@ -135,14 +135,14 @@ def ensure_indexes():
 def restore_group_lb_messages():
     _conn, _cur = get_db()
     _cur.execute("""
-        SELECT leaderboard_key, quiz_id, token, chat_id, message_id, page, inline_message_id
+        SELECT leaderboard_key, quiz_id, token, chat_id, message_id, page, inline_message_id, show_score
         FROM group_lb_messages
     """)
     rows = _cur.fetchall()
     _conn.close()
 
     restored = 0
-    for leaderboard_key, quiz_id, token, chat_id, message_id, page, inline_message_id in rows:
+    for leaderboard_key, quiz_id, token, chat_id, message_id, page, inline_message_id, show_score in rows:
         # Rebuild the key from quiz_id + token to guarantee format consistency
         rebuilt_key = make_leaderboard_key(quiz_id, token)
 
@@ -153,6 +153,7 @@ def restore_group_lb_messages():
             "message_id":        message_id,
             "page":              page,
             "inline_message_id": inline_message_id,
+            "show_score":        1 if show_score is None else show_score,
         }
         restored += 1
 
@@ -445,6 +446,13 @@ CREATE TABLE IF NOT EXISTS group_lb_messages (
     # Safe migration — ignored if column already exists
     try:
         _cur.execute("ALTER TABLE group_lb_messages ADD COLUMN inline_message_id TEXT")
+        _conn.commit()
+    except Exception:
+        pass
+
+    # Safe migration for show_score column
+    try:
+        _cur.execute("ALTER TABLE group_lb_messages ADD COLUMN show_score INTEGER DEFAULT 1")
         _conn.commit()
     except Exception:
         pass
@@ -4966,7 +4974,7 @@ def build_group_post_keyboard(quiz_id: str, token: str, leaderboard_key: str, pa
 
     # Always-present action row
     buttons.append([
-        InlineKeyboardButton("🔄 Reset Score", callback_data=f"RESET_SCORE|{leaderboard_key}"),
+        InlineKeyboardButton("⚙️ Quiz Admin", callback_data=f"GQ_ADMIN|{leaderboard_key}"),
         InlineKeyboardButton("▶️ Start Quiz", url=f"https://t.me/{BOT_USERNAME}?start=PLAY_{quiz_id}_{token}"),
     ])
 
@@ -5014,11 +5022,12 @@ async def send_quiz_to_group(chat_id, quiz_id, context, token):
     )
 
     GROUP_LB_MESSAGES[leaderboard_key] = {
-        "quiz_id": quiz_id,
-        "token": token,
-        "chat_id": chat_id,
+        "quiz_id":    quiz_id,
+        "token":      token,
+        "chat_id":    chat_id,
         "message_id": msg.message_id,
-        "page": 0,
+        "page":       0,
+        "show_score": 1,
     }
 
     try:
@@ -5068,6 +5077,14 @@ def build_group_quiz_text(leaderboard_key, page=0):
         f"🔀 Questions: {'ON' if sq else 'OFF'} • "
         f"Answers: {'ON' if sa else 'OFF'}\n\n"
     )
+    # Check if leaderboard is hidden by admin
+    lb_info = GROUP_LB_MESSAGES.get(leaderboard_key, {})
+    show_score = lb_info.get("show_score", 1)
+
+    if not show_score:
+        text += "🏆 *Leaderboard*\n🔒 _Score display is currently hidden by \n      the admin._\n"
+        return text, 0
+
     text += "🏆 *Leaderboard*\n"
 
     if leaderboard_key in GROUP_LEADERBOARDS and GROUP_LEADERBOARDS[leaderboard_key]:
@@ -8752,6 +8769,436 @@ async def db_search_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["db_search_page"] = context.user_data.get("db_search_page", 0) + 1
     await show_db_search_results(query.message, context)
 
+
+# =========================
+# QUIZ ADMIN PANEL (GROUP POST MANAGEMENT)
+# =========================
+
+def _build_qa_panel_keyboard(leaderboard_key: str, show_score: int) -> InlineKeyboardMarkup:
+    """Builds the Quiz Admin panel inline keyboard."""
+    score_label = "👁 Show Score: ON" if show_score else "👁 Show Score: OFF"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Leaderboard",     callback_data=f"QA_LB|{leaderboard_key}|0")],
+        [InlineKeyboardButton(score_label,          callback_data=f"QA_TOGGLE|{leaderboard_key}")],
+        [
+            InlineKeyboardButton("🔄 Reset Score",  callback_data=f"QA_RESET|{leaderboard_key}"),
+            InlineKeyboardButton("📄 Export Quiz",  callback_data=f"QA_EXPORT|{leaderboard_key}"),
+        ],
+        [InlineKeyboardButton("✖️ Close",           callback_data="QA_CLOSE")],
+    ])
+
+async def quiz_admin_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the ⚙️ Quiz Admin button tapped on a group quiz post."""
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    # 🔒 Only authorized users can access Quiz Admin
+    if not is_authorized(user_id):
+        await query.answer("❌ Only authorized admins can access this.", show_alert=True)
+        return
+
+    await query.answer()
+
+    try:
+        leaderboard_key = query.data.split("|", 1)[1]
+    except (IndexError, ValueError):
+        return
+
+    quiz_id = leaderboard_key.split(":", 1)[0]
+
+    _conn, _cur = get_db()
+    _cur.execute("SELECT title FROM quizzes WHERE quiz_id=?", (quiz_id,))
+    row = _cur.fetchone()
+    _conn.close()
+    quiz_title = row[0] if row else "Quiz"
+
+    info = GROUP_LB_MESSAGES.get(leaderboard_key, {})
+    show_score = info.get("show_score", 1)
+
+    keyboard = _build_qa_panel_keyboard(leaderboard_key, show_score)
+
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"⚙️ *Quiz Admin Panel*\n📘 _{escape_md(quiz_title)}_",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print("⚠️ Could not send Quiz Admin panel:", e)
+        await query.answer("❌ Please start the bot in private first before using Quiz Admin.", show_alert=True)
+
+
+async def qa_leaderboard_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows a paginated full leaderboard in the admin's private chat."""
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        parts = query.data.split("|")
+        leaderboard_key = parts[1]
+        page = int(parts[2])
+    except (ValueError, IndexError):
+        return
+
+    # Build leaderboard data from memory or DB
+    if leaderboard_key in GROUP_LEADERBOARDS and GROUP_LEADERBOARDS[leaderboard_key]:
+        leaderboard = [
+            {"name": data["name"], "score": data["score"]}
+            for data in GROUP_LEADERBOARDS[leaderboard_key].values()
+        ]
+    else:
+        _conn, _cur = get_db()
+        _cur.execute(
+            "SELECT name, score FROM group_leaderboard WHERE leaderboard_key=? ORDER BY score DESC",
+            (leaderboard_key,)
+        )
+        rows = _cur.fetchall()
+        _conn.close()
+        leaderboard = [{"name": name, "score": score} for name, score in rows]
+
+    leaderboard.sort(key=lambda x: x["score"], reverse=True)
+
+    per_page = 10
+    total = len(leaderboard)
+    pages = max(1, (total - 1) // per_page + 1) if total > 0 else 1
+    page = max(0, min(page, pages - 1))
+    start = page * per_page
+    end = start + per_page
+
+    if not leaderboard:
+        text = "📋 *Leaderboard*\n\n_No participants yet._"
+    else:
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        text = f"📋 *Full Leaderboard* ({total} participants)\n\n"
+        for i, user in enumerate(leaderboard[start:end], start=start + 1):
+            prefix = medals.get(i, f"{i}.")
+            text += f"{prefix} {escape_md(user['name'])} — {user['score']}\n"
+
+    # Pagination navigation
+    nav = []
+    if pages > 1:
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"QA_LB|{leaderboard_key}|{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QA_LB_NOP"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data=f"QA_LB|{leaderboard_key}|{page + 1}"))
+
+    buttons = []
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data=f"QA_BACK|{leaderboard_key}")])
+
+    try:
+        await query.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+
+async def qa_toggle_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggles the Show Score ON/OFF on the group quiz post."""
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        leaderboard_key = query.data.split("|", 1)[1]
+    except (IndexError, ValueError):
+        return
+
+    # Toggle in memory
+    info = GROUP_LB_MESSAGES.get(leaderboard_key, {})
+    current = info.get("show_score", 1)
+    new_val = 0 if current else 1
+    info["show_score"] = new_val
+    GROUP_LB_MESSAGES[leaderboard_key] = info
+
+    # Toggle in DB
+    try:
+        async with DB_LOCK:
+            _conn, _cur = get_db()
+            _cur.execute(
+                "UPDATE group_lb_messages SET show_score=? WHERE leaderboard_key=?",
+                (new_val, leaderboard_key)
+            )
+            _conn.commit()
+            _conn.close()
+    except Exception as e:
+        print("⚠️ Failed to toggle show_score:", e)
+
+    # Refresh the group post immediately
+    await update_group_leaderboard(leaderboard_key, context)
+
+    # Refresh the admin panel with updated button label
+    quiz_id = leaderboard_key.split(":", 1)[0]
+    _conn2, _cur2 = get_db()
+    _cur2.execute("SELECT title FROM quizzes WHERE quiz_id=?", (quiz_id,))
+    row = _cur2.fetchone()
+    _conn2.close()
+    quiz_title = row[0] if row else "Quiz"
+
+    keyboard = _build_qa_panel_keyboard(leaderboard_key, new_val)
+
+    try:
+        await query.message.edit_text(
+            f"⚙️ *Quiz Admin Panel*\n📘 _{escape_md(quiz_title)}_",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+
+async def qa_reset_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resets all scores for a quiz post (triggered from the admin panel)."""
+    query = update.callback_query
+
+    try:
+        leaderboard_key = query.data.split("|", 1)[1]
+    except (IndexError, ValueError):
+        await query.answer()
+        return
+
+    # 🧹 Clear memory
+    GROUP_LEADERBOARDS.pop(leaderboard_key, None)
+
+    # 🔐 Clear database
+    try:
+        async with DB_LOCK:
+            _conn, _cur = get_db()
+            _cur.execute(
+                "DELETE FROM group_leaderboard WHERE leaderboard_key=?",
+                (leaderboard_key,)
+            )
+            _conn.commit()
+            _conn.close()
+    except Exception as e:
+        print("⚠️ QA Reset score DB error:", e)
+        await query.answer("❌ Reset failed.", show_alert=True)
+        return
+
+    await query.answer("✅ All scores have been reset.", show_alert=True)
+
+    # Refresh group post
+    await update_group_leaderboard(leaderboard_key, context)
+
+    # Refresh the admin panel
+    quiz_id = leaderboard_key.split(":", 1)[0]
+    _conn2, _cur2 = get_db()
+    _cur2.execute("SELECT title FROM quizzes WHERE quiz_id=?", (quiz_id,))
+    row = _cur2.fetchone()
+    _conn2.close()
+    quiz_title = row[0] if row else "Quiz"
+
+    info = GROUP_LB_MESSAGES.get(leaderboard_key, {})
+    show_score = info.get("show_score", 1)
+    keyboard = _build_qa_panel_keyboard(leaderboard_key, show_score)
+
+    try:
+        await query.message.edit_text(
+            f"⚙️ *Quiz Admin Panel*\n📘 _{escape_md(quiz_title)}_",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+
+async def qa_export_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exports quiz questions to a PDF file and sends it to the admin."""
+    query = update.callback_query
+    await query.answer("📄 Generating PDF, please wait...")
+
+    try:
+        leaderboard_key = query.data.split("|", 1)[1]
+    except (IndexError, ValueError):
+        return
+
+    quiz_id = leaderboard_key.split(":", 1)[0]
+    user_id = query.from_user.id
+
+    # Fetch quiz info
+    _conn, _cur = get_db()
+    _cur.execute("SELECT title, description FROM quizzes WHERE quiz_id=?", (quiz_id,))
+    row = _cur.fetchone()
+    _conn.close()
+    quiz_title = row[0] if row else "Quiz"
+    quiz_desc  = row[1] if row and row[1] else ""
+
+    # Fetch questions in order
+    _conn2, _cur2 = get_db()
+    _cur2.execute("""
+        SELECT qb.question, qb.image_file_id, qb.options, qb.correct, qb.explanation
+        FROM quiz_question_links ql
+        JOIN question_bank qb ON qb.id = ql.question_id
+        WHERE ql.quiz_id=?
+        ORDER BY ql.position ASC
+    """, (quiz_id,))
+    questions = _cur2.fetchall()
+    _conn2.close()
+
+    if not questions:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="❌ This quiz has no questions to export."
+        )
+        return
+
+    try:
+        from fpdf import FPDF
+        import tempfile, os
+
+        class QuizPDF(FPDF):
+            pass
+
+        pdf = QuizPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+
+        # ── Title ───────────────────────────────────────────
+        pdf.set_font("Helvetica", "B", 16)
+        pdf.cell(0, 10, quiz_title[:80], ln=True, align="C")
+
+        if quiz_desc:
+            pdf.set_font("Helvetica", "I", 11)
+            pdf.cell(0, 7, quiz_desc[:100], ln=True, align="C")
+
+        pdf.ln(4)
+        pdf.set_draw_color(120, 120, 120)
+        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+        pdf.ln(6)
+
+        label_map = ["a", "b", "c", "d"]
+
+        for i, (q_text, image_file_id, options_str, correct_idx, explanation) in enumerate(questions, start=1):
+            opts = options_str.split("||")
+
+            # ── Question number + text ──────────────────────
+            pdf.set_font("Helvetica", "B", 11)
+            header = f"{i}.) {q_text}"
+            if image_file_id:
+                header += "  [ Image ]"
+            pdf.multi_cell(0, 7, header[:500])
+            pdf.ln(1)
+
+            # ── Options: a & c on same row, b & d on same row ──
+            pdf.set_font("Helvetica", "", 10)
+            col_w = 90
+            left_opts  = []   # indices 0, 2  (a, c)
+            right_opts = []   # indices 1, 3  (b, d)
+            for j, opt in enumerate(opts):
+                lbl = label_map[j] if j < len(label_map) else str(j + 1)
+                entry = f"{lbl}.) {opt}"
+                if j % 2 == 0:
+                    left_opts.append(entry)
+                else:
+                    right_opts.append(entry)
+
+            for k in range(max(len(left_opts), len(right_opts))):
+                left  = left_opts[k]  if k < len(left_opts)  else ""
+                right = right_opts[k] if k < len(right_opts) else ""
+                y = pdf.get_y()
+                pdf.set_xy(10, y)
+                pdf.cell(col_w, 6, left[:60],  ln=False)
+                pdf.set_xy(110, y)
+                pdf.cell(col_w, 6, right[:60], ln=True)
+
+            # ── Correct answer hint ─────────────────────────
+            if 0 <= correct_idx < len(opts):
+                clbl = label_map[correct_idx] if correct_idx < len(label_map) else str(correct_idx + 1)
+                pdf.set_font("Helvetica", "I", 9)
+                pdf.set_text_color(0, 130, 0)
+                pdf.cell(0, 6, f"   Answer: {clbl}.) {opts[correct_idx][:80]}", ln=True)
+                pdf.set_text_color(0, 0, 0)
+
+            # ── Explanation ─────────────────────────────────
+            if explanation:
+                pdf.set_font("Helvetica", "I", 9)
+                pdf.set_text_color(90, 90, 90)
+                pdf.multi_cell(0, 5, f"   Explanation: {explanation[:300]}")
+                pdf.set_text_color(0, 0, 0)
+
+            pdf.ln(4)
+
+        # ── Save and send ───────────────────────────────────
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            pdf_path = tmp.name
+
+        pdf.output(pdf_path)
+
+        safe_title = "".join(c for c in quiz_title if c.isalnum() or c in " _-")[:30].strip().replace(" ", "_")
+        filename = f"{safe_title or 'quiz'}.pdf"
+
+        with open(pdf_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=f,
+                filename=filename,
+                caption=f"📄 *{escape_md(quiz_title)}*\n_{len(questions)} Questions_",
+                parse_mode="Markdown"
+            )
+
+        os.unlink(pdf_path)
+
+    except ImportError:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "❌ *PDF export requires the fpdf2 library.*\n\n"
+                "Run this in your terminal:\n`pip install fpdf2`\n\n"
+                "Then restart the bot and try again."
+            ),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print("⚠️ PDF export error:", e)
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="❌ Failed to generate PDF. Please try again."
+        )
+
+async def qa_back_to_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Returns from the leaderboard view back to the Quiz Admin panel."""
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        leaderboard_key = query.data.split("|", 1)[1]
+    except (IndexError, ValueError):
+        return
+
+    quiz_id = leaderboard_key.split(":", 1)[0]
+    _conn, _cur = get_db()
+    _cur.execute("SELECT title FROM quizzes WHERE quiz_id=?", (quiz_id,))
+    row = _cur.fetchone()
+    _conn.close()
+    quiz_title = row[0] if row else "Quiz"
+
+    info = GROUP_LB_MESSAGES.get(leaderboard_key, {})
+    show_score = info.get("show_score", 1)
+    keyboard = _build_qa_panel_keyboard(leaderboard_key, show_score)
+
+    try:
+        await query.message.edit_text(
+            f"⚙️ *Quiz Admin Panel*\n📘 _{escape_md(quiz_title)}_",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+async def qa_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Closes (deletes) the Quiz Admin panel message."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
 async def reset_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
 
@@ -9546,6 +9993,14 @@ app.add_handler(CallbackQueryHandler(shuffle_back, pattern="^SHUFFLE_BACK$"))
 app.add_handler(CallbackQueryHandler(resume_quiz, pattern="^RESUME_QUIZ$"))
 app.add_handler(CallbackQueryHandler(force_stop_quiz, pattern="^FORCE_STOP_QUIZ$"))
 app.add_handler(CallbackQueryHandler(post_quiz_to_group, pattern="^POST_QUIZ$"))
+app.add_handler(CallbackQueryHandler(quiz_admin_open,      pattern=r"^GQ_ADMIN\|"))
+app.add_handler(CallbackQueryHandler(qa_leaderboard_show,  pattern=r"^QA_LB\|"))
+app.add_handler(CallbackQueryHandler(qa_toggle_score,      pattern=r"^QA_TOGGLE\|"))
+app.add_handler(CallbackQueryHandler(qa_reset_score,       pattern=r"^QA_RESET\|"))
+app.add_handler(CallbackQueryHandler(qa_export_quiz,       pattern=r"^QA_EXPORT\|"))
+app.add_handler(CallbackQueryHandler(qa_back_to_panel,     pattern=r"^QA_BACK\|"))
+app.add_handler(CallbackQueryHandler(qa_close,             pattern=r"^QA_CLOSE$"))
+app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern=r"^QA_LB_NOP$"))
 app.add_handler(CallbackQueryHandler(reset_score, pattern=r"^RESET_SCORE\|"))
 app.add_handler(CallbackQueryHandler(cancel_create_question, pattern="^CANCEL_CREATE_QUESTION$"))
 app.add_handler(CallbackQueryHandler(qb_move_question, pattern="^QB_MOVE$"))
