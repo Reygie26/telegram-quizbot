@@ -616,6 +616,70 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["chat_messages"].append(msg.message_id)
         return
 
+    # ⚙️ QUIZ ADMIN MODE (creator tapped Quiz Admin button from a group post)
+    if context.args and context.args[0].startswith("QA_"):
+        # Only works in private chat
+        if chat_type in ("group", "supergroup", "channel"):
+            return
+
+        # Format: QA_<quiz_id>_<token>
+        # quiz_id is a UUID (contains hyphens), token is hex
+        # Split at the LAST underscore to isolate the token
+        try:
+            payload = context.args[0][len("QA_"):]
+            last_underscore = payload.rfind("_")
+            if last_underscore == -1:
+                raise ValueError("No underscore found")
+            quiz_id = payload[:last_underscore]
+            token   = payload[last_underscore + 1:]
+        except (ValueError, IndexError):
+            return
+
+        # 🔒 Only the quiz CREATOR (owner) can access Quiz Admin
+        _conn_o, _cur_o = get_db()
+        _cur_o.execute("SELECT owner_id FROM quizzes WHERE quiz_id=?", (quiz_id,))
+        owner_row = _cur_o.fetchone()
+        _conn_o.close()
+
+        if not owner_row or owner_row[0] != user_id:
+            msg = await update.message.reply_text(
+                "❌ Only the quiz creator can access Quiz Admin."
+            )
+            async def _delete_denial():
+                await asyncio.sleep(5)
+                try:
+                    await msg.delete()
+                except:
+                    pass
+                try:
+                    await update.message.delete()
+                except:
+                    pass
+            asyncio.create_task(_delete_denial())
+            return
+
+        # ✅ Authorized — build and send the Quiz Admin panel
+        leaderboard_key = make_leaderboard_key(quiz_id, token)
+        info = GROUP_LB_MESSAGES.get(leaderboard_key, {})
+        show_score = info.get("show_score", 1)
+
+        text = _build_qa_panel_text(quiz_id)
+        keyboard = _build_qa_panel_keyboard(leaderboard_key, show_score)
+
+        # 🔑 Set context so Timer/Shuffle edit handlers work if triggered from this panel
+        context.user_data["active_quiz_id"] = quiz_id
+
+        msg = await update.message.reply_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+
+        # 🔑 Store so show_quiz_action_menu_by_id can update this message after edits
+        context.user_data["quiz_overview_msg_id"] = msg.message_id
+        context.user_data.setdefault("chat_messages", []).append(msg.message_id)
+        return
+
     # 📤 GROUP POST MODE (admin shared the startgroup link into a group)
     if context.args and context.args[0].startswith("POST_"):
         if chat_type not in ("group", "supergroup"):
@@ -4962,7 +5026,6 @@ async def show_leaderboard(chat_id, quiz_id, bot):
 def build_group_post_keyboard(quiz_id: str, token: str, leaderboard_key: str, pages: int = 0, page: int = 0) -> InlineKeyboardMarkup:
     buttons = []
 
-    # ◀ ▶ Pagination (only if leaderboard has multiple pages)
     if pages > 1:
         nav = []
         if page > 0:
@@ -4973,13 +5036,13 @@ def build_group_post_keyboard(quiz_id: str, token: str, leaderboard_key: str, pa
         buttons.append(nav)
 
     # Always-present action row
+    # ⚙️ Quiz Admin is now a URL button — tapping opens the bot directly (same as Start Quiz)
     buttons.append([
-        InlineKeyboardButton("⚙️ Quiz Admin", callback_data=f"GQ_ADMIN|{leaderboard_key}"),
+        InlineKeyboardButton("⚙️ Quiz Admin", url=f"https://t.me/{BOT_USERNAME}?start=QA_{quiz_id}_{token}"),
         InlineKeyboardButton("▶️ Start Quiz", url=f"https://t.me/{BOT_USERNAME}?start=PLAY_{quiz_id}_{token}"),
     ])
 
     return InlineKeyboardMarkup(buttons)
-
 
 async def send_quiz_to_group(chat_id, quiz_id, context, token):
     leaderboard_key = make_leaderboard_key(quiz_id, token)
@@ -5310,9 +5373,9 @@ async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode="Markdown"
     )
 
-    # ⏳ Auto-delete after 120 seconds
+    # ⏳ Auto-delete after 10 seconds
     async def delete_later():
-        await asyncio.sleep(120)
+        await asyncio.sleep(10)
         try:
             await msg.delete()
         except Exception:
@@ -8773,6 +8836,33 @@ async def db_search_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 # QUIZ ADMIN PANEL (GROUP POST MANAGEMENT)
 # =========================
+def _build_qa_panel_text(quiz_id: str) -> str:
+    """Builds the full quiz settings text for the Quiz Admin panel."""
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT title, description, timer, shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
+        (quiz_id,)
+    )
+    row = _cur.fetchone()
+    _conn.close()
+
+    if not row:
+        return "⚙️ *Quiz Admin Panel*"
+
+    title, desc, timer, sq, sa = row
+
+    _conn2, _cur2 = get_db()
+    _cur2.execute("SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?", (quiz_id,))
+    total_questions = _cur2.fetchone()[0]
+    _conn2.close()
+
+    text = "⚙️ *Quiz Admin Panel*\n\n"
+    text += f"📘 *{escape_md(title)}*"
+    if desc:
+        text += f"\n📝 _{escape_md(desc)}_"
+    text += f"\n\n📊 Questions: {total_questions}    ⏱ Timer: {timer}s"
+    text += f"\n🔀 Questions: {'ON' if sq else 'OFF'}    🔀 Options: {'ON' if sa else 'OFF'}"
+    return text
 
 def _build_qa_panel_keyboard(leaderboard_key: str, show_score: int) -> InlineKeyboardMarkup:
     """Builds the Quiz Admin panel inline keyboard."""
@@ -8792,42 +8882,42 @@ async def quiz_admin_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
 
-    # 🔒 Only authorized users can access Quiz Admin
-    if not is_authorized(user_id):
-        await query.answer("❌ Only authorized admins can access this.", show_alert=True)
-        return
-
-    await query.answer()
-
     try:
         leaderboard_key = query.data.split("|", 1)[1]
     except (IndexError, ValueError):
+        await query.answer()
         return
 
     quiz_id = leaderboard_key.split(":", 1)[0]
 
-    _conn, _cur = get_db()
-    _cur.execute("SELECT title FROM quizzes WHERE quiz_id=?", (quiz_id,))
-    row = _cur.fetchone()
-    _conn.close()
-    quiz_title = row[0] if row else "Quiz"
+    # 🔒 Only the quiz CREATOR (owner) can access Quiz Admin
+    _conn_o, _cur_o = get_db()
+    _cur_o.execute("SELECT owner_id FROM quizzes WHERE quiz_id=?", (quiz_id,))
+    owner_row = _cur_o.fetchone()
+    _conn_o.close()
+
+    if not owner_row or owner_row[0] != user_id:
+        await query.answer("❌ Only the quiz creator can access Quiz Admin.", show_alert=True)
+        return
+
+    await query.answer()
 
     info = GROUP_LB_MESSAGES.get(leaderboard_key, {})
     show_score = info.get("show_score", 1)
 
+    text = _build_qa_panel_text(quiz_id)
     keyboard = _build_qa_panel_keyboard(leaderboard_key, show_score)
 
     try:
         await context.bot.send_message(
             chat_id=user_id,
-            text=f"⚙️ *Quiz Admin Panel*\n📘 _{escape_md(quiz_title)}_",
+            text=text,
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
     except Exception as e:
         print("⚠️ Could not send Quiz Admin panel:", e)
         await query.answer("❌ Please start the bot in private first before using Quiz Admin.", show_alert=True)
-
 
 async def qa_leaderboard_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Shows a paginated full leaderboard in the admin's private chat."""
@@ -8934,17 +9024,12 @@ async def qa_toggle_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Refresh the admin panel with updated button label
     quiz_id = leaderboard_key.split(":", 1)[0]
-    _conn2, _cur2 = get_db()
-    _cur2.execute("SELECT title FROM quizzes WHERE quiz_id=?", (quiz_id,))
-    row = _cur2.fetchone()
-    _conn2.close()
-    quiz_title = row[0] if row else "Quiz"
-
+    text = _build_qa_panel_text(quiz_id)
     keyboard = _build_qa_panel_keyboard(leaderboard_key, new_val)
 
     try:
         await query.message.edit_text(
-            f"⚙️ *Quiz Admin Panel*\n📘 _{escape_md(quiz_title)}_",
+            text,
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
@@ -8987,19 +9072,14 @@ async def qa_reset_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Refresh the admin panel
     quiz_id = leaderboard_key.split(":", 1)[0]
-    _conn2, _cur2 = get_db()
-    _cur2.execute("SELECT title FROM quizzes WHERE quiz_id=?", (quiz_id,))
-    row = _cur2.fetchone()
-    _conn2.close()
-    quiz_title = row[0] if row else "Quiz"
-
+    text = _build_qa_panel_text(quiz_id)
     info = GROUP_LB_MESSAGES.get(leaderboard_key, {})
     show_score = info.get("show_score", 1)
     keyboard = _build_qa_panel_keyboard(leaderboard_key, show_score)
 
     try:
         await query.message.edit_text(
-            f"⚙️ *Quiz Admin Panel*\n📘 _{escape_md(quiz_title)}_",
+            text,
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
@@ -9171,19 +9251,14 @@ async def qa_back_to_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     quiz_id = leaderboard_key.split(":", 1)[0]
-    _conn, _cur = get_db()
-    _cur.execute("SELECT title FROM quizzes WHERE quiz_id=?", (quiz_id,))
-    row = _cur.fetchone()
-    _conn.close()
-    quiz_title = row[0] if row else "Quiz"
-
+    text = _build_qa_panel_text(quiz_id)
     info = GROUP_LB_MESSAGES.get(leaderboard_key, {})
     show_score = info.get("show_score", 1)
     keyboard = _build_qa_panel_keyboard(leaderboard_key, show_score)
 
     try:
         await query.message.edit_text(
-            f"⚙️ *Quiz Admin Panel*\n📘 _{escape_md(quiz_title)}_",
+            text,
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
