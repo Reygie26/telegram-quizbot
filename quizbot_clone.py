@@ -39,9 +39,8 @@ from difflib import SequenceMatcher
 ##### =============================================================================================
 ##### BOT TOKEN TO USE
 ##### =============================================================================================
-##### BOT TOKEN TO USE FOR TEST BOT  - BOT_TOKEN = "8482093736:AAFqaEt1fwXIyuAH5nIJtkao1xwP9QdAUPk"
 ##### BOT TOKEN TO USE FOR GITHUB    - BOT_TOKEN = os.environ.get("BOT_TOKEN")
-BOT_TOKEN = "8482093736:AAFqaEt1fwXIyuAH5nIJtkao1xwP9QdAUPk"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("❌ BOT_TOKEN environment variable is missing")
 
