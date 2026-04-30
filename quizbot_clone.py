@@ -39,8 +39,9 @@ from difflib import SequenceMatcher
 ##### =============================================================================================
 ##### BOT TOKEN TO USE
 ##### =============================================================================================
+##### BOT TOKEN TO USE FOR TEST BOT  - BOT_TOKEN = "8482093736:AAFqaEt1fwXIyuAH5nIJtkao1xwP9QdAUPk"
 ##### BOT TOKEN TO USE FOR GITHUB    - BOT_TOKEN = os.environ.get("BOT_TOKEN")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = "8482093736:AAFqaEt1fwXIyuAH5nIJtkao1xwP9QdAUPk"
 if not BOT_TOKEN:
     raise RuntimeError("❌ BOT_TOKEN environment variable is missing")
 
@@ -59,8 +60,9 @@ BOT_USERNAME = "EucresiaBot"
 ##### =============================================================================================
 ##### DB_FILE TO USE
 ##### =============================================================================================
+##### DB_FILE TO USE FOR TEST BOT    - DB_FILE = os.environ.get("DB_FILE", "./quizbot.db")
 ##### DB_FILE TO USE FOR GITHUB      - DB_FILE = "/var/data/quizbot.db"
-DB_FILE = "/var/data/quizbot.db"
+DB_FILE = os.environ.get("DB_FILE", "./quizbot.db")
 
 ##### =============================================================================================
 ##### print("📂 Using database file at:", DB_FILE)
@@ -608,7 +610,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📘 *{quiz_title}*\n\n"
             f"Press the button below to start.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("▶️ Start Quiz", callback_data="PLAY_START")]
+                [
+                    InlineKeyboardButton("▶️ Start Quiz", callback_data="PLAY_START"),
+                    InlineKeyboardButton("❌ Cancel",     callback_data="CANCEL_PLAY_READY"),
+                ]
             ]),
             parse_mode="Markdown"
         )
@@ -4577,6 +4582,22 @@ async def play_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ▶️ STEP 2: START QUIZ (UNCHANGED LOGIC)
     await start_play_quiz(update, context)
+
+async def cancel_play_ready(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # 🧹 Delete the "Quiz Ready!" message (includes both buttons)
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    # 🧼 Clear any play-related state that was pre-set
+    context.user_data.pop("play_quiz_id", None)
+    context.user_data.pop("play_token", None)
+    context.user_data.pop("leaderboard_key", None)
+    context.user_data.pop("group_chat_id", None)
 
 def build_group_message_link(chat_id: int, message_id: int) -> str:
     """
@@ -9943,6 +9964,20 @@ async def sub_delete(update, context):
     await flash_message(context.bot, query.message.chat_id, f"🗑 {name} removed from subscribers.")
     await home_manage_subscribers_from_message(query.message, context)
 
+async def backup_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_USER_ID:
+        return
+    try:
+        with open(DB_FILE, "rb") as f:
+            await context.bot.send_document(
+                chat_id=update.effective_user.id,
+                document=f,
+                filename="quizbot_backup.db",
+                caption="📦 Database backup"
+            )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Backup failed: {e}")
+
 async def cancel_post_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9997,6 +10032,7 @@ app = (
 
 app.job_queue.run_repeating(auto_expire_subscribers, interval=3600, first=10)
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("backup", backup_db))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
@@ -10124,6 +10160,7 @@ app.add_handler(CallbackQueryHandler(folder_next, pattern="^FOLDER_NEXT\\|"))
 app.add_handler(CallbackQueryHandler(home_database, pattern="^HOME_DATABASE$"))
 app.add_handler(CallbackQueryHandler(database_prev, pattern="^DB_PREV$"))
 app.add_handler(CallbackQueryHandler(database_next, pattern="^DB_NEXT$"))
+app.add_handler(CallbackQueryHandler(cancel_play_ready, pattern="^CANCEL_PLAY_READY$"))
 app.add_handler(CallbackQueryHandler(play_start, pattern="^START_THIS$"))
 app.add_handler(CallbackQueryHandler(leaderboard_page_nav, pattern="^LB_PREV\\|"))
 app.add_handler(CallbackQueryHandler(leaderboard_page_nav, pattern="^LB_NEXT\\|"))
