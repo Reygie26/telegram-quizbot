@@ -59,9 +59,8 @@ BOT_USERNAME = "EucresiaBot"
 ##### =============================================================================================
 ##### DB_FILE TO USE
 ##### =============================================================================================
-##### DB_FILE TO USE FOR TEST BOT    - DB_FILE = os.environ.get("DB_FILE", "./quizbot.db")
 ##### DB_FILE TO USE FOR GITHUB      - DB_FILE = "/var/data/quizbot.db"
-DB_FILE = os.environ.get("DB_FILE", "./quizbot.db")
+DB_FILE = "/var/data/quizbot.db"
 
 ##### =============================================================================================
 ##### print("📂 Using database file at:", DB_FILE)
