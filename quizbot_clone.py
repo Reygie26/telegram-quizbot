@@ -254,7 +254,7 @@ Rules:
 
         def _call_gemini():
             response = GEMINI_CLIENT.models.generate_content(
-                model="gemini-1.5-flash-latest",
+                model="gemini-2.0-flash",
                 contents=[
                     google_genai.types.Part.from_bytes(
                         data=file_bytes,
