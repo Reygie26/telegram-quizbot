@@ -36,6 +36,12 @@ from telegram.ext import (
 import random
 from difflib import SequenceMatcher
 
+from google import genai as google_genai
+import base64
+
+GEMINI_API_KEY = "AIzaSyCRQ6CvyI2iYJF3pD_7MsVGaXQAH5uSZf0"
+GEMINI_CLIENT = google_genai.Client(api_key=GEMINI_API_KEY)
+
 ##### =============================================================================================
 ##### BOT TOKEN TO USE
 ##### =============================================================================================
@@ -220,17 +226,71 @@ def natural_sort_key(s):
         for chunk in re.split(r'(\d+)', s)
     ]
 
-def escape_md(text: str) -> str:
-    """
-    Escape special MarkdownV1 characters in dynamic text.
-    Prevents user-supplied text from accidentally triggering bold/italic/code formatting.
-    """
-    if not text:
-        return ""
-    # Order matters: escape backslash first to avoid double-escaping
-    for ch in ['\\', '_', '*', '[', '`']:
-        text = text.replace(ch, f'\\{ch}')
-    return text
+# =========================
+# GEMINI IMAGE SCANNER
+# =========================
+async def scan_image_with_gemini(file_bytes: bytes):
+    import json
+
+    prompt = """You are a quiz question extractor. Analyze this image and extract:
+1. The full question text
+2. All answer options (there should be exactly 4, labeled A/B/C/D or 1/2/3/4 or similar)
+
+Respond ONLY with a valid JSON object in this exact format, no explanation, no markdown:
+{
+  "question": "the full question text here",
+  "options": ["option A text", "option B text", "option C text", "option D text"]
+}
+
+Rules:
+- If no clear question is found, set "question" to ""
+- If options are missing or fewer than 4, fill missing ones with ""
+- Strip any leading labels like "A.", "1.", "(a)" from option text
+- Preserve the original wording exactly, including punctuation
+- Do NOT include the correct answer indicator"""
+
+    try:
+        loop = asyncio.get_event_loop()
+
+        def _call_gemini():
+            response = GEMINI_CLIENT.models.generate_content(
+                model="gemini-1.5-flash-latest",
+                contents=[
+                    google_genai.types.Part.from_bytes(
+                        data=file_bytes,
+                        mime_type="image/jpeg",
+                    ),
+                    prompt,
+                ]
+            )
+            return response.text
+
+        raw = await loop.run_in_executor(None, _call_gemini)
+
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        raw = raw.strip()
+
+        data = json.loads(raw)
+
+        question = (data.get("question") or "").strip()
+        options  = [str(o).strip() for o in (data.get("options") or [])]
+
+        while len(options) < 4:
+            options.append("")
+
+        options = options[:4]
+
+        valid_options = [o for o in options if o]
+
+        return question, valid_options
+
+    except Exception as e:
+        print(f"⚠️ Gemini scan error: {e}")
+        return "", []
 
 def get_active_user_id(context) -> int:
     """
@@ -940,7 +1000,112 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ================= NEW QUESTION IMAGE STEP =================
     q_state = context.user_data.get("add_q_state")
 
-    if q_state != "NEW_Q_IMAGE":
+    if q_state not in ("NEW_Q_IMAGE", "NEW_Q_PHOTO_WAIT"):
+        return
+
+    # ================= OCR SCAN PHOTO (GEMINI) =================
+    if q_state == "NEW_Q_PHOTO_WAIT":
+        photo   = update.message.photo[-1]
+        file_id = photo.file_id
+
+        context.user_data.setdefault("question_flow_msgs", []).append(
+            update.message.message_id
+        )
+
+        processing_msg = await update.message.reply_text("🔍 Scanning image with Gemini AI, please wait...")
+        context.user_data["question_flow_msgs"].append(processing_msg.message_id)
+
+        try:
+            tg_file    = await context.bot.get_file(file_id)
+            file_bytes = await tg_file.download_as_bytearray()
+            question, options = await scan_image_with_gemini(bytes(file_bytes))
+
+        except Exception as e:
+            print("⚠️ Gemini scan failed:", e)
+            await processing_msg.edit_text(
+                "❌ Failed to scan the image. Please try again with a clearer photo."
+            )
+            context.user_data["add_q_state"] = "NEW_Q_PHOTO_WAIT"
+            return
+
+        try:
+            await processing_msg.delete()
+            context.user_data["question_flow_msgs"].remove(processing_msg.message_id)
+        except:
+            pass
+
+        if not question and not options:
+            msg = await update.message.reply_text(
+                "❌ No question text was detected in the image.\n\n"
+                "Please send a clearer photo and try again.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
+                ])
+            )
+            context.user_data["question_flow_msgs"].append(msg.message_id)
+            context.user_data["add_q_state"] = "NEW_Q_PHOTO_WAIT"
+            return
+
+        context.user_data["ocr_question"] = question
+        context.user_data["ocr_options"]  = options
+        context.user_data["add_q_state"]  = "NEW_Q_PHOTO_CONFIRM"
+
+        labels      = ["A", "B", "C", "D"]
+        result_text = "🔍 *Scanned Result (Gemini AI):*\n\n"
+
+        if question:
+            result_text += f"📝 *Question:*\n{escape_md(question)}\n\n"
+        else:
+            result_text += "⚠️ _No question text detected._\n\n"
+
+        if options:
+            result_text += "🔤 *Options:*\n"
+            for i, opt in enumerate(options):
+                label = labels[i] if i < len(labels) else str(i + 1)
+                result_text += f"{label}. {escape_md(opt)}\n"
+        else:
+            result_text += "⚠️ _No options detected._\n"
+
+        buttons = []
+        if question and len(options) == 4 and all(options):
+            buttons.append([
+                InlineKeyboardButton("✅ Use This",  callback_data="OCR_ACCEPT"),
+                InlineKeyboardButton("🔄 Retake",    callback_data="OCR_RETAKE"),
+            ])
+        else:
+            missing = []
+            if not question:
+                missing.append("question text")
+            missing_opts = [labels[i] for i in range(len(options)) if not options[i]]
+            if missing_opts:
+                missing.append(f"option(s) {', '.join(missing_opts)}")
+            if not options:
+                missing.append("all options")
+
+            result_text += (
+                f"\n\n⚠️ _Could not fully detect: {', '.join(missing)}. "
+                "Retake with a clearer photo or cancel._"
+            )
+            if question and len([o for o in options if o]) >= 2:
+                buttons.append([
+                    InlineKeyboardButton("✅ Use This",  callback_data="OCR_ACCEPT"),
+                    InlineKeyboardButton("🔄 Retake",    callback_data="OCR_RETAKE"),
+                ])
+            else:
+                buttons.append([
+                    InlineKeyboardButton("🔄 Retake", callback_data="OCR_RETAKE"),
+                ])
+
+        buttons.append([
+            InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")
+        ])
+
+        msg = await update.message.reply_text(
+            result_text,
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown"
+        )
+        context.user_data["question_flow_msgs"].append(msg.message_id)
         return
 
     photo = update.message.photo[-1]
@@ -3533,6 +3698,23 @@ async def home_create_question(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
 
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Create Manually", callback_data="HOME_CREATE_MANUALLY"),
+            InlineKeyboardButton("📷 Send Photo",      callback_data="HOME_CREATE_PHOTO"),
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="GO_HOME")],
+    ])
+
+    await query.message.edit_text(
+        "❓ Create a Question\n\nChoose how to create your question:",
+        reply_markup=keyboard
+    )
+
+async def home_create_manually(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
     # 🔒 Clear any quiz-specific state
     context.user_data.pop("active_quiz_id", None)
     context.user_data.pop("active_question_id", None)
@@ -3556,16 +3738,41 @@ async def home_create_question(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
     ])
 
-    msg = await query.message.reply_text(
+    await query.message.edit_text(
         "❓ Create a Question\n\n📝 Send question text:",
         reply_markup=keyboard
     )
 
-    # 🔑 Track the FIRST prompt message (existing system)
-    context.user_data["question_flow_msgs"].append(msg.message_id)
+    # 🔑 Track the prompt message (now the edited menu message)
+    context.user_data["question_flow_msgs"].append(query.message.message_id)
 
     # 🔑 Track specifically for duplicate cancel cleanup
-    context.user_data["create_q_prompt_msg_id"] = msg.message_id
+    context.user_data["create_q_prompt_msg_id"] = query.message.message_id
+
+async def home_create_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # 🔑 Set state — waiting for the user to send a photo
+    context.user_data["add_q_state"]       = "NEW_Q_PHOTO_WAIT"
+    context.user_data["new_question"]       = {"options": []}
+    context.user_data["question_flow_msgs"] = []
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
+    ])
+
+    await query.message.edit_text(
+        "📷 *Send Photo*\n\n"
+        "Send a clear photo of your question.\n"
+        "Make sure the text and answer options are fully visible.",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+    # 🔑 Track this message for cleanup
+    context.user_data["create_q_prompt_msg_id"] = query.message.message_id
+    context.user_data["question_flow_msgs"].append(query.message.message_id)
 
 async def back_to_folders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -6430,6 +6637,57 @@ async def qb_open_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.edit_text(
         f"📁 **{folder_name}**\n\nSelect questions:",
         reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+
+async def ocr_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User confirmed the OCR result — move to correct answer selection."""
+    query = update.callback_query
+    await query.answer()
+
+    question = context.user_data.pop("ocr_question", "")
+    options  = context.user_data.pop("ocr_options", [])
+
+    # ✅ Store in new_question exactly like the manual flow
+    context.user_data["new_question"] = {
+        "text":    question,
+        "options": options,
+        "image":   None,
+    }
+
+    context.user_data["add_q_state"] = "NEW_Q_CORRECT"
+
+    labels = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{labels[i]} {options[i]}", callback_data=f"CORRECT_{i}")]
+        for i in range(len(options))
+    ])
+
+    msg = await query.message.reply_text(
+        "✅ Choose the correct answer:",
+        reply_markup=keyboard
+    )
+    context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
+
+
+async def ocr_retake(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User wants to send a different photo."""
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data.pop("ocr_question", None)
+    context.user_data.pop("ocr_options",  None)
+    context.user_data["add_q_state"] = "NEW_Q_PHOTO_WAIT"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
+    ])
+
+    await query.message.edit_text(
+        "📷 *Send Photo*\n\n"
+        "Send a clear photo of your question.\n"
+        "Make sure the text and answer options are fully visible.",
+        reply_markup=keyboard,
         parse_mode="Markdown"
     )
 
@@ -10148,6 +10406,10 @@ app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pat
 app.add_handler(CallbackQueryHandler(qb_pick_folder_start, pattern="^QB_PICK_FOLDER$"))
 app.add_handler(CallbackQueryHandler(qb_folder_prev, pattern="^QB_FOLDER_PREV$"))
 app.add_handler(CallbackQueryHandler(qb_folder_next, pattern="^QB_FOLDER_NEXT$"))
+app.add_handler(CallbackQueryHandler(home_create_manually, pattern="^HOME_CREATE_MANUALLY$"))
+app.add_handler(CallbackQueryHandler(home_create_photo,    pattern="^HOME_CREATE_PHOTO$"))
+app.add_handler(CallbackQueryHandler(ocr_accept,           pattern="^OCR_ACCEPT$"))
+app.add_handler(CallbackQueryHandler(ocr_retake,           pattern="^OCR_RETAKE$"))
 app.add_handler(CallbackQueryHandler(home_create_question, pattern="^HOME_CREATE_QUESTION$"))
 app.add_handler(CallbackQueryHandler(database_add_folder_start, pattern="^DB_ADD$"))
 app.add_handler(CallbackQueryHandler(confirm_delete, pattern="^CONFIRM_DELETE$"))
