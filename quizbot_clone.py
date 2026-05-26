@@ -39,7 +39,12 @@ from difflib import SequenceMatcher
 from google import genai as google_genai
 import base64
 
-GEMINI_API_KEY = "AIzaSyCRQ6CvyI2iYJF3pD_7MsVGaXQAH5uSZf0"
+##### =============================================================================================
+##### GEMINI_API_KEY TO USE
+##### =============================================================================================
+##### GEMINI_API_KEY TO USE FOR GITHUB    - GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
 GEMINI_CLIENT = google_genai.Client(api_key=GEMINI_API_KEY)
 
 ##### =============================================================================================
@@ -105,6 +110,18 @@ SUBSCRIPTION_DURATIONS = {
 ## =========================
 ## HELPERS
 ## =========================
+
+def escape_md(text: str) -> str:
+    """
+    Escapes special Markdown characters for Telegram's MarkdownV1 parse mode.
+    """
+    if not text:
+        return ""
+    # Characters that need escaping in Telegram Markdown
+    escape_chars = ['_', '*', '`', '[']
+    for ch in escape_chars:
+        text = text.replace(ch, f'\\{ch}')
+    return text
 
 # =========================
 # OWNER RESTORE
@@ -252,18 +269,16 @@ Rules:
     try:
         loop = asyncio.get_event_loop()
 
-        # ✅ FIX: Build the Part BEFORE entering the executor,
-        # and pass both as proper Part objects
         image_part = google_genai.types.Part.from_bytes(
             data=file_bytes,
             mime_type="image/jpeg",
         )
-        text_part = google_genai.types.Part.from_text(prompt)
+        text_part = google_genai.types.Part.from_text(text=prompt)
 
         def _call_gemini():
             response = GEMINI_CLIENT.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=[image_part, text_part],  # ✅ Both proper Parts
+                model="gemini-2.5-flash",       # ✅ Updated model
+                contents=[image_part, text_part],
             )
             return response.text
 
@@ -285,14 +300,23 @@ Rules:
             options.append("")
 
         options = options[:4]
-
         valid_options = [o for o in options if o]
 
         return question, valid_options
 
     except Exception as e:
         print(f"⚠️ Gemini scan error: {e}")
-        return "", []
+        error_str = str(e).lower()
+        if "503" in error_str or "unavailable" in error_str or "high demand" in error_str:
+            raise RuntimeError("🔴 Gemini AI is currently overloaded. Please try again in a moment.")
+        elif "429" in error_str or "quota" in error_str or "rate" in error_str:
+            raise RuntimeError("🔴 Gemini AI rate limit reached. Please wait a moment and try again.")
+        elif "403" in error_str or "permission" in error_str or "api key" in error_str:
+            raise RuntimeError("🔴 Gemini API key error. Please contact the bot admin.")
+        elif "404" in error_str or "not found" in error_str:
+            raise RuntimeError("🔴 Gemini model not found. Please contact the bot admin.")
+        else:
+            raise RuntimeError(f"🔴 Gemini AI error: {e}")
 
 def get_active_user_id(context) -> int:
     """
@@ -1024,8 +1048,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             print("⚠️ Gemini scan failed:", e)
+            error_msg = str(e) if str(e).startswith("🔴") else "❌ Failed to scan the image. Please try again with a clearer photo."
             await processing_msg.edit_text(
-                "❌ Failed to scan the image. Please try again with a clearer photo."
+                error_msg,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Retry", callback_data="OCR_RETAKE")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
+                ])
             )
             context.user_data["add_q_state"] = "NEW_Q_PHOTO_WAIT"
             return
