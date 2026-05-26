@@ -263,6 +263,9 @@ Rules:
 - If no clear question is found, set "question" to ""
 - If options are missing or fewer than 4, fill missing ones with ""
 - Strip any leading labels like "A.", "1.", "(a)" from option text
+- Strip any leading number or bullet from the question text itself.
+  Examples of what to remove: "1.", "2.", "3)", "(1)", "•", "-", "–", "Q1.", "Q."
+  The question must start with the actual question content, not a number or symbol.
 - Preserve the original wording exactly, including punctuation
 - Do NOT include the correct answer indicator"""
 
@@ -1517,6 +1520,102 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         await rebuild_question_preview(chat_id, context)
 
+        return
+
+    # ================= OCR EDIT: QUESTION TEXT =================
+    if q_state == "OCR_EDIT_Q_TEXT":
+        new_text = text.strip()
+        chat_id  = update.effective_chat.id
+
+        if len(new_text) > MAX_QUESTION_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Question is too long ({len(new_text)} characters).\n"
+                f"Maximum allowed: {MAX_QUESTION_LENGTH} characters.\n\nPlease shorten and send again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, update.message.message_id),
+                return_exceptions=True
+            )
+            return
+
+        # Save the corrected text
+        context.user_data["new_question"]["text"] = new_text
+
+        # 🧹 Delete prompt + quote bubble + user message
+        prompt_id    = context.user_data.pop("ocr_edit_prompt_id",    None)
+        quote_msg_id = context.user_data.pop("ocr_edit_quote_msg_id", None)
+
+        delete_tasks = [context.bot.delete_message(chat_id, update.message.message_id)]
+        if prompt_id:
+            delete_tasks.append(context.bot.delete_message(chat_id, prompt_id))
+        if quote_msg_id:
+            delete_tasks.append(context.bot.delete_message(chat_id, quote_msg_id))
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+        # Return to review on a fresh message
+        context.user_data["add_q_state"] = "OCR_REVIEW"
+        new_msg = await context.bot.send_message(chat_id, "⏳")
+        context.user_data["ocr_review_msg_id"] = new_msg.message_id
+        context.user_data.setdefault("question_flow_msgs", []).append(new_msg.message_id)
+        await show_ocr_review(new_msg, context)
+        return
+
+    # ================= OCR EDIT: OPTIONS =================
+    if q_state in ("OCR_EDIT_OPT_1", "OCR_EDIT_OPT_2", "OCR_EDIT_OPT_3", "OCR_EDIT_OPT_4"):
+        chat_id = update.effective_chat.id
+
+        if len(text) > MAX_OPTION_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Option is too long ({len(text)} characters).\n"
+                f"Maximum allowed: {MAX_OPTION_LENGTH} characters.\n\nPlease shorten and send again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, update.message.message_id),
+                return_exceptions=True
+            )
+            return
+
+        context.user_data.setdefault("ocr_new_options", []).append(text.strip())
+        count = len(context.user_data["ocr_new_options"])
+
+        # Delete old prompt + user message
+        prompt_id    = context.user_data.pop("ocr_edit_prompt_id", None)
+        delete_tasks = [context.bot.delete_message(chat_id, update.message.message_id)]
+        if prompt_id:
+            delete_tasks.append(context.bot.delete_message(chat_id, prompt_id))
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+        option_labels = ["A", "B", "C", "D"]
+
+        if count < 4:
+            # Ask for the next option
+            next_label = option_labels[count]
+            context.user_data["add_q_state"] = f"OCR_EDIT_OPT_{count + 1}"
+
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data="OCR_EDIT_CANCEL")]
+            ])
+            msg = await context.bot.send_message(
+                chat_id,
+                f"✏️ Send corrected *Option {next_label}*:",
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+            context.user_data["ocr_edit_prompt_id"] = msg.message_id
+            context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
+        else:
+            # All 4 collected — commit to new_question and return to review
+            context.user_data["new_question"]["options"] = context.user_data.pop("ocr_new_options")
+            context.user_data["add_q_state"] = "OCR_REVIEW"
+
+            new_msg = await context.bot.send_message(chat_id, "⏳")
+            context.user_data["ocr_review_msg_id"] = new_msg.message_id
+            context.user_data.setdefault("question_flow_msgs", []).append(new_msg.message_id)
+            await show_ocr_review(new_msg, context)
         return
 
     # 📝 Question text (NEW QUESTION — WITH DUPLICATE CHECK)
@@ -3747,16 +3846,25 @@ async def home_create_manually(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
 
     # 🔒 Clear any quiz-specific state
-    context.user_data.pop("active_quiz_id", None)
-    context.user_data.pop("active_question_id", None)
-    context.user_data.pop("edit_q_field", None)
-    context.user_data.pop("add_q_state", None)
-    context.user_data.pop("new_question", None)
+    context.user_data.pop("active_quiz_id",            None)
+    context.user_data.pop("active_question_id",        None)
+    context.user_data.pop("edit_q_field",              None)
+    context.user_data.pop("add_q_state",               None)
+    context.user_data.pop("new_question",              None)
 
     # 🧹 Clear any leftover duplicate tracking (safety)
-    context.user_data.pop("create_q_prompt_msg_id", None)
+    context.user_data.pop("create_q_prompt_msg_id",    None)
     context.user_data.pop("last_user_question_msg_id", None)
-    context.user_data.pop("pending_duplicate_text", None)
+    context.user_data.pop("pending_duplicate_text",    None)
+
+    # 🔑 Clear OCR flow flag and all OCR staging keys
+    context.user_data.pop("ocr_flow",                  None)
+    context.user_data.pop("ocr_question",              None)
+    context.user_data.pop("ocr_options",               None)
+    context.user_data.pop("ocr_review_msg_id",         None)
+    context.user_data.pop("ocr_new_options",           None)
+    context.user_data.pop("ocr_edit_prompt_id",        None)
+    context.user_data.pop("ocr_edit_quote_msg_id",     None)
 
     # 🔑 Initialize Question Flow Tracker
     context.user_data["question_flow_msgs"] = []
@@ -3788,6 +3896,7 @@ async def home_create_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["add_q_state"]       = "NEW_Q_PHOTO_WAIT"
     context.user_data["new_question"]       = {"options": []}
     context.user_data["question_flow_msgs"] = []
+    context.user_data["ocr_flow"]           = True   # 🔑 Mark as OCR flow
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
@@ -4144,15 +4253,26 @@ async def save_new_question(message, context):
         [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
     ])
 
-    context.user_data["add_q_state"] = "NEW_Q_TEXT"
-    context.user_data["new_question"] = {"options": []}
+    # 🔑 Restart in the same mode the user originally chose
+    if context.user_data.get("ocr_flow"):
+        context.user_data["add_q_state"] = "NEW_Q_PHOTO_WAIT"
+        context.user_data["new_question"] = {"options": []}
 
-    msg = await message.reply_text(
-        "❓ Create a Question\n\n📝 Send question text:",
-        reply_markup=keyboard
-    )
+        msg = await message.reply_text(
+            "📷 Send Photo\n\nSend a clear photo of your next question.\n"
+            "Make sure the text and answer options are fully visible.",
+            reply_markup=keyboard
+        )
+    else:
+        context.user_data["add_q_state"] = "NEW_Q_TEXT"
+        context.user_data["new_question"] = {"options": []}
 
-    context.user_data["question_flow_msgs"] = [msg.message_id]
+        msg = await message.reply_text(
+            "❓ Create a Question\n\n📝 Send question text:",
+            reply_markup=keyboard
+        )
+
+    context.user_data["question_flow_msgs"]     = [msg.message_id]
     context.user_data["create_q_prompt_msg_id"] = msg.message_id
 
 async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6671,35 +6791,268 @@ async def qb_open_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+# =========================
+# OCR REVIEW FLOW
+# =========================
+
+async def show_ocr_review(message, context):
+    """Renders the OCR review/edit screen on an existing message object."""
+    q    = context.user_data.get("new_question", {})
+    text = q.get("text", "")
+    opts = q.get("options", [])
+
+    labels  = ["A", "B", "C", "D"]
+    display = f"📋 *Review Scanned Question*\n\n"
+    display += f"📝 *Question:*\n{escape_md(text)}\n\n"
+    display += "🔤 *Options:*\n"
+    for i, opt in enumerate(opts):
+        lbl = labels[i] if i < len(labels) else str(i + 1)
+        display += f"{lbl}. {escape_md(opt)}\n"
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Edit Question", callback_data="OCR_EDIT_QUESTION"),
+            InlineKeyboardButton("✏️ Edit Options",  callback_data="OCR_EDIT_OPTIONS"),
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel",             callback_data="CANCEL_CREATE_QUESTION"),
+            InlineKeyboardButton("✅ Confirm & Continue", callback_data="OCR_CONFIRM"),
+        ],
+    ])
+
+    try:
+        await message.edit_text(
+            display,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+        context.user_data["ocr_review_msg_id"] = message.message_id
+    except Exception:
+        msg = await message.reply_text(
+            display,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+        context.user_data["ocr_review_msg_id"] = msg.message_id
+        context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
+
+
 async def ocr_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User confirmed the OCR result — move to correct answer selection."""
+    """User confirmed the OCR result — go to review/edit screen first."""
     query = update.callback_query
     await query.answer()
 
-    question = context.user_data.pop("ocr_question", "")
-    options  = context.user_data.pop("ocr_options", [])
+    # Keep ocr_ keys alive — only pop them after the user fully confirms
+    question = context.user_data.get("ocr_question", "")
+    options  = context.user_data.get("ocr_options", [])
 
-    # ✅ Store in new_question exactly like the manual flow
+    # Stage into new_question (copy options so edits don't corrupt ocr_ originals)
     context.user_data["new_question"] = {
         "text":    question,
-        "options": options,
+        "options": options[:],
         "image":   None,
     }
 
-    context.user_data["add_q_state"] = "NEW_Q_CORRECT"
+    context.user_data["add_q_state"] = "OCR_REVIEW"
 
-    labels = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
+    await show_ocr_review(query.message, context)
+
+
+async def ocr_edit_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User wants to correct the scanned question text."""
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["add_q_state"] = "OCR_EDIT_Q_TEXT"
+    chat_id = query.message.chat_id
+
+    # 🔑 Get the current scanned/staged question text
+    current_text = context.user_data.get("new_question", {}).get("text", "")
+
+    # ── Message 1: plain prompt (no buttons) ──────────────────────
+    prompt_msg = await context.bot.send_message(
+        chat_id,
+        "✏️ Send the corrected question text:\n\n📝 Scanned Question:"
+    )
+
+    # ── Message 2: the scanned question text + Cancel button ───────
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{labels[i]} {options[i]}", callback_data=f"CORRECT_{i}")]
-        for i in range(len(options))
+        [InlineKeyboardButton("❌ Cancel", callback_data="OCR_EDIT_CANCEL")]
+    ])
+
+    quote_msg = await context.bot.send_message(
+        chat_id,
+        f"{escape_md(current_text)}",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+    # 🔑 Track BOTH messages for cleanup
+    context.user_data["ocr_edit_prompt_id"]    = prompt_msg.message_id
+    context.user_data["ocr_edit_quote_msg_id"] = quote_msg.message_id
+    context.user_data.setdefault("question_flow_msgs", []).append(prompt_msg.message_id)
+    context.user_data.setdefault("question_flow_msgs", []).append(quote_msg.message_id)
+
+
+async def ocr_edit_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User wants to correct the scanned answer options."""
+    query = update.callback_query
+    await query.answer()
+
+    # Clear any previous partial edit buffer
+    context.user_data["ocr_new_options"] = []
+    context.user_data["add_q_state"]     = "OCR_EDIT_OPT_1"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="OCR_EDIT_CANCEL")]
     ])
 
     msg = await query.message.reply_text(
-        "✅ Choose the correct answer:",
-        reply_markup=keyboard
+        "✏️ Send corrected *Option A*:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
     )
+    context.user_data["ocr_edit_prompt_id"] = msg.message_id
     context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
 
+
+async def ocr_edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancels an in-progress edit and returns to the review screen."""
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+
+    # 🧹 The Cancel button lives on the quote bubble — delete it
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    # 🧹 Delete the plain prompt message (Message 1)
+    prompt_id = context.user_data.pop("ocr_edit_prompt_id", None)
+    if prompt_id and prompt_id != query.message.message_id:
+        try:
+            await context.bot.delete_message(chat_id, prompt_id)
+        except Exception:
+            pass
+
+    # 🧹 Delete the quote bubble if tracked separately (Message 2)
+    # (covers the case where Cancel is on a different message than the quote)
+    quote_msg_id = context.user_data.pop("ocr_edit_quote_msg_id", None)
+    if quote_msg_id and quote_msg_id != query.message.message_id:
+        try:
+            await context.bot.delete_message(chat_id, quote_msg_id)
+        except Exception:
+            pass
+
+    # Discard any partially collected options
+    context.user_data.pop("ocr_new_options", None)
+
+    # Return to review
+    context.user_data["add_q_state"] = "OCR_REVIEW"
+
+    new_msg = await context.bot.send_message(chat_id, "⏳")
+    context.user_data["ocr_review_msg_id"] = new_msg.message_id
+    context.user_data.setdefault("question_flow_msgs", []).append(new_msg.message_id)
+    await show_ocr_review(new_msg, context)
+
+
+async def ocr_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    User tapped Confirm & Continue.
+    Runs the duplicate check before proceeding to answer selection.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    q        = context.user_data.get("new_question", {})
+    new_text = q.get("text", "").strip()
+
+    if not new_text:
+        await query.answer("❌ Question text is empty.", show_alert=True)
+        return
+
+    # ── DUPLICATE CHECK (identical logic to the manual flow) ──────
+    similar_matches = []
+
+    _conn_dup, _cur_dup = get_db()
+    _cur_dup.execute("SELECT id, question FROM question_bank")
+    existing_questions = _cur_dup.fetchall()
+    _conn_dup.close()
+
+    for _qid, existing_text in existing_questions:
+        similarity = SequenceMatcher(
+            None,
+            new_text.lower(),
+            existing_text.lower()
+        ).ratio()
+        if similarity >= 0.80:
+            similar_matches.append((similarity, existing_text))
+
+    similar_matches.sort(reverse=True, key=lambda x: x[0])
+
+    if similar_matches:
+        top_matches = similar_matches[:5]
+
+        warning_text = "⚠️ *Similar question(s) found:*\n\n"
+        for i, (_, q_text) in enumerate(top_matches, 1):
+            _conn_qr, _cur_qr = get_db()
+            _cur_qr.execute(
+                "SELECT options, correct FROM question_bank WHERE question=? LIMIT 1",
+                (q_text,)
+            )
+            q_row = _cur_qr.fetchone()
+            _conn_qr.close()
+
+            if q_row:
+                opts        = q_row[0].split("||")
+                correct_idx = q_row[1]
+                correct_text = opts[correct_idx] if 0 <= correct_idx < len(opts) else "—"
+                warning_text += (
+                    f"{i}. {escape_md(q_text[:80])}\n"
+                    f"    ✅ _{escape_md(correct_text)}_\n\n"
+                )
+            else:
+                warning_text += f"{i}. {escape_md(q_text[:80])}\n\n"
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Create Anyway", callback_data="OCR_DUP_CREATE_ANYWAY"),
+                InlineKeyboardButton("✏️ Edit Question", callback_data="OCR_EDIT_QUESTION"),
+            ],
+            [
+                InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION"),
+            ]
+        ])
+
+        context.user_data["add_q_state"] = "OCR_CONFIRM_DUPLICATE"
+
+        try:
+            await query.message.edit_text(
+                warning_text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+        except Exception:
+            msg = await query.message.reply_text(
+                warning_text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+            context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
+        return
+
+    # ── NO DUPLICATE — proceed straight to answer selection ───────
+    await _ocr_proceed_to_correct(query.message, context)
+
+
+async def ocr_dup_create_anyway(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User acknowledged the duplicate warning and wants to save anyway."""
+    query = update.callback_query
+    await query.answer()
+
+    await _ocr_proceed_to_correct(query.message, context)
 
 async def ocr_retake(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User wants to send a different photo."""
@@ -6722,6 +7075,40 @@ async def ocr_retake(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+async def _ocr_proceed_to_correct(message, context):
+    """
+    Shared final step: cleans up OCR staging data and shows
+    the correct-answer selection keyboard.
+    """
+    q    = context.user_data.get("new_question", {})
+    opts = q.get("options", [])
+
+    # Clean up OCR staging keys — no longer needed
+    context.user_data.pop("ocr_question",      None)
+    context.user_data.pop("ocr_options",       None)
+    context.user_data.pop("ocr_review_msg_id", None)
+    context.user_data.pop("ocr_new_options",   None)
+
+    context.user_data["add_q_state"] = "NEW_Q_CORRECT"
+
+    labels = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{labels[i]} {opts[i]}", callback_data=f"CORRECT_{i}")]
+        for i in range(len(opts))
+    ])
+
+    try:
+        await message.edit_text(
+            "✅ Choose the correct answer:",
+            reply_markup=keyboard
+        )
+    except Exception:
+        msg = await message.reply_text(
+            "✅ Choose the correct answer:",
+            reply_markup=keyboard
+        )
+        context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
+
 async def cancel_create_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -6734,13 +7121,17 @@ async def cancel_create_question(update: Update, context: ContextTypes.DEFAULT_T
     except:
         pass
 
-    # 🧹 Clear question creation state
-    context.user_data.pop("add_q_state", None)
-    context.user_data.pop("new_question", None)
-    context.user_data.pop("question_flow_msgs", None)
-
-    # 🚫 DO NOT redraw Home
-    # 🚫 DO NOT send any new message
+    # 🧹 Clear question creation state including ocr_flow flag
+    context.user_data.pop("add_q_state",        None)
+    context.user_data.pop("new_question",        None)
+    context.user_data.pop("question_flow_msgs",  None)
+    context.user_data.pop("ocr_flow",            None)
+    context.user_data.pop("ocr_question",        None)
+    context.user_data.pop("ocr_options",         None)
+    context.user_data.pop("ocr_review_msg_id",   None)
+    context.user_data.pop("ocr_new_options",     None)
+    context.user_data.pop("ocr_edit_prompt_id",  None)
+    context.user_data.pop("ocr_edit_quote_msg_id", None)
 
 async def cancel_timer_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -10439,8 +10830,13 @@ app.add_handler(CallbackQueryHandler(qb_folder_prev, pattern="^QB_FOLDER_PREV$")
 app.add_handler(CallbackQueryHandler(qb_folder_next, pattern="^QB_FOLDER_NEXT$"))
 app.add_handler(CallbackQueryHandler(home_create_manually, pattern="^HOME_CREATE_MANUALLY$"))
 app.add_handler(CallbackQueryHandler(home_create_photo,    pattern="^HOME_CREATE_PHOTO$"))
-app.add_handler(CallbackQueryHandler(ocr_accept,           pattern="^OCR_ACCEPT$"))
-app.add_handler(CallbackQueryHandler(ocr_retake,           pattern="^OCR_RETAKE$"))
+app.add_handler(CallbackQueryHandler(ocr_edit_question,     pattern="^OCR_EDIT_QUESTION$"))
+app.add_handler(CallbackQueryHandler(ocr_edit_options,      pattern="^OCR_EDIT_OPTIONS$"))
+app.add_handler(CallbackQueryHandler(ocr_edit_cancel,       pattern="^OCR_EDIT_CANCEL$"))
+app.add_handler(CallbackQueryHandler(ocr_confirm,           pattern="^OCR_CONFIRM$"))
+app.add_handler(CallbackQueryHandler(ocr_dup_create_anyway, pattern="^OCR_DUP_CREATE_ANYWAY$"))
+app.add_handler(CallbackQueryHandler(ocr_accept,            pattern="^OCR_ACCEPT$"))
+app.add_handler(CallbackQueryHandler(ocr_retake,            pattern="^OCR_RETAKE$"))
 app.add_handler(CallbackQueryHandler(home_create_question, pattern="^HOME_CREATE_QUESTION$"))
 app.add_handler(CallbackQueryHandler(database_add_folder_start, pattern="^DB_ADD$"))
 app.add_handler(CallbackQueryHandler(confirm_delete, pattern="^CONFIRM_DELETE$"))
