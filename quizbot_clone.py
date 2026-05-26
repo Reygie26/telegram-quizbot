@@ -252,16 +252,18 @@ Rules:
     try:
         loop = asyncio.get_event_loop()
 
+        # ✅ FIX: Build the Part BEFORE entering the executor,
+        # and pass both as proper Part objects
+        image_part = google_genai.types.Part.from_bytes(
+            data=file_bytes,
+            mime_type="image/jpeg",
+        )
+        text_part = google_genai.types.Part.from_text(prompt)
+
         def _call_gemini():
             response = GEMINI_CLIENT.models.generate_content(
                 model="gemini-2.0-flash",
-                contents=[
-                    google_genai.types.Part.from_bytes(
-                        data=file_bytes,
-                        mime_type="image/jpeg",
-                    ),
-                    prompt,
-                ]
+                contents=[image_part, text_part],  # ✅ Both proper Parts
             )
             return response.text
 
