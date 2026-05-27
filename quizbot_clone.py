@@ -39,13 +39,32 @@ from difflib import SequenceMatcher
 from google import genai as google_genai
 import base64
 
-##### =============================================================================================
-##### GEMINI_API_KEY TO USE
-##### =============================================================================================
-##### GEMINI_API_KEY TO USE FOR GITHUB    - GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# =============================================================================================
+# GEMINI API KEY ROTATION
+# =============================================================================================
+# For TEST BOT: list your keys manually
+# For RENDER: set env var GEMINI_API_KEYS = "key1,key2,key3,key4,key5"
 
-GEMINI_CLIENT = google_genai.Client(api_key=GEMINI_API_KEY)
+_raw_keys = os.environ.get(
+    "GEMINI_API_KEYS",
+    "AIzaSy_KEY_1,AIzaSy_KEY_2,AIzaSy_KEY_3,AIzaSy_KEY_4,AIzaSy_KEY_5"
+)
+
+GEMINI_API_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
+_gemini_key_index = 0  # tracks which key is currently active
+
+def _get_gemini_client():
+    """Returns a Gemini client using the currently active API key."""
+    return google_genai.Client(api_key=GEMINI_API_KEYS[_gemini_key_index])
+
+def _rotate_gemini_key():
+    """Rotates to the next available Gemini API key. Returns True if rotated, False if all exhausted."""
+    global _gemini_key_index
+    if _gemini_key_index < len(GEMINI_API_KEYS) - 1:
+        _gemini_key_index += 1
+        print(f"🔄 Rotated to Gemini API key index {_gemini_key_index}")
+        return True
+    return False  # all keys exhausted
 
 ##### =============================================================================================
 ##### BOT TOKEN TO USE
@@ -248,6 +267,7 @@ def natural_sort_key(s):
 # =========================
 async def scan_image_with_gemini(file_bytes: bytes):
     import json
+    global _gemini_key_index
 
     prompt = """You are a quiz question extractor. Analyze this image and extract:
 1. The full question text
@@ -269,57 +289,78 @@ Rules:
 - Preserve the original wording exactly, including punctuation
 - Do NOT include the correct answer indicator"""
 
-    try:
-        loop = asyncio.get_event_loop()
+    image_part = google_genai.types.Part.from_bytes(
+        data=file_bytes,
+        mime_type="image/jpeg",
+    )
+    text_part = google_genai.types.Part.from_text(text=prompt)
 
-        image_part = google_genai.types.Part.from_bytes(
-            data=file_bytes,
-            mime_type="image/jpeg",
-        )
-        text_part = google_genai.types.Part.from_text(text=prompt)
+    loop = asyncio.get_event_loop()
 
-        def _call_gemini():
-            response = GEMINI_CLIENT.models.generate_content(
-                model="gemini-2.5-flash",       # ✅ Updated model
-                contents=[image_part, text_part],
-            )
-            return response.text
+    # ── Try each key in sequence until one works ──────────────────────
+    start_index = _gemini_key_index  # remember where we started
 
-        raw = await loop.run_in_executor(None, _call_gemini)
+    while True:
+        try:
+            client = _get_gemini_client()
 
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
+            def _call_gemini():
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=[image_part, text_part],
+                )
+                return response.text
 
-        data = json.loads(raw)
+            raw = await loop.run_in_executor(None, _call_gemini)
 
-        question = (data.get("question") or "").strip()
-        options  = [str(o).strip() for o in (data.get("options") or [])]
+            # ── Parse response ─────────────────────────────────────────
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            raw = raw.strip()
 
-        while len(options) < 4:
-            options.append("")
+            data = json.loads(raw)
+            question = (data.get("question") or "").strip()
+            options  = [str(o).strip() for o in (data.get("options") or [])]
 
-        options = options[:4]
-        valid_options = [o for o in options if o]
+            while len(options) < 4:
+                options.append("")
+            options = options[:4]
 
-        return question, valid_options
+            return question, options
 
-    except Exception as e:
-        print(f"⚠️ Gemini scan error: {e}")
-        error_str = str(e).lower()
-        if "503" in error_str or "unavailable" in error_str or "high demand" in error_str:
-            raise RuntimeError("🔴 Gemini AI is currently overloaded. Please try again in a moment.")
-        elif "429" in error_str or "quota" in error_str or "rate" in error_str:
-            raise RuntimeError("🔴 Gemini AI rate limit reached. Please wait a moment and try again.")
-        elif "403" in error_str or "permission" in error_str or "api key" in error_str:
-            raise RuntimeError("🔴 Gemini API key error. Please contact the bot admin.")
-        elif "404" in error_str or "not found" in error_str:
-            raise RuntimeError("🔴 Gemini model not found. Please contact the bot admin.")
-        else:
-            raise RuntimeError(f"🔴 Gemini AI error: {e}")
+        except Exception as e:
+            error_str = str(e).lower()
+            print(f"⚠️ Gemini key index {_gemini_key_index} error: {e}")
+
+            # ── Rate limit or quota hit → rotate key ──────────────────
+            is_rate_error = any(x in error_str for x in [
+                "429", "quota", "rate", "503", "unavailable", "high demand",
+                "resource_exhausted", "too many requests"
+            ])
+
+            if is_rate_error:
+                rotated = _rotate_gemini_key()
+                if rotated:
+                    print(f"♻️ Retrying with key index {_gemini_key_index}...")
+                    continue  # retry immediately with new key
+                else:
+                    # All keys exhausted — reset index for next session
+                    _gemini_key_index = 0
+                    raise RuntimeError(
+                        "🔴 All Gemini API keys have reached their rate limit. "
+                        "Please try again later."
+                    )
+
+            # ── Non-rate errors: raise immediately (don't rotate) ─────
+            elif "403" in error_str or "permission" in error_str or "api key" in error_str:
+                raise RuntimeError("🔴 Gemini API key error. Please contact the bot admin.")
+            elif "404" in error_str or "not found" in error_str:
+                raise RuntimeError("🔴 Gemini model not found. Please contact the bot admin.")
+            else:
+                raise RuntimeError(f"🔴 Gemini AI error: {e}")
 
 def get_active_user_id(context) -> int:
     """
