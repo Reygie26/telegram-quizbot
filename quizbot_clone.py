@@ -1077,6 +1077,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q_state == "NEW_Q_PHOTO_WAIT":
         photo   = update.message.photo[-1]
         file_id = photo.file_id
+        context.user_data["ocr_photo_file_id"] = file_id  # 🔑 Store for retake/rescan
 
         context.user_data.setdefault("question_flow_msgs", []).append(
             update.message.message_id
@@ -1595,12 +1596,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             delete_tasks.append(context.bot.delete_message(chat_id, quote_msg_id))
         await asyncio.gather(*delete_tasks, return_exceptions=True)
 
-        # Return to review on a fresh message
+        # Return to review — update existing preview message
         context.user_data["add_q_state"] = "OCR_REVIEW"
-        new_msg = await context.bot.send_message(chat_id, "⏳")
-        context.user_data["ocr_review_msg_id"] = new_msg.message_id
-        context.user_data.setdefault("question_flow_msgs", []).append(new_msg.message_id)
-        await show_ocr_review(new_msg, context)
+        review_msg_id = context.user_data.get("ocr_review_msg_id")
+        if review_msg_id:
+            await show_ocr_review_by_id(chat_id, review_msg_id, context)
+        else:
+            new_msg = await context.bot.send_message(chat_id, "⏳")
+            context.user_data["ocr_review_msg_id"] = new_msg.message_id
+            context.user_data.setdefault("question_flow_msgs", []).append(new_msg.message_id)
+            await show_ocr_review(new_msg, context)
         return
 
     # ================= OCR EDIT: OPTIONS =================
@@ -1653,10 +1658,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["new_question"]["options"] = context.user_data.pop("ocr_new_options")
             context.user_data["add_q_state"] = "OCR_REVIEW"
 
-            new_msg = await context.bot.send_message(chat_id, "⏳")
-            context.user_data["ocr_review_msg_id"] = new_msg.message_id
-            context.user_data.setdefault("question_flow_msgs", []).append(new_msg.message_id)
-            await show_ocr_review(new_msg, context)
+            review_msg_id = context.user_data.get("ocr_review_msg_id")
+            if review_msg_id:
+                await show_ocr_review_by_id(chat_id, review_msg_id, context)
+            else:
+                new_msg = await context.bot.send_message(chat_id, "⏳")
+                context.user_data["ocr_review_msg_id"] = new_msg.message_id
+                context.user_data.setdefault("question_flow_msgs", []).append(new_msg.message_id)
+                await show_ocr_review(new_msg, context)
         return
 
     # 📝 Question text (NEW QUESTION — WITH DUPLICATE CHECK)
@@ -6877,6 +6886,52 @@ async def show_ocr_review(message, context):
         context.user_data["ocr_review_msg_id"] = msg.message_id
         context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
 
+async def show_ocr_review_by_id(chat_id: int, message_id: int, context):
+    """
+    Re-renders the OCR review screen by editing an existing message
+    using only chat_id + message_id (no message object required).
+    """
+    q    = context.user_data.get("new_question", {})
+    text = q.get("text", "")
+    opts = q.get("options", [])
+
+    labels  = ["A", "B", "C", "D"]
+    display = "📋 *Review Scanned Question*\n\n"
+    display += f"📝 *Question:*\n{escape_md(text)}\n\n"
+    display += "🔤 *Options:*\n"
+    for i, opt in enumerate(opts):
+        lbl = labels[i] if i < len(labels) else str(i + 1)
+        display += f"{lbl}. {escape_md(opt)}\n"
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Edit Question", callback_data="OCR_EDIT_QUESTION"),
+            InlineKeyboardButton("✏️ Edit Options",  callback_data="OCR_EDIT_OPTIONS"),
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel",             callback_data="CANCEL_CREATE_QUESTION"),
+            InlineKeyboardButton("✅ Confirm & Continue", callback_data="OCR_CONFIRM"),
+        ],
+    ])
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=display,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+        context.user_data["ocr_review_msg_id"] = message_id
+    except Exception:
+        # Fallback: send a new message if edit fails
+        msg = await context.bot.send_message(
+            chat_id, display,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+        context.user_data["ocr_review_msg_id"] = msg.message_id
+        context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
 
 async def ocr_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User confirmed the OCR result — go to review/edit screen first."""
@@ -6944,17 +6999,36 @@ async def ocr_edit_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["ocr_new_options"] = []
     context.user_data["add_q_state"]     = "OCR_EDIT_OPT_1"
 
+    # 🔑 Get current options to show as preview
+    current_opts = context.user_data.get("new_question", {}).get("options", [])
+    labels = ["A", "B", "C", "D"]
+
+    preview_text = "✏️ *Current Options:*\n"
+    for i, opt in enumerate(current_opts):
+        lbl = labels[i] if i < len(labels) else str(i + 1)
+        preview_text += f"{lbl}. {escape_md(opt)}\n"
+
+    # ── Message 1: options preview (no buttons) ──
+    preview_msg = await query.message.reply_text(
+        preview_text,
+        parse_mode="Markdown"
+    )
+
+    # ── Message 2: prompt for Option A + Cancel button ──
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ Cancel", callback_data="OCR_EDIT_CANCEL")]
     ])
-
-    msg = await query.message.reply_text(
+    prompt_msg = await query.message.reply_text(
         "✏️ Send corrected *Option A*:",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
-    context.user_data["ocr_edit_prompt_id"] = msg.message_id
-    context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
+
+    # 🔑 Track both messages for cleanup
+    context.user_data["ocr_edit_quote_msg_id"] = preview_msg.message_id
+    context.user_data["ocr_edit_prompt_id"]    = prompt_msg.message_id
+    context.user_data.setdefault("question_flow_msgs", []).append(preview_msg.message_id)
+    context.user_data.setdefault("question_flow_msgs", []).append(prompt_msg.message_id)
 
 
 async def ocr_edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6990,13 +7064,16 @@ async def ocr_edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Discard any partially collected options
     context.user_data.pop("ocr_new_options", None)
 
-    # Return to review
+    # Return to review — update existing preview message
     context.user_data["add_q_state"] = "OCR_REVIEW"
-
-    new_msg = await context.bot.send_message(chat_id, "⏳")
-    context.user_data["ocr_review_msg_id"] = new_msg.message_id
-    context.user_data.setdefault("question_flow_msgs", []).append(new_msg.message_id)
-    await show_ocr_review(new_msg, context)
+    review_msg_id = context.user_data.get("ocr_review_msg_id")
+    if review_msg_id:
+        await show_ocr_review_by_id(chat_id, review_msg_id, context)
+    else:
+        new_msg = await context.bot.send_message(chat_id, "⏳")
+        context.user_data["ocr_review_msg_id"] = new_msg.message_id
+        context.user_data.setdefault("question_flow_msgs", []).append(new_msg.message_id)
+        await show_ocr_review(new_msg, context)
 
 
 async def ocr_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7063,7 +7140,7 @@ async def ocr_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("✏️ Edit Question", callback_data="OCR_EDIT_QUESTION"),
             ],
             [
-                InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION"),
+                InlineKeyboardButton("❌ Cancel", callback_data="OCR_DUP_CANCEL"),
             ]
         ])
 
@@ -7087,6 +7164,89 @@ async def ocr_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── NO DUPLICATE — proceed straight to answer selection ───────
     await _ocr_proceed_to_correct(query.message, context)
 
+async def ocr_dup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Cancel from the duplicate warning screen.
+    Deletes the warning and rescans the previously uploaded photo.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+
+    # 🧹 Delete the duplicate warning message
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    # 🔄 Clear duplicate state but keep the OCR flow alive
+    context.user_data.pop("ocr_question", None)
+    context.user_data.pop("ocr_options",  None)
+    context.user_data["new_question"] = {"options": []}
+
+    file_id = context.user_data.get("ocr_photo_file_id")
+
+    if not file_id:
+        # No stored photo — ask user to send a new one
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
+        ])
+        msg = await context.bot.send_message(
+            chat_id,
+            "📷 *Send Photo*\n\nSend a clear photo of your question.\n"
+            "Make sure the text and answer options are fully visible.",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+        context.user_data["add_q_state"]            = "NEW_Q_PHOTO_WAIT"
+        context.user_data["create_q_prompt_msg_id"] = msg.message_id
+        context.user_data["question_flow_msgs"]     = [msg.message_id]
+        return
+
+    # ✅ Rescan the previously uploaded photo
+    scanning_msg = await context.bot.send_message(
+        chat_id, "🔍 Re-scanning image with Gemini AI, please wait..."
+    )
+    context.user_data.setdefault("question_flow_msgs", []).append(scanning_msg.message_id)
+
+    try:
+        tg_file    = await context.bot.get_file(file_id)
+        file_bytes = await tg_file.download_as_bytearray()
+        question, options = await scan_image_with_gemini(bytes(file_bytes))
+    except Exception as e:
+        error_str = str(e) if str(e).startswith("🔴") else "❌ Failed to re-scan. Please try again."
+        await scanning_msg.edit_text(
+            error_str,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Retry",  callback_data="OCR_RETAKE")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
+            ])
+        )
+        context.user_data["add_q_state"] = "NEW_Q_PHOTO_WAIT"
+        return
+
+    # 🧹 Delete the scanning message
+    try:
+        await scanning_msg.delete()
+        context.user_data["question_flow_msgs"].remove(scanning_msg.message_id)
+    except Exception:
+        pass
+
+    # ✅ Stage results and show fresh review
+    context.user_data["ocr_question"] = question
+    context.user_data["ocr_options"]  = options
+    context.user_data["new_question"] = {
+        "text":    question,
+        "options": options[:],
+        "image":   None,
+    }
+    context.user_data["add_q_state"] = "OCR_REVIEW"
+
+    new_msg = await context.bot.send_message(chat_id, "⏳")
+    context.user_data["ocr_review_msg_id"] = new_msg.message_id
+    context.user_data.setdefault("question_flow_msgs", []).append(new_msg.message_id)
+    await show_ocr_review(new_msg, context)
 
 async def ocr_dup_create_anyway(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User acknowledged the duplicate warning and wants to save anyway."""
@@ -7096,25 +7256,61 @@ async def ocr_dup_create_anyway(update: Update, context: ContextTypes.DEFAULT_TY
     await _ocr_proceed_to_correct(query.message, context)
 
 async def ocr_retake(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User wants to send a different photo."""
+    """Rescans the previously uploaded photo instead of asking for a new one."""
     query = update.callback_query
     await query.answer()
 
     context.user_data.pop("ocr_question", None)
     context.user_data.pop("ocr_options",  None)
-    context.user_data["add_q_state"] = "NEW_Q_PHOTO_WAIT"
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
-    ])
+    file_id = context.user_data.get("ocr_photo_file_id")
 
-    await query.message.edit_text(
-        "📷 *Send Photo*\n\n"
-        "Send a clear photo of your question.\n"
-        "Make sure the text and answer options are fully visible.",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
+    if not file_id:
+        # No stored photo — fall back to asking for a new one
+        context.user_data["add_q_state"] = "NEW_Q_PHOTO_WAIT"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
+        ])
+        await query.message.edit_text(
+            "📷 *Send Photo*\n\n"
+            "Send a clear photo of your question.\n"
+            "Make sure the text and answer options are fully visible.",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+        return
+
+    # ✅ Re-scan the previously uploaded photo
+    await query.message.edit_text("🔍 Re-scanning image with Gemini AI, please wait...")
+
+    try:
+        tg_file    = await context.bot.get_file(file_id)
+        file_bytes = await tg_file.download_as_bytearray()
+        question, options = await scan_image_with_gemini(bytes(file_bytes))
+    except Exception as e:
+        error_str = str(e) if str(e).startswith("🔴") else "❌ Failed to re-scan the image. Please try again."
+        await query.message.edit_text(
+            error_str,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Retry", callback_data="OCR_RETAKE")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
+            ])
+        )
+        context.user_data["add_q_state"] = "NEW_Q_PHOTO_WAIT"
+        return
+
+    # ✅ Stage results and show review on the SAME message
+    context.user_data["ocr_question"] = question
+    context.user_data["ocr_options"]  = options
+    context.user_data["new_question"] = {
+        "text":    question,
+        "options": options[:],
+        "image":   None,
+    }
+    context.user_data["add_q_state"]    = "OCR_REVIEW"
+    context.user_data["ocr_review_msg_id"] = query.message.message_id
+
+    await show_ocr_review(query.message, context)
 
 async def _ocr_proceed_to_correct(message, context):
     """
@@ -10963,6 +11159,7 @@ app.add_handler(CallbackQueryHandler(ocr_edit_question,     pattern="^OCR_EDIT_Q
 app.add_handler(CallbackQueryHandler(ocr_edit_options,      pattern="^OCR_EDIT_OPTIONS$"))
 app.add_handler(CallbackQueryHandler(ocr_edit_cancel,       pattern="^OCR_EDIT_CANCEL$"))
 app.add_handler(CallbackQueryHandler(ocr_confirm,           pattern="^OCR_CONFIRM$"))
+app.add_handler(CallbackQueryHandler(ocr_dup_cancel,        pattern="^OCR_DUP_CANCEL$"))
 app.add_handler(CallbackQueryHandler(ocr_dup_create_anyway, pattern="^OCR_DUP_CREATE_ANYWAY$"))
 app.add_handler(CallbackQueryHandler(ocr_accept,            pattern="^OCR_ACCEPT$"))
 app.add_handler(CallbackQueryHandler(ocr_retake,            pattern="^OCR_RETAKE$"))
