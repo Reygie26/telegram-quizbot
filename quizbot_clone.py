@@ -10726,6 +10726,98 @@ async def cancel_post_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
+async def gemini_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Owner-only command: /keystatus
+    Tests all Gemini API keys and reports which ones are working.
+    """
+    if update.effective_user.id != OWNER_USER_ID:
+        return
+
+    if not update.message:
+        return
+
+    total = len(GEMINI_API_KEYS)
+    status_msg = await update.message.reply_text(
+        f"🔍 Testing {total} Gemini API key(s)...\nPlease wait."
+    )
+
+    # Tiny 1x1 white JPEG for testing
+    import base64
+    TEST_IMAGE_B64 = (
+        "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8U"
+        "HRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgN"
+        "DRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIy"
+        "MjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFgABAQEAAAAAAAAAAAAAAAAABgUEA"
+        "/8QAIhAAAQMEAgMAAAAAAAAAAAAAAQIDBAUREiExQVH/xAAUAQEAAAAAAAAAAAAAAAAAAAAA"
+        "/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8Amk2"
+        "pa2qp4o3TStYJXBjS4gAuPQDfoqoiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIi"
+        "AiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiA"
+        "iIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiB//Z"
+    )
+    test_bytes = base64.b64decode(TEST_IMAGE_B64)
+
+    results = []
+
+    for i, key in enumerate(GEMINI_API_KEYS):
+        short_key = f"{key[:8]}...{key[-4:]}"
+        try:
+            client = google_genai.Client(api_key=key)
+
+            import asyncio
+            loop = asyncio.get_event_loop()
+
+            image_part = google_genai.types.Part.from_bytes(
+                data=test_bytes,
+                mime_type="image/jpeg",
+            )
+            text_part = google_genai.types.Part.from_text(
+                text="Reply with only the word: OK"
+            )
+
+            def _test_call():
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=[image_part, text_part],
+                )
+                return response.text
+
+            await loop.run_in_executor(None, _test_call)
+
+            # ✅ Key is working
+            active_marker = " ← current" if i == _gemini_key_index else ""
+            results.append(f"✅ Key {i+1}: `{short_key}` — Working{active_marker}")
+
+        except Exception as e:
+            error_str = str(e).lower()
+
+            if any(x in error_str for x in ["429", "quota", "rate", "resource_exhausted", "too many"]):
+                results.append(f"🔴 Key {i+1}: `{short_key}` — Rate Limited")
+            elif any(x in error_str for x in ["403", "permission", "api key", "invalid"]):
+                results.append(f"❌ Key {i+1}: `{short_key}` — Invalid / Auth Error")
+            elif any(x in error_str for x in ["503", "unavailable", "high demand"]):
+                results.append(f"⚠️ Key {i+1}: `{short_key}` — Gemini Overloaded")
+            else:
+                results.append(f"⚠️ Key {i+1}: `{short_key}` — Error: {str(e)[:60]}")
+
+    current_key_short = f"{GEMINI_API_KEYS[_gemini_key_index][:8]}...{GEMINI_API_KEYS[_gemini_key_index][-4:]}"
+    summary = "\n".join(results)
+    working = sum(1 for r in results if "✅" in r)
+    limited = sum(1 for r in results if "🔴" in r)
+    invalid = sum(1 for r in results if "❌" in r)
+
+    final_text = (
+        f"📊 *Gemini API Key Status*\n\n"
+        f"{summary}\n\n"
+        f"─────────────────\n"
+        f"✅ Working: {working}/{total}\n"
+        f"🔴 Rate Limited: {limited}/{total}\n"
+        f"❌ Invalid: {invalid}/{total}\n\n"
+        f"🎯 Currently Active: Key {_gemini_key_index + 1}"
+    )
+
+    await status_msg.edit_text(final_text, parse_mode="Markdown")
+
 # =========================
 # HANDLERS
 # =========================
@@ -10752,6 +10844,7 @@ app = (
 app.job_queue.run_repeating(auto_expire_subscribers, interval=3600, first=10)
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("backup", backup_db))
+app.add_handler(CommandHandler("keystatus", gemini_key_status))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
