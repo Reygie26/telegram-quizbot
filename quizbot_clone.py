@@ -10742,51 +10742,32 @@ async def gemini_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔍 Testing {total} Gemini API key(s)...\nPlease wait."
     )
 
-    # Tiny 1x1 white JPEG for testing
-    import base64
-    TEST_IMAGE_B64 = (
-        "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8U"
-        "HRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgN"
-        "DRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIy"
-        "MjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFgABAQEAAAAAAAAAAAAAAAAABgUEA"
-        "/8QAIhAAAQMEAgMAAAAAAAAAAAAAAQIDBAUREiExQVH/xAAUAQEAAAAAAAAAAAAAAAAAAAAA"
-        "/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8Amk2"
-        "pa2qp4o3TStYJXBjS4gAuPQDfoqoiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIi"
-        "AiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiA"
-        "iIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiAiIiB//Z"
-    )
-    test_bytes = base64.b64decode(TEST_IMAGE_B64)
-
     results = []
 
     for i, key in enumerate(GEMINI_API_KEYS):
         short_key = f"{key[:8]}...{key[-4:]}"
         try:
             client = google_genai.Client(api_key=key)
-
-            import asyncio
             loop = asyncio.get_event_loop()
-
-            image_part = google_genai.types.Part.from_bytes(
-                data=test_bytes,
-                mime_type="image/jpeg",
-            )
-            text_part = google_genai.types.Part.from_text(
-                text="Reply with only the word: OK"
-            )
 
             def _test_call():
                 response = client.models.generate_content(
                     model="gemini-2.5-flash",
-                    contents=[image_part, text_part],
+                    contents="Reply with only the word: OK",
                 )
                 return response.text
 
-            await loop.run_in_executor(None, _test_call)
+            # ⏱ 15 second timeout per key
+            result_text = await asyncio.wait_for(
+                loop.run_in_executor(None, _test_call),
+                timeout=15.0
+            )
 
-            # ✅ Key is working
             active_marker = " ← current" if i == _gemini_key_index else ""
             results.append(f"✅ Key {i+1}: `{short_key}` — Working{active_marker}")
+
+        except asyncio.TimeoutError:
+            results.append(f"⏱ Key {i+1}: `{short_key}` — Timed Out (no response)")
 
         except Exception as e:
             error_str = str(e).lower()
@@ -10800,11 +10781,21 @@ async def gemini_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 results.append(f"⚠️ Key {i+1}: `{short_key}` — Error: {str(e)[:60]}")
 
-    current_key_short = f"{GEMINI_API_KEYS[_gemini_key_index][:8]}...{GEMINI_API_KEYS[_gemini_key_index][-4:]}"
-    summary = "\n".join(results)
+        # 🔔 Update message after EACH key so you see progress live
+        partial_summary = "\n".join(results)
+        tested_so_far = f"🔍 Testing key {i+1}/{total}...\n\n{partial_summary}"
+        try:
+            await status_msg.edit_text(tested_so_far, parse_mode="Markdown")
+        except Exception:
+            pass
+
+    # ── Final Summary ──────────────────────────────────────────────
     working = sum(1 for r in results if "✅" in r)
     limited = sum(1 for r in results if "🔴" in r)
     invalid = sum(1 for r in results if "❌" in r)
+    timedout = sum(1 for r in results if "⏱" in r)
+
+    summary = "\n".join(results)
 
     final_text = (
         f"📊 *Gemini API Key Status*\n\n"
@@ -10812,11 +10803,15 @@ async def gemini_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"─────────────────\n"
         f"✅ Working: {working}/{total}\n"
         f"🔴 Rate Limited: {limited}/{total}\n"
-        f"❌ Invalid: {invalid}/{total}\n\n"
+        f"❌ Invalid: {invalid}/{total}\n"
+        f"⏱ Timed Out: {timedout}/{total}\n\n"
         f"🎯 Currently Active: Key {_gemini_key_index + 1}"
     )
 
-    await status_msg.edit_text(final_text, parse_mode="Markdown")
+    try:
+        await status_msg.edit_text(final_text, parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text(final_text, parse_mode="Markdown")
 
 # =========================
 # HANDLERS
