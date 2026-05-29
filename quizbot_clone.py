@@ -1661,7 +1661,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if current_opt_text:
                 quote_msg = await context.bot.send_message(
                     chat_id,
-                    f"📋 Scanned Option {next_label} (tap & hold to copy):\n\n{current_opt_text}",
+                    f"{current_opt_text}",
                 )
                 context.user_data["ocr_edit_quote_msg_id"] = quote_msg.message_id
                 context.user_data.setdefault("question_flow_msgs", []).append(quote_msg.message_id)
@@ -7012,6 +7012,17 @@ async def ocr_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+    # 🧹 Delete the "Send Photo..." prompt message
+    prompt_msg_id = context.user_data.pop("create_q_prompt_msg_id", None)
+    if prompt_msg_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=query.message.chat_id,
+                message_id=prompt_msg_id
+            )
+        except Exception:
+            pass
+
     # Keep ocr_ keys alive — only pop them after the user fully confirms
     question = context.user_data.get("ocr_question", "")
     options  = context.user_data.get("ocr_options", [])
@@ -7024,7 +7035,6 @@ async def ocr_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     context.user_data["add_q_state"] = "OCR_REVIEW"
-
     await show_ocr_review(query.message, context)
 
 async def ocr_edit_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7053,7 +7063,7 @@ async def ocr_edit_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if current_text:
         quote_msg = await context.bot.send_message(
             chat_id,
-            f"📋 Scanned question text (tap & hold to copy):\n\n{current_text}",
+            f"{current_text}",
         )
         context.user_data["ocr_edit_quote_msg_id"] = quote_msg.message_id
         context.user_data.setdefault("question_flow_msgs", []).append(quote_msg.message_id)
@@ -7100,7 +7110,7 @@ async def ocr_edit_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if current_opt_a:
         quote_msg = await context.bot.send_message(
             chat_id,
-            f"📋 Scanned Option A (tap & hold to copy):\n\n{current_opt_a}",
+            f"{current_opt_a}",
         )
         context.user_data["ocr_edit_quote_msg_id"] = quote_msg.message_id
         context.user_data.setdefault("question_flow_msgs", []).append(quote_msg.message_id)
@@ -7154,7 +7164,7 @@ async def ocr_accept_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if next_opt_text:
             quote_msg = await context.bot.send_message(
                 chat_id,
-                f"📋 Scanned Option {next_label} (tap & hold to copy):\n\n{next_opt_text}",
+                f"{next_opt_text}",
             )
             context.user_data["ocr_edit_quote_msg_id"] = quote_msg.message_id
             context.user_data.setdefault("question_flow_msgs", []).append(quote_msg.message_id)
