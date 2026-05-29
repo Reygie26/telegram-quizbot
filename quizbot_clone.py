@@ -1086,6 +1086,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.setdefault("question_flow_msgs", []).append(
             update.message.message_id
         )
+        context.user_data["ocr_photo_msg_id"] = update.message.message_id
 
         processing_msg = await update.message.reply_text("🔍 Scanning image with Gemini AI, please wait...")
         context.user_data["question_flow_msgs"].append(processing_msg.message_id)
@@ -1589,15 +1590,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Save the corrected text
         context.user_data["new_question"]["text"] = new_text
 
-        # 🧹 Delete prompt + quote bubble + user message
-        prompt_id    = context.user_data.pop("ocr_edit_prompt_id",    None)
-        quote_msg_id = context.user_data.pop("ocr_edit_quote_msg_id", None)
+        # 🧹 Delete prompt + quote message + user message
+        prompt_id = context.user_data.pop("ocr_edit_prompt_id",    None)
+        quote_id  = context.user_data.pop("ocr_edit_quote_msg_id", None)
 
         delete_tasks = [context.bot.delete_message(chat_id, update.message.message_id)]
         if prompt_id:
             delete_tasks.append(context.bot.delete_message(chat_id, prompt_id))
-        if quote_msg_id:
-            delete_tasks.append(context.bot.delete_message(chat_id, quote_msg_id))
+        if quote_id:
+            delete_tasks.append(context.bot.delete_message(chat_id, quote_id))
         await asyncio.gather(*delete_tasks, return_exceptions=True)
 
         # Return to review — update existing preview message
@@ -1632,12 +1633,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.setdefault("ocr_new_options", []).append(text.strip())
         count = len(context.user_data["ocr_new_options"])
 
-        # 🧹 Delete user message + existing prompt (no quote bubble anymore)
+        # 🧹 Delete user message + existing prompt + existing quote message
         existing_prompt_id = context.user_data.pop("ocr_edit_prompt_id", None)
-        context.user_data.pop("ocr_edit_quote_msg_id", None)
+        existing_quote_id  = context.user_data.pop("ocr_edit_quote_msg_id", None)
         delete_tasks = [context.bot.delete_message(chat_id, update.message.message_id)]
         if existing_prompt_id:
             delete_tasks.append(context.bot.delete_message(chat_id, existing_prompt_id))
+        if existing_quote_id:
+            delete_tasks.append(context.bot.delete_message(chat_id, existing_quote_id))
         await asyncio.gather(*delete_tasks, return_exceptions=True)
 
         option_labels = ["A", "B", "C", "D"]
@@ -1648,21 +1651,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current_opt_text = current_opts[count] if count < len(current_opts) else ""
             context.user_data["add_q_state"] = f"OCR_EDIT_OPT_{count + 1}"
 
-            # ── ONE combined prompt+quote message ──
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("✅ Accept", callback_data=f"OCR_ACCEPT_OPT|{count}"),
                     InlineKeyboardButton("❌ Cancel", callback_data="OCR_EDIT_CANCEL"),
                 ]
             ])
+            # ── Message A: copyable scanned option text ──
+            if current_opt_text:
+                quote_msg = await context.bot.send_message(
+                    chat_id,
+                    f"📋 Scanned Option {next_label} (tap & hold to copy):\n\n{current_opt_text}",
+                )
+                context.user_data["ocr_edit_quote_msg_id"] = quote_msg.message_id
+                context.user_data.setdefault("question_flow_msgs", []).append(quote_msg.message_id)
+            else:
+                context.user_data["ocr_edit_quote_msg_id"] = None
+            # ── Message B: instruction + buttons ──
             prompt_msg = await context.bot.send_message(
                 chat_id,
-                f"✏️ *Current option {next_label}:*\n_{escape_md(current_opt_text) if current_opt_text else '(empty)'}_\n\n📝 Send corrected *Option {next_label}*:",
+                f"📝 Send corrected *Option {next_label}*:",
                 reply_markup=keyboard,
                 parse_mode="Markdown"
             )
-            context.user_data["ocr_edit_prompt_id"]    = prompt_msg.message_id
-            context.user_data["ocr_edit_quote_msg_id"] = None
+            context.user_data["ocr_edit_prompt_id"] = prompt_msg.message_id
             context.user_data.setdefault("question_flow_msgs", []).append(prompt_msg.message_id)
 
         else:
@@ -6989,6 +7001,17 @@ async def ocr_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    # 🧹 Delete the user's photo message now that we're proceeding
+    photo_msg_id = context.user_data.pop("ocr_photo_msg_id", None)
+    if photo_msg_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=query.message.chat_id,
+                message_id=photo_msg_id
+            )
+        except Exception:
+            pass
+
     # Keep ocr_ keys alive — only pop them after the user fully confirms
     question = context.user_data.get("ocr_question", "")
     options  = context.user_data.get("ocr_options", [])
@@ -7008,11 +7031,9 @@ async def ocr_edit_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User wants to correct the scanned question text."""
     query = update.callback_query
     await query.answer()
-
     context.user_data["add_q_state"] = "OCR_EDIT_Q_TEXT"
     chat_id = query.message.chat_id
     current_text = context.user_data.get("new_question", {}).get("text", "")
-
     # ── Edit review message to placeholder ──
     review_msg_id = context.user_data.get("ocr_review_msg_id")
     if review_msg_id:
@@ -7025,20 +7046,26 @@ async def ocr_edit_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
-
-    # ── ONE combined prompt+quote message ──
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ Cancel", callback_data="OCR_EDIT_CANCEL")]
     ])
+    # ── Message A: copyable scanned text ──
+    if current_text:
+        quote_msg = await context.bot.send_message(
+            chat_id,
+            f"📋 Scanned question text (tap & hold to copy):\n\n{current_text}",
+        )
+        context.user_data["ocr_edit_quote_msg_id"] = quote_msg.message_id
+        context.user_data.setdefault("question_flow_msgs", []).append(quote_msg.message_id)
+    else:
+        context.user_data["ocr_edit_quote_msg_id"] = None
+    # ── Message B: instruction + buttons ──
     prompt_msg = await context.bot.send_message(
         chat_id,
-        f"✏️ *Current question:*\n_{escape_md(current_text)}_\n\n📝 Send corrected text:",
+        "📝 Send corrected text:",
         reply_markup=keyboard,
-        parse_mode="Markdown"
     )
-
-    context.user_data["ocr_edit_prompt_id"]    = prompt_msg.message_id
-    context.user_data["ocr_edit_quote_msg_id"] = None
+    context.user_data["ocr_edit_prompt_id"] = prompt_msg.message_id
     context.user_data.setdefault("question_flow_msgs", []).append(prompt_msg.message_id)
 
 
@@ -7046,14 +7073,11 @@ async def ocr_edit_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User wants to correct the scanned answer options."""
     query = update.callback_query
     await query.answer()
-
     context.user_data["ocr_new_options"] = []
     context.user_data["add_q_state"]     = "OCR_EDIT_OPT_1"
-
     current_opts  = context.user_data.get("new_question", {}).get("options", [])
     current_opt_a = current_opts[0] if current_opts else ""
     chat_id       = query.message.chat_id
-
     # ── Edit review message to placeholder ──
     review_msg_id = context.user_data.get("ocr_review_msg_id")
     if review_msg_id:
@@ -7066,23 +7090,30 @@ async def ocr_edit_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
-
-    # ── ONE combined prompt+quote message ──
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Accept", callback_data="OCR_ACCEPT_OPT|0"),
             InlineKeyboardButton("❌ Cancel", callback_data="OCR_EDIT_CANCEL"),
         ]
     ])
+    # ── Message A: copyable scanned option text ──
+    if current_opt_a:
+        quote_msg = await context.bot.send_message(
+            chat_id,
+            f"📋 Scanned Option A (tap & hold to copy):\n\n{current_opt_a}",
+        )
+        context.user_data["ocr_edit_quote_msg_id"] = quote_msg.message_id
+        context.user_data.setdefault("question_flow_msgs", []).append(quote_msg.message_id)
+    else:
+        context.user_data["ocr_edit_quote_msg_id"] = None
+    # ── Message B: instruction + buttons ──
     prompt_msg = await context.bot.send_message(
         chat_id,
-        f"✏️ *Current option A:*\n_{escape_md(current_opt_a) if current_opt_a else '(empty)'}_\n\n📝 Send corrected *Option A*:",
+        "📝 Send corrected *Option A*:",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
-
-    context.user_data["ocr_edit_prompt_id"]    = prompt_msg.message_id
-    context.user_data["ocr_edit_quote_msg_id"] = None
+    context.user_data["ocr_edit_prompt_id"] = prompt_msg.message_id
     context.user_data.setdefault("question_flow_msgs", []).append(prompt_msg.message_id)
 
 async def ocr_accept_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7092,54 +7123,56 @@ async def ocr_accept_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     query = update.callback_query
     await query.answer()
-
     chat_id   = query.message.chat_id
     opt_index = int(query.data.split("|", 1)[1])
-
     current_opts  = context.user_data.get("new_question", {}).get("options", [])
     accepted_text = current_opts[opt_index] if opt_index < len(current_opts) else ""
-
     context.user_data.setdefault("ocr_new_options", []).append(accepted_text)
     count = len(context.user_data["ocr_new_options"])
-
-    # 🧹 Delete the existing prompt (no quote bubble to delete anymore)
+    # 🧹 Delete the existing prompt and quote message
     prompt_id = context.user_data.pop("ocr_edit_prompt_id", None)
-    context.user_data.pop("ocr_edit_quote_msg_id", None)
+    quote_id  = context.user_data.pop("ocr_edit_quote_msg_id", None)
+    delete_tasks = []
     if prompt_id:
-        try:
-            await context.bot.delete_message(chat_id, prompt_id)
-        except Exception:
-            pass
-
+        delete_tasks.append(context.bot.delete_message(chat_id, prompt_id))
+    if quote_id:
+        delete_tasks.append(context.bot.delete_message(chat_id, quote_id))
+    if delete_tasks:
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
     option_labels = ["A", "B", "C", "D"]
-
     if count < 4:
         next_label    = option_labels[count]
         next_opt_text = current_opts[count] if count < len(current_opts) else ""
         context.user_data["add_q_state"] = f"OCR_EDIT_OPT_{count + 1}"
-
-        # ── ONE combined prompt+quote message ──
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("✅ Accept", callback_data=f"OCR_ACCEPT_OPT|{count}"),
                 InlineKeyboardButton("❌ Cancel", callback_data="OCR_EDIT_CANCEL"),
             ]
         ])
+        # ── Message A: copyable scanned option text ──
+        if next_opt_text:
+            quote_msg = await context.bot.send_message(
+                chat_id,
+                f"📋 Scanned Option {next_label} (tap & hold to copy):\n\n{next_opt_text}",
+            )
+            context.user_data["ocr_edit_quote_msg_id"] = quote_msg.message_id
+            context.user_data.setdefault("question_flow_msgs", []).append(quote_msg.message_id)
+        else:
+            context.user_data["ocr_edit_quote_msg_id"] = None
+        # ── Message B: instruction + buttons ──
         prompt_msg = await context.bot.send_message(
             chat_id,
-            f"✏️ *Current option {next_label}:*\n_{escape_md(next_opt_text) if next_opt_text else '(empty)'}_\n\n📝 Send corrected *Option {next_label}*:",
+            f"📝 Send corrected *Option {next_label}*:",
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
-        context.user_data["ocr_edit_prompt_id"]    = prompt_msg.message_id
-        context.user_data["ocr_edit_quote_msg_id"] = None
+        context.user_data["ocr_edit_prompt_id"] = prompt_msg.message_id
         context.user_data.setdefault("question_flow_msgs", []).append(prompt_msg.message_id)
-
     else:
         # All 4 collected — commit and return to review
         context.user_data["new_question"]["options"] = context.user_data.pop("ocr_new_options")
         context.user_data["add_q_state"] = "OCR_REVIEW"
-
         review_msg_id = context.user_data.get("ocr_review_msg_id")
         if review_msg_id:
             await show_ocr_review_by_id(chat_id, review_msg_id, context)
@@ -7153,15 +7186,12 @@ async def ocr_edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancels an in-progress edit and returns to the review screen."""
     query = update.callback_query
     await query.answer()
-
     chat_id = query.message.chat_id
-
-    # 🧹 The Cancel button now lives on the single combined prompt — delete it
+    # 🧹 Delete the prompt message (Cancel button lives here)
     try:
         await query.message.delete()
     except Exception:
         pass
-
     # 🧹 Delete prompt if tracked separately (safety net)
     prompt_id = context.user_data.pop("ocr_edit_prompt_id", None)
     if prompt_id and prompt_id != query.message.message_id:
@@ -7169,11 +7199,15 @@ async def ocr_edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.delete_message(chat_id, prompt_id)
         except Exception:
             pass
-
-    context.user_data.pop("ocr_edit_quote_msg_id", None)
+    # 🧹 Delete the quote message (now a real separate message)
+    quote_id = context.user_data.pop("ocr_edit_quote_msg_id", None)
+    if quote_id:
+        try:
+            await context.bot.delete_message(chat_id, quote_id)
+        except Exception:
+            pass
     context.user_data.pop("ocr_new_options", None)
     context.user_data["add_q_state"] = "OCR_REVIEW"
-
     # ── Restore the review message (was set to placeholder) ──
     review_msg_id = context.user_data.get("ocr_review_msg_id")
     if review_msg_id:
