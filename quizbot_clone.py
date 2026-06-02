@@ -1102,8 +1102,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await processing_msg.edit_text(
                 error_msg,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Retry", callback_data="OCR_RETAKE")],
-                    [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
+                    [
+                        InlineKeyboardButton("🔄 Retry", callback_data="OCR_RETAKE"),
+                        InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION"),
+                    ]
                 ])
             )
             context.user_data["add_q_state"] = "NEW_Q_PHOTO_WAIT"
@@ -1717,7 +1719,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         similar_matches = []
 
         _conn_dup, _cur_dup = get_db()
-        _cur_dup.execute("SELECT id, question FROM question_bank")
+        _cur_dup.execute(
+            """
+            SELECT qb.id, qb.question
+            FROM question_bank qb
+            JOIN question_bank_folders f ON f.id = qb.folder_id
+            WHERE f.owner_id = ?
+            """,
+            (get_active_user_id(context),)
+        )
         existing_questions = _cur_dup.fetchall()
         _conn_dup.close()
 
@@ -4371,6 +4381,13 @@ async def save_new_question(message, context):
         context.user_data["add_q_state"] = "NEW_Q_PHOTO_WAIT"
         context.user_data["new_question"] = {"options": []}
 
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("⬅️ Back",   callback_data="OCR_BACK_TO_METHOD"),
+                InlineKeyboardButton("❌ Cancel",  callback_data="CANCEL_CREATE_QUESTION"),
+            ]
+        ])
+
         msg = await message.reply_text(
             "📷 Send Photo\n\nSend a clear photo of your next question.\n"
             "Make sure the text and answer options are fully visible.",
@@ -7001,27 +7018,21 @@ async def ocr_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    # 🧹 Delete the user's photo message now that we're proceeding
-    photo_msg_id = context.user_data.pop("ocr_photo_msg_id", None)
-    if photo_msg_id:
-        try:
-            await context.bot.delete_message(
-                chat_id=query.message.chat_id,
-                message_id=photo_msg_id
-            )
-        except Exception:
-            pass
-
-    # 🧹 Delete the "Send Photo..." prompt message
+    # 🧹 Delete photo + Send Photo prompt simultaneously
+    photo_msg_id  = context.user_data.pop("ocr_photo_msg_id", None)
     prompt_msg_id = context.user_data.pop("create_q_prompt_msg_id", None)
+
+    delete_tasks = []
+    if photo_msg_id:
+        delete_tasks.append(
+            context.bot.delete_message(chat_id=query.message.chat_id, message_id=photo_msg_id)
+        )
     if prompt_msg_id:
-        try:
-            await context.bot.delete_message(
-                chat_id=query.message.chat_id,
-                message_id=prompt_msg_id
-            )
-        except Exception:
-            pass
+        delete_tasks.append(
+            context.bot.delete_message(chat_id=query.message.chat_id, message_id=prompt_msg_id)
+        )
+    if delete_tasks:
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
 
     # Keep ocr_ keys alive — only pop them after the user fully confirms
     question = context.user_data.get("ocr_question", "")
@@ -7247,7 +7258,15 @@ async def ocr_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     similar_matches = []
 
     _conn_dup, _cur_dup = get_db()
-    _cur_dup.execute("SELECT id, question FROM question_bank")
+    _cur_dup.execute(
+        """
+        SELECT qb.id, qb.question
+        FROM question_bank qb
+        JOIN question_bank_folders f ON f.id = qb.folder_id
+        WHERE f.owner_id = ?
+        """,
+        (get_active_user_id(context),)
+    )
     existing_questions = _cur_dup.fetchall()
     _conn_dup.close()
 
@@ -11084,6 +11103,15 @@ async def sub_delete(update, context):
 
 async def backup_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_USER_ID:
+        msg = await update.message.reply_text(
+            "⚠️ The /backup command is exclusively for the Bot Creator."
+        )
+        await asyncio.sleep(3)
+        try:
+            await msg.delete()
+            await update.message.delete()
+        except Exception:
+            pass
         return
     try:
         with open(DB_FILE, "rb") as f:
@@ -11130,7 +11158,7 @@ async def gemini_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Owner-only command: /keystatus
     Tests all Gemini API keys and reports which ones are working.
     """
-    if update.effective_user.id != OWNER_USER_ID:
+    if not is_authorized(update.effective_user.id):
         return
 
     if not update.message:
@@ -11209,8 +11237,22 @@ async def gemini_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await status_msg.edit_text(final_text, parse_mode="Markdown")
+        target_msg = status_msg
     except Exception:
-        await update.message.reply_text(final_text, parse_mode="Markdown")
+        target_msg = await update.message.reply_text(final_text, parse_mode="Markdown")
+
+    async def _delete_keystatus():
+        await asyncio.sleep(5)
+        try:
+            await target_msg.delete()
+        except Exception:
+            pass
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+    asyncio.create_task(_delete_keystatus())
 
 # =========================
 # HANDLERS
