@@ -5718,23 +5718,20 @@ async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 🔒 ACCESS CONTROL CHECK
     _conn_ac, _cur_ac = get_db()
-    _cur_ac.execute("SELECT access, folder FROM quizzes WHERE quiz_id=?", (quiz_id,))
+    _cur_ac.execute(
+        "SELECT access, folder, owner_id FROM quizzes WHERE quiz_id=?",
+        (quiz_id,)
+    )
     ac_row = _cur_ac.fetchone()
     _conn_ac.close()
 
-    if ac_row and ac_row[0] == "private":
-        folder     = ac_row[1]
-        player_id  = query.from_user.id
+    if ac_row:
+        access_mode = ac_row[0] or "public"
+        folder      = ac_row[1] or "Default"
+        owner_id    = ac_row[2]
+        player_id   = query.from_user.id
 
-        # Fetch quiz owner
-        _conn_ow, _cur_ow = get_db()
-        _cur_ow.execute("SELECT owner_id FROM quizzes WHERE quiz_id=?", (quiz_id,))
-        ow_row = _cur_ow.fetchone()
-        _conn_ow.close()
-        owner_id = ow_row[0] if ow_row else None
-
-        # Allow owner always
-        if player_id != owner_id:
+        if access_mode == "private" and player_id != owner_id:
             _conn_sub, _cur_sub = get_db()
             _cur_sub.execute(
                 """
@@ -5747,6 +5744,12 @@ async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _conn_sub.close()
 
             if not allowed:
+                # 🧹 Clean up play-related state so the user isn't stuck
+                context.user_data.pop("play_quiz_id",    None)
+                context.user_data.pop("play_token",      None)
+                context.user_data.pop("leaderboard_key", None)
+                context.user_data.pop("group_chat_id",   None)
+
                 await context.bot.send_message(
                     chat_id=player_id,
                     text=(
@@ -6090,6 +6093,13 @@ async def send_quiz_to_group(chat_id, quiz_id, context, token):
         return
     title, desc, timer, sq, sa = row
 
+    _conn_ac, _cur_ac = get_db()
+    _cur_ac.execute("SELECT access FROM quizzes WHERE quiz_id=?", (quiz_id,))
+    access_row   = _cur_ac.fetchone()
+    _conn_ac.close()
+    access_val   = (access_row[0] if access_row and access_row[0] else "public")
+    access_badge = "🌐 Public" if access_val == "public" else "🔒 Private"
+
     _conn2, _cur2 = get_db()
     _cur2.execute("SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?", (quiz_id,))
     total_questions = _cur2.fetchone()[0]
@@ -6098,6 +6108,7 @@ async def send_quiz_to_group(chat_id, quiz_id, context, token):
     text = f"📘 *{escape_md(title)}*\n"
     if desc:
         text += f"📝 _{escape_md(desc)}_\n"
+    text += f"{access_badge}\n"
     text += "\n"
     text += f"🧠 *{total_questions} Questions* • ⏱ *{timer}s*\n"
     text += (
@@ -6147,7 +6158,7 @@ def build_group_quiz_text(leaderboard_key, page=0):
 
     _conn, _cur = get_db()
     _cur.execute(
-        "SELECT title, description, timer, shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
+        "SELECT title, description, timer, shuffle_q, shuffle_a, access FROM quizzes WHERE quiz_id=?",
         (quiz_id,)
     )
     row = _cur.fetchone()
@@ -6155,16 +6166,22 @@ def build_group_quiz_text(leaderboard_key, page=0):
 
     if not row:
         return "❌ Quiz not found.", 0
-    title, desc, timer, sq, sa = row
+    title, desc, timer, sq, sa, access_val = row
+    access_val   = access_val or "public"
+    access_badge = "🌐 Public" if access_val == "public" else "🔒 Private"
 
     _conn2, _cur2 = get_db()
     _cur2.execute("SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?", (quiz_id,))
     total_questions = _cur2.fetchone()[0]
     _conn2.close()
 
+    access_val   = access_val or "public"  # already fetched below — see query fix
+    access_badge = "🌐 Public" if access_val == "public" else "🔒 Private"
+
     text = f"📘 *{escape_md(title)}*\n"
     if desc:
         text += f"📝 _{escape_md(desc)}_\n"
+    text += f"{access_badge}\n"
     text += "\n"
     text += f"🧠 *{total_questions} Questions* • ⏱ *{timer}s*\n"
     text += (
