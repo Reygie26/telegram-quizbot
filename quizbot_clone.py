@@ -4190,6 +4190,11 @@ async def set_quiz_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await confirm.delete()
     except: pass
 
+    # 🔄 SYNC: Refresh all active group posts for this quiz
+    asyncio.create_task(
+        refresh_all_group_posts_for_quiz(quiz_id, context)
+    )
+
     overview_id = context.user_data.get("quiz_overview_msg_id")
     if overview_id:
         await show_quiz_action_menu_by_id(
@@ -6174,9 +6179,6 @@ def build_group_quiz_text(leaderboard_key, page=0):
     _cur2.execute("SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?", (quiz_id,))
     total_questions = _cur2.fetchone()[0]
     _conn2.close()
-
-    access_val   = access_val or "public"  # already fetched below — see query fix
-    access_badge = "🌐 Public" if access_val == "public" else "🔒 Private"
 
     text = f"📘 *{escape_md(title)}*\n"
     if desc:
