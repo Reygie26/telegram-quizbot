@@ -5758,7 +5758,7 @@ async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=player_id,
                     text=(
-                        "🔒 *This Quiz is Private.*\n\n"
+                        "🔒 This Quiz is Private.\n\n"
                         "You are not on the subscriber list for this Quiz.\n"
                         "Please contact the Quiz Admin to be added.\n\n"
                         "TeleQuiz Bot Creator:\n"
@@ -5769,7 +5769,6 @@ async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "Channel: https://t.me/Bot_TeleQuiz\n"
                         "Group  : https://t.me/+pbioRS0BWN4wZjM9\n"
                     ),
-                    parse_mode="Markdown"
                 )
                 return
 
