@@ -3825,7 +3825,7 @@ async def show_quiz_action_menu(message, context):
         return
     title, desc, timer, sq, sa, access_val = row
     access_val   = access_val or "public"
-    access_badge = "🌐 Public" if access_val == "public" else "🔒 Private"
+    access_badge = "🌐 Public" if access_val == "public" else "🔒 Private (Subscriber Only)"
 
     _conn2, _cur2 = get_db()
     _cur2.execute("SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?", (quiz_id,))
@@ -5764,10 +5764,10 @@ async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "TeleQuiz Bot Creator:\n"
                         "Reygie Marimon Gorgonio\n"
                         "Contact No.: 0928 180 2793\n"
-                        "Telegram   : @Eucresia\n\n"
+                        "Telegram    : @Eucresia\n\n"
                         "TeleQuiz Bot Official links\n"
-                        "Channel: https://t.me/Bot_TeleQuiz\n"
-                        "Group  : https://t.me/+pbioRS0BWN4wZjM9\n"
+                        "Channel : https://t.me/Bot_TeleQuiz\n"
+                        "Group    : https://t.me/+pbioRS0BWN4wZjM9\n"
                     ),
                 )
                 return
@@ -6109,7 +6109,7 @@ async def send_quiz_to_group(chat_id, quiz_id, context, token):
     access_row   = _cur_ac.fetchone()
     _conn_ac.close()
     access_val   = (access_row[0] if access_row and access_row[0] else "public")
-    access_badge = "🌐 Public" if access_val == "public" else "🔒 Private"
+    access_badge = "🌐 Public" if access_val == "public" else "🔒 Private (Subscriber Only)"
 
     _conn2, _cur2 = get_db()
     _cur2.execute("SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?", (quiz_id,))
@@ -6179,7 +6179,7 @@ def build_group_quiz_text(leaderboard_key, page=0):
         return "❌ Quiz not found.", 0
     title, desc, timer, sq, sa, access_val = row
     access_val   = access_val or "public"
-    access_badge = "🌐 Public" if access_val == "public" else "🔒 Private"
+    access_badge = "🌐 Public" if access_val == "public" else "🔒 Private (Subscriber Only)"
 
     _conn2, _cur2 = get_db()
     _cur2.execute("SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?", (quiz_id,))
@@ -8732,7 +8732,7 @@ async def show_quiz_action_menu_by_id(chat_id, message_id, context):
         return
     title, desc, timer, sq, sa, total_questions, access_val = row
     access_val   = access_val or "public"
-    access_badge = "🌐 Public" if access_val == "public" else "🔒 Private"
+    access_badge = "🌐 Public" if access_val == "public" else "🔒 Private (Subscriber Only)"
 
     text = f"📘 **{escape_md(title)}**"
     if desc:
