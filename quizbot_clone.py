@@ -2263,7 +2263,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with DB_LOCK:
                 _conn, _cur = get_db()
                 _cur.execute(
-                    "INSERT INTO quizzes VALUES (?, ?, ?, NULL, 'Default', 1, 1, 15)",
+                    """
+                    INSERT INTO quizzes
+                        (quiz_id, owner_id, title, description, folder, shuffle_q, shuffle_a, timer, access)
+                    VALUES (?, ?, ?, NULL, 'Default', 1, 1, 15, 'public')
+                    """,
                     (
                         context.user_data["quiz_id"],
                         get_active_user_id(context),
@@ -3895,7 +3899,7 @@ async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     _conn, _cur = get_db()
     _cur.execute(
-        "SELECT title, description, timer, shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
+        "SELECT title, description, timer, shuffle_q, shuffle_a, access FROM quizzes WHERE quiz_id=?",
         (quiz_id,)
     )
     row = _cur.fetchone()
@@ -3903,7 +3907,9 @@ async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not row:
         return
-    title, desc, timer, sq, sa = row
+    title, desc, timer, sq, sa, access_val = row
+    access_val   = access_val or "public"
+    access_badge = "🌐 Public" if access_val == "public" else "🔒 Private (Subscriber Only)"
 
     _conn2, _cur2 = get_db()
     _cur2.execute("SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?", (quiz_id,))
@@ -3913,6 +3919,7 @@ async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"📘 **{escape_md(title)}**"
         + (f"\n📝 _{escape_md(desc)}_" if desc else "")
+        + f"\n{access_badge}"
         + "\n\n"
         + f"📊 Questions: {total_questions}    ⏱ Timer: {timer}s"
         + f"\n🔀 Questions: {'ON' if sq else 'OFF'}"
@@ -10550,7 +10557,7 @@ def _build_qa_panel_text(quiz_id: str) -> str:
     """Builds the full quiz settings text for the Quiz Admin panel."""
     _conn, _cur = get_db()
     _cur.execute(
-        "SELECT title, description, timer, shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
+        "SELECT title, description, timer, shuffle_q, shuffle_a, access FROM quizzes WHERE quiz_id=?",
         (quiz_id,)
     )
     row = _cur.fetchone()
@@ -10559,7 +10566,9 @@ def _build_qa_panel_text(quiz_id: str) -> str:
     if not row:
         return "⚙️ *Quiz Admin Panel*"
 
-    title, desc, timer, sq, sa = row
+    title, desc, timer, sq, sa, access_val = row
+    access_val   = access_val or "public"
+    access_badge = "🌐 Public" if access_val == "public" else "🔒 Private (Subscriber Only)"
 
     _conn2, _cur2 = get_db()
     _cur2.execute("SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?", (quiz_id,))
@@ -10570,6 +10579,7 @@ def _build_qa_panel_text(quiz_id: str) -> str:
     text += f"📘 *{escape_md(title)}*"
     if desc:
         text += f"\n📝 _{escape_md(desc)}_"
+    text += f"\n{access_badge}"
     text += f"\n\n📊 Questions: {total_questions}    ⏱ Timer: {timer}s"
     text += f"\n🔀 Questions: {'ON' if sq else 'OFF'}    🔀 Options: {'ON' if sa else 'OFF'}"
     return text
