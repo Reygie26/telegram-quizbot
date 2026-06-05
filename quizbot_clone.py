@@ -592,6 +592,24 @@ CREATE TABLE IF NOT EXISTS group_lb_messages (
         pass
 
     _cur.execute("""
+CREATE TABLE IF NOT EXISTS quiz_folder_subscribers (
+    folder_name TEXT,
+    owner_id INTEGER,
+    user_id INTEGER,
+    name TEXT,
+    PRIMARY KEY (folder_name, owner_id, user_id)
+)
+""")
+    _conn.commit()
+
+    # Safe migration: add access column to quizzes
+    try:
+        _cur.execute("ALTER TABLE quizzes ADD COLUMN access TEXT DEFAULT 'public'")
+        _conn.commit()
+    except Exception:
+        pass
+
+    _cur.execute("""
 CREATE TABLE IF NOT EXISTS subscribers (
     user_id INTEGER PRIMARY KEY,
     name TEXT,
@@ -2469,6 +2487,165 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
+    # ================= QFS: WAIT USER ID =================
+    if state == "QFS_WAIT_USER_ID":
+        chat_id     = update.effective_chat.id
+        user_msg_id = update.message.message_id
+        folder      = context.user_data.get("qfs_folder", "")
+
+        try:
+            new_user_id = int(text.strip())
+        except ValueError:
+            err = await update.message.reply_text("❌ Invalid User ID. Please send numbers only.")
+            await asyncio.sleep(2)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, user_msg_id),
+                return_exceptions=True
+            )
+            return
+
+        try:
+            await context.bot.get_chat(new_user_id)
+        except Exception:
+            prompt_id = context.user_data.pop("qfs_prompt_id", None)
+            if prompt_id:
+                try: await context.bot.delete_message(chat_id, prompt_id)
+                except: pass
+            try: await context.bot.delete_message(chat_id, user_msg_id)
+            except: pass
+
+            err = await context.bot.send_message(
+                chat_id,
+                f"❌ User ID `{new_user_id}` not found on Telegram.\n\nPlease send a valid User ID:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Cancel", callback_data=f"QFS_MENU|{folder}")]
+                ])
+            )
+            context.user_data["qfs_prompt_id"] = err.message_id
+            return
+
+        context.user_data["qfs_new_user_id"] = new_user_id
+        context.user_data["state"] = "QFS_WAIT_NAME"
+
+        prompt_id = context.user_data.pop("qfs_prompt_id", None)
+        if prompt_id:
+            try: await context.bot.delete_message(chat_id, prompt_id)
+            except: pass
+        try: await context.bot.delete_message(chat_id, user_msg_id)
+        except: pass
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"QFS_MENU|{folder}")]
+        ])
+        msg = await context.bot.send_message(
+            chat_id,
+            f"✅ User ID `{new_user_id}` accepted.\n\n📝 Now send the *Subscriber Name*:",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+        context.user_data["qfs_prompt_id"] = msg.message_id
+        return
+
+    # ================= QFS: WAIT NAME =================
+    if state == "QFS_WAIT_NAME":
+        chat_id     = update.effective_chat.id
+        user_msg_id = update.message.message_id
+        folder      = context.user_data.get("qfs_folder", "")
+        new_user_id = context.user_data.get("qfs_new_user_id")
+        name        = text.strip()
+        active_uid  = get_active_user_id(context)
+
+        if not name:
+            err = await update.message.reply_text("❌ Name cannot be empty. Please send a name:")
+            await asyncio.sleep(2)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, user_msg_id),
+                return_exceptions=True
+            )
+            return
+
+        # Check duplicate
+        _conn_chk, _cur_chk = get_db()
+        _cur_chk.execute(
+            "SELECT 1 FROM quiz_folder_subscribers WHERE folder_name=? AND owner_id=? AND user_id=?",
+            (folder, active_uid, new_user_id)
+        )
+        already = _cur_chk.fetchone()
+        _conn_chk.close()
+
+        if already:
+            prompt_id = context.user_data.pop("qfs_prompt_id", None)
+            if prompt_id:
+                try: await context.bot.delete_message(chat_id, prompt_id)
+                except: pass
+            try: await context.bot.delete_message(chat_id, user_msg_id)
+            except: pass
+            context.user_data.pop("state", None)
+            context.user_data.pop("qfs_new_user_id", None)
+            await flash_message(context.bot, chat_id, "⚠️ This user is already a subscriber.")
+
+            # Refresh QFS menu
+            _dummy_msg = await context.bot.send_message(chat_id, "⏳")
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add Quiz Subscriber", callback_data=f"QFS_ADD|{folder}")],
+                [
+                    InlineKeyboardButton("❌ Inactive", callback_data=f"QFS_LIST|{folder}|inactive"),
+                    InlineKeyboardButton("✅ Active",   callback_data=f"QFS_LIST|{folder}|active"),
+                ],
+                [InlineKeyboardButton("⬅️ Back", callback_data=f"OPEN_FOLDER|{folder}")],
+            ])
+            await _dummy_msg.edit_text(
+                f"👥 *Quiz Subscribers*\n📁 Folder: {escape_md(folder)}",
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+            return
+
+        try:
+            async with DB_LOCK:
+                _conn, _cur = get_db()
+                _cur.execute(
+                    "INSERT INTO quiz_folder_subscribers (folder_name, owner_id, user_id, name) VALUES (?, ?, ?, ?)",
+                    (folder, active_uid, new_user_id, name)
+                )
+                _conn.commit()
+                _conn.close()
+        except Exception as e:
+            print("⚠️ QFS insert failed:", e)
+            await flash_message(context.bot, chat_id, "❌ Failed to add subscriber.")
+            return
+
+        prompt_id = context.user_data.pop("qfs_prompt_id", None)
+        if prompt_id:
+            try: await context.bot.delete_message(chat_id, prompt_id)
+            except: pass
+        try: await context.bot.delete_message(chat_id, user_msg_id)
+        except: pass
+
+        context.user_data.pop("state", None)
+        context.user_data.pop("qfs_new_user_id", None)
+
+        await flash_message(context.bot, chat_id, f"✅ *{name}* added as Quiz Subscriber.", delay=2)
+
+        _dummy_msg = await context.bot.send_message(chat_id, "⏳")
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add Quiz Subscriber", callback_data=f"QFS_ADD|{folder}")],
+            [
+                InlineKeyboardButton("❌ Inactive", callback_data=f"QFS_LIST|{folder}|inactive"),
+                InlineKeyboardButton("✅ Active",   callback_data=f"QFS_LIST|{folder}|active"),
+            ],
+            [InlineKeyboardButton("⬅️ Back", callback_data=f"OPEN_FOLDER|{folder}")],
+        ])
+        await _dummy_msg.edit_text(
+            f"👥 *Quiz Subscribers*\n📁 Folder: {escape_md(folder)}",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+        return
+
     # SUB_WAIT_USER_ID
     if state == "SUB_WAIT_USER_ID":
         chat_id = update.effective_chat.id
@@ -3171,6 +3348,9 @@ async def show_quizzes_in_folder(message, context, folder):
         keyboard.append(nav)
 
     if folder != "Default":
+        keyboard.insert(0, [
+            InlineKeyboardButton("👥 Quiz Subscribers", callback_data=f"QFS_MENU|{folder}")
+        ])
         keyboard.append([
             InlineKeyboardButton("✏️ Rename", callback_data=f"RENAME_FOLDER|{folder}"),
             InlineKeyboardButton("🗑 Delete", callback_data=f"DELETE_FOLDER|{folder}"),
@@ -3184,6 +3364,209 @@ async def show_quizzes_in_folder(message, context, folder):
         f"📁 {title_label}",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
+
+async def qfs_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    folder = query.data.split("|", 1)[1]
+    context.user_data["qfs_folder"] = folder
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Quiz Subscriber", callback_data=f"QFS_ADD|{folder}")],
+        [
+            InlineKeyboardButton("❌ Inactive", callback_data=f"QFS_LIST|{folder}|inactive"),
+            InlineKeyboardButton("✅ Active",   callback_data=f"QFS_LIST|{folder}|active"),
+        ],
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"OPEN_FOLDER|{folder}")],
+    ])
+
+    await query.message.edit_text(
+        f"👥 *Quiz Subscribers*\n📁 Folder: {escape_md(folder)}",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+async def qfs_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    folder = query.data.split("|", 1)[1]
+    context.user_data["qfs_folder"] = folder
+    context.user_data["state"] = "QFS_WAIT_USER_ID"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"QFS_MENU|{folder}")]
+    ])
+
+    msg = await query.message.reply_text(
+        "➕ *Add Quiz Subscriber*\n\n📋 Send the Telegram *User ID*:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    context.user_data["qfs_prompt_id"] = msg.message_id
+
+
+async def qfs_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split("|")
+    folder = parts[1]
+    mode   = parts[2]
+
+    context.user_data["qfs_folder"] = folder
+    context.user_data["qfs_list_mode"] = mode
+    context.user_data["qfs_list_page"] = 0
+
+    await _show_qfs_list(query.message, context, folder, mode, 0)
+
+
+async def _show_qfs_list(message, context, folder, mode, page):
+    active_uid = get_active_user_id(context)
+    PER_PAGE = 10
+
+    _conn, _cur = get_db()
+    if mode == "active":
+        _cur.execute(
+            """
+            SELECT user_id, name FROM quiz_folder_subscribers
+            WHERE folder_name=? AND owner_id=?
+            ORDER BY name COLLATE NOCASE
+            """,
+            (folder, active_uid)
+        )
+        header = f"✅ *Active Quiz Subscribers*\n📁 {escape_md(folder)}"
+        empty  = f"✅ *Active Quiz Subscribers*\n📁 {escape_md(folder)}\n\n_No subscribers yet._"
+    else:
+        # For now inactive = users NOT in active list (reserved for future revoke tracking)
+        # We show an empty list with a note
+        _cur.execute("SELECT 1 WHERE 0")  # empty result
+        header = f"❌ *Inactive Quiz Subscribers*\n📁 {escape_md(folder)}"
+        empty  = f"❌ *Inactive Quiz Subscribers*\n📁 {escape_md(folder)}\n\n_No inactive subscribers._"
+
+    rows = _cur.fetchall()
+    _conn.close()
+
+    keyboard = []
+
+    if not rows:
+        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data=f"QFS_MENU|{folder}")])
+        await message.edit_text(empty, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+
+    total = len(rows)
+    pages = (total - 1) // PER_PAGE + 1
+    page  = max(0, min(page, pages - 1))
+    context.user_data["qfs_list_page"] = page
+
+    start = page * PER_PAGE
+    end   = start + PER_PAGE
+
+    for user_id, name in rows[start:end]:
+        keyboard.append([
+            InlineKeyboardButton(f"👤 {name}", callback_data=f"QFS_VIEW|{user_id}")
+        ])
+
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"QFS_LIST_PREV|{folder}|{mode}"))
+        nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="QFS_LIST_NOP"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data=f"QFS_LIST_NEXT|{folder}|{mode}"))
+        keyboard.append(nav)
+
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data=f"QFS_MENU|{folder}")])
+
+    await message.edit_text(
+        header,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def qfs_list_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts  = query.data.split("|")
+    folder = parts[1]
+    mode   = parts[2]
+    page   = max(0, context.user_data.get("qfs_list_page", 0) - 1)
+    context.user_data["qfs_list_page"] = page
+    await _show_qfs_list(query.message, context, folder, mode, page)
+
+
+async def qfs_list_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts  = query.data.split("|")
+    folder = parts[1]
+    mode   = parts[2]
+    page   = context.user_data.get("qfs_list_page", 0) + 1
+    context.user_data["qfs_list_page"] = page
+    await _show_qfs_list(query.message, context, folder, mode, page)
+
+
+async def qfs_view_subscriber(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    target_id = int(query.data.split("|", 1)[1])
+    folder    = context.user_data.get("qfs_folder", "")
+    active_uid = get_active_user_id(context)
+
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT name FROM quiz_folder_subscribers WHERE folder_name=? AND owner_id=? AND user_id=?",
+        (folder, active_uid, target_id)
+    )
+    row = _cur.fetchone()
+    _conn.close()
+
+    name = row[0] if row else str(target_id)
+    mode = context.user_data.get("qfs_list_mode", "active")
+
+    text = (
+        f"👤 *{escape_md(name)}*\n\n"
+        f"🆔 User ID: `{target_id}`\n"
+        f"📁 Folder: {escape_md(folder)}"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🗑 Remove", callback_data=f"QFS_REMOVE|{target_id}"),
+            InlineKeyboardButton("⬅️ Back",  callback_data=f"QFS_LIST|{folder}|{mode}"),
+        ]
+    ])
+
+    await query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+
+async def qfs_remove_subscriber(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    target_id  = int(query.data.split("|", 1)[1])
+    folder     = context.user_data.get("qfs_folder", "")
+    active_uid = get_active_user_id(context)
+
+    try:
+        async with DB_LOCK:
+            _conn, _cur = get_db()
+            _cur.execute(
+                "DELETE FROM quiz_folder_subscribers WHERE folder_name=? AND owner_id=? AND user_id=?",
+                (folder, active_uid, target_id)
+            )
+            _conn.commit()
+            _conn.close()
+    except Exception as e:
+        print("⚠️ QFS remove failed:", e)
+        await flash_message(context.bot, query.message.chat_id, "❌ Remove failed.")
+        return
+
+    await flash_message(context.bot, query.message.chat_id, "✅ Subscriber removed.")
+    await _show_qfs_list(query.message, context, folder, "active", 0)
 
 async def open_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3432,7 +3815,7 @@ async def show_quiz_action_menu(message, context):
 
     _conn, _cur = get_db()
     _cur.execute(
-        "SELECT title, description, timer, shuffle_q, shuffle_a FROM quizzes WHERE quiz_id=?",
+        "SELECT title, description, timer, shuffle_q, shuffle_a, access FROM quizzes WHERE quiz_id=?",
         (quiz_id,)
     )
     row = _cur.fetchone()
@@ -3440,7 +3823,9 @@ async def show_quiz_action_menu(message, context):
 
     if not row:
         return
-    title, desc, timer, sq, sa = row
+    title, desc, timer, sq, sa, access_val = row
+    access_val   = access_val or "public"
+    access_badge = "🌐 Public" if access_val == "public" else "🔒 Private"
 
     _conn2, _cur2 = get_db()
     _cur2.execute("SELECT COUNT(*) FROM quiz_question_links WHERE quiz_id=?", (quiz_id,))
@@ -3450,6 +3835,7 @@ async def show_quiz_action_menu(message, context):
     text = f"📘 **{escape_md(title)}**"
     if desc:
         text += f"\n📝 _{escape_md(desc)}_"
+    text += f"\n{access_badge}"
     text += "\n\n"
     text += f"📊 Questions: {total_questions}    ⏱ Timer: {timer}s"
     text += (
@@ -3544,6 +3930,9 @@ async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("❓ Show Questions",   callback_data="EDIT_QUESTIONS"),
+            InlineKeyboardButton("🔐 Access",           callback_data="EDIT_ACCESS"),
+        ],
+        [
             InlineKeyboardButton("⬅️ Back",            callback_data="BACK_TO_ACTION"),
         ],
     ]
@@ -3726,6 +4115,99 @@ async def edit_shuffle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 🔑 Remember shuffle menu message for cleanup
     context.user_data["shuffle_menu_msg_id"] = msg.message_id
+
+async def edit_access_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    quiz_id = context.user_data.get("active_quiz_id")
+    if not quiz_id:
+        return
+
+    _conn, _cur = get_db()
+    _cur.execute("SELECT access FROM quizzes WHERE quiz_id=?", (quiz_id,))
+    row = _cur.fetchone()
+    _conn.close()
+
+    current = (row[0] if row and row[0] else "public")
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"{'✅ ' if current == 'public' else ''}🌐 Public",
+                callback_data="SET_ACCESS|public"
+            ),
+            InlineKeyboardButton(
+                f"{'✅ ' if current == 'private' else ''}🔒 Private",
+                callback_data="SET_ACCESS|private"
+            ),
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_ACCESS_MENU")],
+    ])
+
+    msg = await query.message.reply_text(
+        "🔐 *Quiz Access*\n\n"
+        "🌐 *Public* — Anyone in the group can take this quiz.\n"
+        "🔒 *Private* — Only users in the Quiz Subscribers list of this folder can take it.",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    context.user_data["edit_access_prompt_id"] = msg.message_id
+
+
+async def set_quiz_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    access_val = query.data.split("|", 1)[1]
+    quiz_id    = context.user_data.get("active_quiz_id")
+    if not quiz_id:
+        return
+
+    try:
+        async with DB_LOCK:
+            _conn, _cur = get_db()
+            _cur.execute(
+                "UPDATE quizzes SET access=? WHERE quiz_id=?",
+                (access_val, quiz_id)
+            )
+            _conn.commit()
+            _conn.close()
+    except Exception as e:
+        print("⚠️ Failed to set access:", e)
+        await query.answer("❌ Failed to update.", show_alert=True)
+        return
+
+    prompt_id = context.user_data.pop("edit_access_prompt_id", None)
+    if prompt_id:
+        try:
+            await context.bot.delete_message(query.message.chat_id, prompt_id)
+        except: pass
+
+    label = "🌐 Public" if access_val == "public" else "🔒 Private"
+    confirm = await query.message.reply_text(f"✅ Quiz set to {label}.")
+    await asyncio.sleep(1.5)
+    try: await confirm.delete()
+    except: pass
+
+    overview_id = context.user_data.get("quiz_overview_msg_id")
+    if overview_id:
+        await show_quiz_action_menu_by_id(
+            chat_id=query.message.chat_id,
+            message_id=overview_id,
+            context=context
+        )
+
+
+async def cancel_access_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    prompt_id = context.user_data.pop("edit_access_prompt_id", None)
+    if prompt_id:
+        try:
+            await context.bot.delete_message(query.message.chat_id, prompt_id)
+        except: pass
 
 async def toggle_shuffle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -5233,6 +5715,48 @@ async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await flash_message(context.bot, query.message.chat_id, "❌ This quiz has no questions.")
         return
+
+    # 🔒 ACCESS CONTROL CHECK
+    _conn_ac, _cur_ac = get_db()
+    _cur_ac.execute("SELECT access, folder FROM quizzes WHERE quiz_id=?", (quiz_id,))
+    ac_row = _cur_ac.fetchone()
+    _conn_ac.close()
+
+    if ac_row and ac_row[0] == "private":
+        folder     = ac_row[1]
+        player_id  = query.from_user.id
+
+        # Fetch quiz owner
+        _conn_ow, _cur_ow = get_db()
+        _cur_ow.execute("SELECT owner_id FROM quizzes WHERE quiz_id=?", (quiz_id,))
+        ow_row = _cur_ow.fetchone()
+        _conn_ow.close()
+        owner_id = ow_row[0] if ow_row else None
+
+        # Allow owner always
+        if player_id != owner_id:
+            _conn_sub, _cur_sub = get_db()
+            _cur_sub.execute(
+                """
+                SELECT 1 FROM quiz_folder_subscribers
+                WHERE folder_name=? AND owner_id=? AND user_id=?
+                """,
+                (folder, owner_id, player_id)
+            )
+            allowed = _cur_sub.fetchone()
+            _conn_sub.close()
+
+            if not allowed:
+                await context.bot.send_message(
+                    chat_id=player_id,
+                    text=(
+                        "🔒 *This quiz is Private.*\n\n"
+                        "You are not on the subscriber list for this quiz.\n"
+                        "Please contact the quiz admin to be added."
+                    ),
+                    parse_mode="Markdown"
+                )
+                return
 
     questions = []
     for qid, text, image, options, correct, explanation in rows:
@@ -8170,7 +8694,7 @@ async def show_quiz_action_menu_by_id(chat_id, message_id, context):
     _conn, _cur = get_db()
     _cur.execute("""
         SELECT q.title, q.description, q.timer, q.shuffle_q, q.shuffle_a,
-               COUNT(ql.question_id)
+               COUNT(ql.question_id), q.access
         FROM quizzes q
         LEFT JOIN quiz_question_links ql ON q.quiz_id = ql.quiz_id
         WHERE q.quiz_id=?
@@ -8181,11 +8705,14 @@ async def show_quiz_action_menu_by_id(chat_id, message_id, context):
 
     if not row:
         return
-    title, desc, timer, sq, sa, total_questions = row
+    title, desc, timer, sq, sa, total_questions, access_val = row
+    access_val   = access_val or "public"
+    access_badge = "🌐 Public" if access_val == "public" else "🔒 Private"
 
     text = f"📘 **{escape_md(title)}**"
     if desc:
         text += f"\n📝 _{escape_md(desc)}_"
+    text += f"\n{access_badge}"
     text += "\n\n"
     text += f"📊 Questions: {total_questions}    ⏱ Timer: {timer}s"
     text += (
@@ -11454,6 +11981,14 @@ app.add_handler(CallbackQueryHandler(delete_quiz, pattern="^DELETE_QUIZ$"))
 app.add_handler(CallbackQueryHandler(go_home, pattern="^GO_HOME$"))
 app.add_handler(CallbackQueryHandler(home_create_quiz, pattern="^HOME_CREATE$"))
 app.add_handler(CallbackQueryHandler(home_my_quizzes, pattern="^HOME_MY_QUIZZES$"))
+app.add_handler(CallbackQueryHandler(qfs_menu,             pattern=r"^QFS_MENU\|"))
+app.add_handler(CallbackQueryHandler(qfs_add_start,        pattern=r"^QFS_ADD\|"))
+app.add_handler(CallbackQueryHandler(qfs_list,             pattern=r"^QFS_LIST\|"))
+app.add_handler(CallbackQueryHandler(qfs_list_prev,        pattern=r"^QFS_LIST_PREV\|"))
+app.add_handler(CallbackQueryHandler(qfs_list_next,        pattern=r"^QFS_LIST_NEXT\|"))
+app.add_handler(CallbackQueryHandler(qfs_view_subscriber,  pattern=r"^QFS_VIEW\|"))
+app.add_handler(CallbackQueryHandler(qfs_remove_subscriber,pattern=r"^QFS_REMOVE\|"))
+app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^QFS_LIST_NOP$"))
 app.add_handler(CallbackQueryHandler(move_create_folder_start, pattern="^MOVE_CREATE_FOLDER$"))
 app.add_handler(CallbackQueryHandler(move_quiz_menu, pattern="^MOVE_QUIZ$"))
 app.add_handler(CallbackQueryHandler(move_quiz_to_folder, pattern="^MOVE_QUIZ_TO\\|"))
@@ -11471,6 +12006,9 @@ app.add_handler(CallbackQueryHandler(edit_desc, pattern="^EDIT_DESC$"))
 app.add_handler(CallbackQueryHandler(edit_timer_menu, pattern="^EDIT_TIMER$"))
 app.add_handler(CallbackQueryHandler(set_timer, pattern="^SET_TIMER_"))
 app.add_handler(CallbackQueryHandler(edit_shuffle_menu, pattern="^EDIT_SHUFFLE$"))
+app.add_handler(CallbackQueryHandler(edit_access_menu,  pattern="^EDIT_ACCESS$"))
+app.add_handler(CallbackQueryHandler(set_quiz_access,   pattern=r"^SET_ACCESS\|"))
+app.add_handler(CallbackQueryHandler(cancel_access_menu,pattern="^CANCEL_ACCESS_MENU$"))
 app.add_handler(CallbackQueryHandler(toggle_shuffle, pattern="^TOGGLE_"))
 app.add_handler(CallbackQueryHandler(show_questions, pattern="^EDIT_QUESTIONS$"))
 app.add_handler(CallbackQueryHandler(back_to_action, pattern="^BACK_TO_ACTION$"))
