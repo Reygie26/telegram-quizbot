@@ -621,17 +621,6 @@ CREATE TABLE IF NOT EXISTS quiz_folder_subscribers (
     except Exception:
         pass
 
-for sql in [
-    "ALTER TABLE quiz_folder_subscribers ADD COLUMN subscription_type TEXT DEFAULT 'Lifetime'",
-    "ALTER TABLE quiz_folder_subscribers ADD COLUMN expires_at INTEGER DEFAULT 0",
-    "ALTER TABLE quiz_folder_subscribers ADD COLUMN subscribed_at INTEGER DEFAULT 0",
-]:
-    try:
-        _cur.execute(sql)
-        _conn.commit()
-    except Exception:
-        pass
-
     _cur.execute("""
 CREATE TABLE IF NOT EXISTS subscribers (
     user_id INTEGER PRIMARY KEY,
