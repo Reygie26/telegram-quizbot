@@ -99,7 +99,6 @@ DB_FILE = "/var/data/quizbot.db"
 ##### =============================================================================================
 ##### print("📂 Using database file at:", DB_FILE)
 ##### =============================================================================================
-##### FOR TEST BOT                   - (empty)
 ##### FOR GITHUB                     - print("📂 Using database file at:", DB_FILE)
 print("📂 Using database file at:", DB_FILE)
 
@@ -4595,7 +4594,6 @@ async def show_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     end = start + QUESTIONS_PER_PAGE
 
     keyboard = []
-    keyboard.append([InlineKeyboardButton("➕ Add from Question Bank", callback_data="QB_PICK_FOLDER")])
 
     for i, (qid, q) in enumerate(rows[start:end], start=start + 1):
         keyboard.append([
@@ -4612,6 +4610,7 @@ async def show_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             nav.append(InlineKeyboardButton("Next ▶️", callback_data="QPAGE_NEXT"))
         keyboard.append(nav)
 
+    keyboard.append([InlineKeyboardButton("➕ Add from Question Bank", callback_data="QB_PICK_FOLDER")])
     keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="EDIT_THIS")])
 
     await query.message.edit_text(
@@ -4662,9 +4661,6 @@ async def show_questions_from_message(message, context):
     end = start + QUESTIONS_PER_PAGE
 
     keyboard = []
-    keyboard.append([
-        InlineKeyboardButton("➕ Add from Question Bank", callback_data="QB_PICK_FOLDER")
-    ])
 
     for i, (qid, q) in enumerate(rows[start:end], start=start + 1):
         keyboard.append([
@@ -4681,6 +4677,7 @@ async def show_questions_from_message(message, context):
             nav.append(InlineKeyboardButton("Next ▶️", callback_data="QPAGE_NEXT"))
         keyboard.append(nav)
 
+    keyboard.append([InlineKeyboardButton("➕ Add from Question Bank", callback_data="QB_PICK_FOLDER")])
     keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="EDIT_THIS")])
 
     await message.edit_text(
@@ -8463,15 +8460,6 @@ def build_qb_question_keyboard(context):
 
     keyboard = []
 
-    keyboard.append([
-        InlineKeyboardButton("📄 Add this Page", callback_data="QB_ADD_THIS_PAGE"),
-    ])
-    keyboard.append([
-        InlineKeyboardButton("🎲 Add 10",  callback_data="QB_AUTO_ADD|10"),
-        InlineKeyboardButton("🎲 Add 50",  callback_data="QB_AUTO_ADD|50"),
-        InlineKeyboardButton("🎲 Add 100", callback_data="QB_AUTO_ADD|100"),
-    ])
-
     for qid, text in page_items:
         already_added = qid in linked_questions
         if already_added:
@@ -8493,11 +8481,17 @@ def build_qb_question_keyboard(context):
         keyboard.append(nav)
 
     keyboard.append([
-        InlineKeyboardButton("🧹 Clear Selection",              callback_data="QB_CLEAR_SELECTED"),
+        InlineKeyboardButton("🎲 Add 10",  callback_data="QB_AUTO_ADD|10"),
+        InlineKeyboardButton("🎲 Add 50",  callback_data="QB_AUTO_ADD|50"),
+        InlineKeyboardButton("🎲 Add 100", callback_data="QB_AUTO_ADD|100"),
+    ])
+    keyboard.append([
+        InlineKeyboardButton("📄 Add this Page",               callback_data="QB_ADD_THIS_PAGE"),
         InlineKeyboardButton(f"➕ Add Selected ({len(selected)})", callback_data="QB_ADD_SELECTED"),
     ])
     keyboard.append([
-        InlineKeyboardButton("⬅️ Back", callback_data="QB_PICK_FOLDER")
+        InlineKeyboardButton("🧹 Clear Selection", callback_data="QB_CLEAR_SELECTED"),
+        InlineKeyboardButton("⬅️ Back",            callback_data="QB_PICK_FOLDER"),
     ])
 
     return InlineKeyboardMarkup(keyboard)
@@ -10286,15 +10280,6 @@ async def show_db_move_question_list(message, context):
 
     keyboard = []
 
-    keyboard.append([
-        InlineKeyboardButton("📄 Add this Page", callback_data="DB_MOVE_ADD_PAGE"),
-        InlineKeyboardButton("🎲 Add 10",        callback_data="DB_MOVE_AUTO_ADD|10"),
-    ])
-    keyboard.append([
-        InlineKeyboardButton("🎲 Add 50",  callback_data="DB_MOVE_AUTO_ADD|50"),
-        InlineKeyboardButton("🎲 Add 100", callback_data="DB_MOVE_AUTO_ADD|100"),
-    ])
-
     for qid, text in page_items:
         checked = "☑" if qid in selected else "⬜"
         keyboard.append([
@@ -10314,10 +10299,18 @@ async def show_db_move_question_list(message, context):
         keyboard.append(nav)
 
     keyboard.append([
+        InlineKeyboardButton("🎲 Add 10",  callback_data="DB_MOVE_AUTO_ADD|10"),
+        InlineKeyboardButton("🎲 Add 50",  callback_data="DB_MOVE_AUTO_ADD|50"),
+        InlineKeyboardButton("🎲 Add 100", callback_data="DB_MOVE_AUTO_ADD|100"),
+    ])
+    keyboard.append([
+        InlineKeyboardButton("📄 Add this Page", callback_data="DB_MOVE_ADD_PAGE"),
         InlineKeyboardButton(
             f"📦 Move Selected ({len(selected)})",
             callback_data="DB_MOVE_CONFIRM"
         ),
+    ])
+    keyboard.append([
         InlineKeyboardButton("⬅️ Cancel", callback_data=f"DB_MOVE_IN|{target_folder}")
     ])
 
