@@ -591,7 +591,7 @@ CREATE TABLE IF NOT EXISTS group_lb_messages (
     except Exception:
         pass
 
-_cur.execute("""
+    _cur.execute("""
 CREATE TABLE IF NOT EXISTS quiz_folder_subscribers (
     folder_name TEXT,
     owner_id INTEGER,
