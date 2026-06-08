@@ -99,6 +99,7 @@ DB_FILE = "/var/data/quizbot.db"
 ##### =============================================================================================
 ##### print("📂 Using database file at:", DB_FILE)
 ##### =============================================================================================
+##### FOR TEST BOT                   - (empty)
 ##### FOR GITHUB                     - print("📂 Using database file at:", DB_FILE)
 print("📂 Using database file at:", DB_FILE)
 
@@ -590,7 +591,7 @@ CREATE TABLE IF NOT EXISTS group_lb_messages (
     except Exception:
         pass
 
-    _cur.execute("""
+_cur.execute("""
 CREATE TABLE IF NOT EXISTS quiz_folder_subscribers (
     folder_name TEXT,
     owner_id INTEGER,
@@ -601,9 +602,32 @@ CREATE TABLE IF NOT EXISTS quiz_folder_subscribers (
 """)
     _conn.commit()
 
+    # Safe migrations for quiz_folder_subscribers expiry columns
+    for sql in [
+        "ALTER TABLE quiz_folder_subscribers ADD COLUMN subscription_type TEXT DEFAULT 'Lifetime'",
+        "ALTER TABLE quiz_folder_subscribers ADD COLUMN expires_at INTEGER DEFAULT 0",
+        "ALTER TABLE quiz_folder_subscribers ADD COLUMN subscribed_at INTEGER DEFAULT 0",
+    ]:
+        try:
+            _cur.execute(sql)
+            _conn.commit()
+        except Exception:
+            pass
+
     # Safe migration: add access column to quizzes
     try:
         _cur.execute("ALTER TABLE quizzes ADD COLUMN access TEXT DEFAULT 'public'")
+        _conn.commit()
+    except Exception:
+        pass
+
+for sql in [
+    "ALTER TABLE quiz_folder_subscribers ADD COLUMN subscription_type TEXT DEFAULT 'Lifetime'",
+    "ALTER TABLE quiz_folder_subscribers ADD COLUMN expires_at INTEGER DEFAULT 0",
+    "ALTER TABLE quiz_folder_subscribers ADD COLUMN subscribed_at INTEGER DEFAULT 0",
+]:
+    try:
+        _cur.execute(sql)
         _conn.commit()
     except Exception:
         pass
@@ -2590,7 +2614,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("qfs_new_user_id", None)
             await flash_message(context.bot, chat_id, "⚠️ This user is already a subscriber.")
 
-            # Refresh QFS menu
             _dummy_msg = await context.bot.send_message(chat_id, "⏳")
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ Add Quiz Subscriber", callback_data=f"QFS_ADD|{folder}")],
@@ -2607,19 +2630,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        try:
-            async with DB_LOCK:
-                _conn, _cur = get_db()
-                _cur.execute(
-                    "INSERT INTO quiz_folder_subscribers (folder_name, owner_id, user_id, name) VALUES (?, ?, ?, ?)",
-                    (folder, active_uid, new_user_id, name)
-                )
-                _conn.commit()
-                _conn.close()
-        except Exception as e:
-            print("⚠️ QFS insert failed:", e)
-            await flash_message(context.bot, chat_id, "❌ Failed to add subscriber.")
-            return
+        # ✅ Name accepted — store it and ask for duration
+        context.user_data["qfs_new_name"] = name
+        context.user_data["state"] = "QFS_WAIT_DURATION"
 
         prompt_id = context.user_data.pop("qfs_prompt_id", None)
         if prompt_id:
@@ -2628,25 +2641,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await context.bot.delete_message(chat_id, user_msg_id)
         except: pass
 
-        context.user_data.pop("state", None)
-        context.user_data.pop("qfs_new_user_id", None)
-
-        await flash_message(context.bot, chat_id, f"✅ *{name}* added as Quiz Subscriber.", delay=2)
-
-        _dummy_msg = await context.bot.send_message(chat_id, "⏳")
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add Quiz Subscriber", callback_data=f"QFS_ADD|{folder}")],
-            [
-                InlineKeyboardButton("❌ Inactive", callback_data=f"QFS_LIST|{folder}|inactive"),
-                InlineKeyboardButton("✅ Active",   callback_data=f"QFS_LIST|{folder}|active"),
-            ],
-            [InlineKeyboardButton("⬅️ Back", callback_data=f"OPEN_FOLDER|{folder}")],
+            [InlineKeyboardButton("📅 1 Day",    callback_data="QFS_DURATION|1 Day"),
+             InlineKeyboardButton("📅 1 Week",   callback_data="QFS_DURATION|1 Week"),
+             InlineKeyboardButton("📅 1 Month",  callback_data="QFS_DURATION|1 Month")],
+            [InlineKeyboardButton("📅 6 Months", callback_data="QFS_DURATION|6 Months"),
+             InlineKeyboardButton("📅 1 Year",   callback_data="QFS_DURATION|1 Year"),
+             InlineKeyboardButton("♾ Lifetime",  callback_data="QFS_DURATION|Lifetime")],
+            [InlineKeyboardButton("❌ Cancel",   callback_data=f"QFS_MENU|{folder}")],
         ])
-        await _dummy_msg.edit_text(
-            f"👥 *Quiz Subscribers*\n📁 Folder: {escape_md(folder)}",
+        msg = await context.bot.send_message(
+            chat_id,
+            f"👤 Name: *{name}*\n\n⏳ Select subscription duration:",
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
+        context.user_data["qfs_prompt_id"] = msg.message_id
         return
 
     # SUB_WAIT_USER_ID
@@ -3427,24 +3437,35 @@ async def qfs_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _show_qfs_list(message, context, folder, mode, page):
     active_uid = get_active_user_id(context)
-    PER_PAGE = 10
+    PER_PAGE   = 10
+    now        = int(time.time())
 
     _conn, _cur = get_db()
     if mode == "active":
         _cur.execute(
             """
-            SELECT user_id, name FROM quiz_folder_subscribers
+            SELECT user_id, name, subscription_type, expires_at
+            FROM quiz_folder_subscribers
             WHERE folder_name=? AND owner_id=?
+              AND (subscription_type='Lifetime' OR expires_at=0 OR expires_at > ?)
             ORDER BY name COLLATE NOCASE
             """,
-            (folder, active_uid)
+            (folder, active_uid, now)
         )
         header = f"✅ *Active Quiz Subscribers*\n📁 {escape_md(folder)}"
-        empty  = f"✅ *Active Quiz Subscribers*\n📁 {escape_md(folder)}\n\n_No subscribers yet._"
+        empty  = f"✅ *Active Quiz Subscribers*\n📁 {escape_md(folder)}\n\n_No active subscribers._"
     else:
-        # For now inactive = users NOT in active list (reserved for future revoke tracking)
-        # We show an empty list with a note
-        _cur.execute("SELECT 1 WHERE 0")  # empty result
+        _cur.execute(
+            """
+            SELECT user_id, name, subscription_type, expires_at
+            FROM quiz_folder_subscribers
+            WHERE folder_name=? AND owner_id=?
+              AND (subscription_type='Revoked'
+                   OR (subscription_type != 'Lifetime' AND expires_at > 0 AND expires_at <= ?))
+            ORDER BY expires_at ASC
+            """,
+            (folder, active_uid, now)
+        )
         header = f"❌ *Inactive Quiz Subscribers*\n📁 {escape_md(folder)}"
         empty  = f"❌ *Inactive Quiz Subscribers*\n📁 {escape_md(folder)}\n\n_No inactive subscribers._"
 
@@ -3455,7 +3476,11 @@ async def _show_qfs_list(message, context, folder, mode, page):
 
     if not rows:
         keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data=f"QFS_MENU|{folder}")])
-        await message.edit_text(empty, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await message.edit_text(
+            empty,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
         return
 
     total = len(rows)
@@ -3466,9 +3491,22 @@ async def _show_qfs_list(message, context, folder, mode, page):
     start = page * PER_PAGE
     end   = start + PER_PAGE
 
-    for user_id, name in rows[start:end]:
+    for user_id, name, sub_type, expires_at in rows[start:end]:
+        if sub_type == "Lifetime" or expires_at == 0:
+            badge = "Lifetime"
+        elif sub_type == "Revoked":
+            badge = "Revoked"
+        elif expires_at > now:
+            days  = (expires_at - now) // 86400
+            badge = f"{days}d left"
+        else:
+            badge = "Expired"
+
         keyboard.append([
-            InlineKeyboardButton(f"👤 {name}", callback_data=f"QFS_VIEW|{user_id}")
+            InlineKeyboardButton(
+                f"👤 {name}  •  {badge}",
+                callback_data=f"QFS_VIEW|{user_id}"
+            )
         ])
 
     if pages > 1:
@@ -3515,8 +3553,182 @@ async def qfs_view_subscriber(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
 
-    target_id = int(query.data.split("|", 1)[1])
-    folder    = context.user_data.get("qfs_folder", "")
+    target_id  = int(query.data.split("|", 1)[1])
+    folder     = context.user_data.get("qfs_folder", "")
+    active_uid = get_active_user_id(context)
+    now        = int(time.time())
+
+    _conn, _cur = get_db()
+    _cur.execute(
+        """
+        SELECT name, subscription_type, expires_at, subscribed_at
+        FROM quiz_folder_subscribers
+        WHERE folder_name=? AND owner_id=? AND user_id=?
+        """,
+        (folder, active_uid, target_id)
+    )
+    row = _cur.fetchone()
+    _conn.close()
+
+    if not row:
+        await query.answer("❌ Subscriber not found.", show_alert=True)
+        return
+
+    name, sub_type, expires_at, subscribed_at = row
+    mode = context.user_data.get("qfs_list_mode", "active")
+
+    # Format subscribed_at date
+    if subscribed_at and subscribed_at > 0:
+        sub_date = datetime.datetime.fromtimestamp(
+            subscribed_at, datetime.timezone.utc
+        ).strftime("%B %d, %Y")
+        sub_date_label = "Last Renewed"
+    else:
+        sub_date = "—"
+        sub_date_label = "Subscribed"
+
+    # Format remaining time
+    if sub_type == "Lifetime" or expires_at == 0:
+        remaining_text = "Lifetime (no expiry)"
+    elif sub_type == "Revoked":
+        remaining_text = "Revoked"
+    elif expires_at > now:
+        days = (expires_at - now) // 86400
+        expiry_date = datetime.datetime.fromtimestamp(
+            expires_at, datetime.timezone.utc
+        ).strftime("%B %d, %Y")
+        remaining_text = f"{days} day(s) — expires {expiry_date}"
+    else:
+        remaining_text = "Expired"
+
+    text = (
+        f"👤 *{escape_md(name)}*\n\n"
+        f"🆔 User ID: `{target_id}`\n"
+        f"📅 {sub_date_label}: {sub_date}\n"
+        f"📦 Duration: {sub_type or 'Lifetime'}\n"
+        f"⏳ Remaining: {remaining_text}"
+    )
+
+    if mode == "inactive":
+        action_button = InlineKeyboardButton("🗑 Remove", callback_data=f"QFS_REMOVE|{target_id}")
+    else:
+        action_button = InlineKeyboardButton("🚫 Revoke", callback_data=f"QFS_REVOKE|{target_id}")
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            action_button,
+            InlineKeyboardButton("🔄 Renew", callback_data=f"QFS_RENEW|{target_id}"),
+            InlineKeyboardButton("⬅️ Back",  callback_data=f"QFS_LIST|{folder}|{mode}"),
+        ]
+    ])
+
+    await query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def qfs_apply_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    sub_type    = query.data.split("|", 1)[1]
+    chat_id     = query.message.chat_id
+    folder      = context.user_data.get("qfs_folder", "")
+    new_user_id = context.user_data.get("qfs_new_user_id")
+    name        = context.user_data.get("qfs_new_name")
+    active_uid  = get_active_user_id(context)
+    is_renew    = context.user_data.get("qfs_renew_id") is not None
+
+    if not new_user_id or not name:
+        await flash_message(context.bot, chat_id, "❌ Subscriber data lost.")
+        return
+
+    now      = int(time.time())
+    duration = SUBSCRIPTION_DURATIONS.get(sub_type, 0)
+
+    if sub_type == "Lifetime":
+        expires_at = 0
+    elif is_renew:
+        _conn_r, _cur_r = get_db()
+        _cur_r.execute(
+            "SELECT expires_at, subscription_type FROM quiz_folder_subscribers "
+            "WHERE folder_name=? AND owner_id=? AND user_id=?",
+            (folder, active_uid, new_user_id)
+        )
+        row_r = _cur_r.fetchone()
+        _conn_r.close()
+        if row_r:
+            current_expires, current_type = row_r
+            if current_type == "Lifetime":
+                expires_at = 0
+            else:
+                base = max(current_expires, now)
+                expires_at = base + duration
+        else:
+            expires_at = now + duration
+    else:
+        expires_at = now + duration
+
+    try:
+        async with DB_LOCK:
+            _conn, _cur = get_db()
+            if is_renew:
+                _cur.execute(
+                    """
+                    UPDATE quiz_folder_subscribers
+                    SET subscription_type=?, expires_at=?, subscribed_at=?
+                    WHERE folder_name=? AND owner_id=? AND user_id=?
+                    """,
+                    (sub_type, expires_at, now, folder, active_uid, new_user_id)
+                )
+            else:
+                _cur.execute(
+                    """
+                    INSERT INTO quiz_folder_subscribers
+                    (folder_name, owner_id, user_id, name, subscription_type, expires_at, subscribed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (folder, active_uid, new_user_id, name, sub_type, expires_at, now)
+                )
+            _conn.commit()
+            _conn.close()
+    except Exception as e:
+        print("⚠️ QFS duration apply failed:", e)
+        await flash_message(context.bot, chat_id, "❌ Failed to save subscriber.")
+        return
+
+    # Cleanup state
+    prompt_id = context.user_data.pop("qfs_prompt_id", None)
+    if prompt_id:
+        try: await context.bot.delete_message(chat_id, prompt_id)
+        except: pass
+
+    context.user_data.pop("state", None)
+    context.user_data.pop("qfs_new_user_id", None)
+    context.user_data.pop("qfs_new_name", None)
+    context.user_data.pop("qfs_renew_id", None)
+
+    action_word = "renewed" if is_renew else "added"
+    await flash_message(context.bot, chat_id, f"✅ *{name}* {action_word} with *{sub_type}* access.", delay=2)
+
+    _dummy_msg = await context.bot.send_message(chat_id, "⏳")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Quiz Subscriber", callback_data=f"QFS_ADD|{folder}")],
+        [
+            InlineKeyboardButton("❌ Inactive", callback_data=f"QFS_LIST|{folder}|inactive"),
+            InlineKeyboardButton("✅ Active",   callback_data=f"QFS_LIST|{folder}|active"),
+        ],
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"OPEN_FOLDER|{folder}")],
+    ])
+    await _dummy_msg.edit_text(
+        f"👥 *Quiz Subscribers*\n📁 Folder: {escape_md(folder)}",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+async def qfs_renew_subscriber(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    target_id  = int(query.data.split("|", 1)[1])
+    folder     = context.user_data.get("qfs_folder", "")
     active_uid = get_active_user_id(context)
 
     _conn, _cur = get_db()
@@ -3528,23 +3740,55 @@ async def qfs_view_subscriber(update: Update, context: ContextTypes.DEFAULT_TYPE
     _conn.close()
 
     name = row[0] if row else str(target_id)
-    mode = context.user_data.get("qfs_list_mode", "active")
 
-    text = (
-        f"👤 *{escape_md(name)}*\n\n"
-        f"🆔 User ID: `{target_id}`\n"
-        f"📁 Folder: {escape_md(folder)}"
-    )
+    context.user_data["qfs_renew_id"]    = target_id
+    context.user_data["qfs_new_user_id"] = target_id
+    context.user_data["qfs_new_name"]    = name
 
     keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🗑 Remove", callback_data=f"QFS_REMOVE|{target_id}"),
-            InlineKeyboardButton("⬅️ Back",  callback_data=f"QFS_LIST|{folder}|{mode}"),
-        ]
+        [InlineKeyboardButton("📅 1 Day",    callback_data="QFS_DURATION|1 Day"),
+         InlineKeyboardButton("📅 1 Week",   callback_data="QFS_DURATION|1 Week"),
+         InlineKeyboardButton("📅 1 Month",  callback_data="QFS_DURATION|1 Month")],
+        [InlineKeyboardButton("📅 6 Months", callback_data="QFS_DURATION|6 Months"),
+         InlineKeyboardButton("📅 1 Year",   callback_data="QFS_DURATION|1 Year"),
+         InlineKeyboardButton("♾ Lifetime",  callback_data="QFS_DURATION|Lifetime")],
+        [InlineKeyboardButton("❌ Cancel",   callback_data=f"QFS_VIEW|{target_id}")],
     ])
 
-    await query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await query.message.edit_text(
+        f"🔄 *Renew subscription for {escape_md(name)}*\n\nSelect new duration:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
 
+async def qfs_revoke_subscriber(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    target_id  = int(query.data.split("|", 1)[1])
+    folder     = context.user_data.get("qfs_folder", "")
+    active_uid = get_active_user_id(context)
+
+    try:
+        async with DB_LOCK:
+            _conn, _cur = get_db()
+            _cur.execute(
+                """
+                UPDATE quiz_folder_subscribers
+                SET expires_at=1, subscription_type='Revoked'
+                WHERE folder_name=? AND owner_id=? AND user_id=?
+                """,
+                (folder, active_uid, target_id)
+            )
+            _conn.commit()
+            _conn.close()
+    except Exception as e:
+        print("⚠️ QFS revoke failed:", e)
+        await flash_message(context.bot, query.message.chat_id, "❌ Revoke failed.")
+        return
+
+    await flash_message(context.bot, query.message.chat_id, "✅ Subscriber revoked.")
+    await _show_qfs_list(query.message, context, folder, "active", 0)
 
 async def qfs_remove_subscriber(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -5742,12 +5986,16 @@ async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if access_mode == "private" and player_id != owner_id:
             _conn_sub, _cur_sub = get_db()
+            now_ac = int(time.time())
             _cur_sub.execute(
                 """
                 SELECT 1 FROM quiz_folder_subscribers
                 WHERE folder_name=? AND owner_id=? AND user_id=?
+                  AND (subscription_type='Lifetime'
+                       OR expires_at=0
+                       OR expires_at > ?)
                 """,
-                (folder, owner_id, player_id)
+                (folder, owner_id, player_id, now_ac)
             )
             allowed = _cur_sub.fetchone()
             _conn_sub.close()
@@ -12015,6 +12263,9 @@ app.add_handler(CallbackQueryHandler(qfs_list,             pattern=r"^QFS_LIST\|
 app.add_handler(CallbackQueryHandler(qfs_list_prev,        pattern=r"^QFS_LIST_PREV\|"))
 app.add_handler(CallbackQueryHandler(qfs_list_next,        pattern=r"^QFS_LIST_NEXT\|"))
 app.add_handler(CallbackQueryHandler(qfs_view_subscriber,  pattern=r"^QFS_VIEW\|"))
+app.add_handler(CallbackQueryHandler(qfs_apply_duration,   pattern=r"^QFS_DURATION\|"))
+app.add_handler(CallbackQueryHandler(qfs_renew_subscriber, pattern=r"^QFS_RENEW\|"))
+app.add_handler(CallbackQueryHandler(qfs_revoke_subscriber,pattern=r"^QFS_REVOKE\|"))
 app.add_handler(CallbackQueryHandler(qfs_remove_subscriber,pattern=r"^QFS_REMOVE\|"))
 app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^QFS_LIST_NOP$"))
 app.add_handler(CallbackQueryHandler(move_create_folder_start, pattern="^MOVE_CREATE_FOLDER$"))
