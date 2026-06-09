@@ -99,7 +99,6 @@ DB_FILE = "/var/data/quizbot.db"
 ##### =============================================================================================
 ##### print("📂 Using database file at:", DB_FILE)
 ##### =============================================================================================
-##### FOR TEST BOT                   - (empty)
 ##### FOR GITHUB                     - print("📂 Using database file at:", DB_FILE)
 print("📂 Using database file at:", DB_FILE)
 
@@ -1248,6 +1247,96 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🔑 Track user messages during question creation
     if context.user_data.get("add_q_state"):
         context.user_data.setdefault("question_flow_msgs", []).append(update.message.message_id)
+
+    # ── DOC SCAN: waiting for page numbers ───────────────────────────────────
+    if context.user_data.get("add_q_state") == "DOC_SCAN_WAIT_PAGES":
+        chat_id     = update.effective_chat.id
+        user_msg_id = update.message.message_id
+        raw_input   = text.strip()
+
+        total_pages = context.user_data.get("doc_scan_pages")
+
+        # Parse comma-separated page numbers
+        selected_pages = []
+        invalid_pages  = []
+
+        for part in raw_input.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if part.isdigit():
+                p = int(part)
+                if total_pages and (p < 1 or p > total_pages):
+                    invalid_pages.append(str(p))
+                else:
+                    if p not in selected_pages:
+                        selected_pages.append(p)
+            else:
+                invalid_pages.append(part)
+
+        # Delete user's typed message immediately
+        try:
+            await context.bot.delete_message(chat_id, user_msg_id)
+        except Exception:
+            pass
+
+        if invalid_pages:
+            status_id = context.user_data.get("doc_scan_status_id")
+            total_pages = context.user_data.get("doc_scan_pages")
+            doc_name    = context.user_data.get("doc_scan_name", "document")
+
+            err_text = (
+                f"❌ Invalid page number(s): *{', '.join(invalid_pages)}*\n\n"
+                f"📄 *{escape_md(doc_name)}*\n"
+                f"📊 Total pages: *{total_pages}*\n\n"
+                f"Please type valid page numbers separated by commas.\n"
+                f"Example: `1,3,5,10`"
+            )
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📄 Scan All Pages", callback_data="DOC_SCAN_ALL_PAGES")],
+                [InlineKeyboardButton("❌ Cancel",          callback_data="DOC_SCAN_CANCEL")],
+            ])
+            if status_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_id,
+                        text=err_text,
+                        reply_markup=keyboard,
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+            return
+
+        if not selected_pages:
+            return
+
+        # Sort pages in order
+        selected_pages.sort()
+
+        # Store selected pages and begin scan
+        context.user_data["doc_scan_selected_pages"] = selected_pages
+        context.user_data["add_q_state"]             = "DOC_SCAN_RUNNING"
+
+        status_id = context.user_data.get("doc_scan_status_id")
+        if status_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_id,
+                    text=(
+                        f"✅ Scanning pages: *{', '.join(str(p) for p in selected_pages)}*\n\n"
+                        f"⏳ Starting now…"
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+
+        await _doc_scan_begin(chat_id, context)
+        return
+
 
     if state == "DB_ADD_FOLDER":
         chat_id = update.effective_chat.id
@@ -12345,6 +12434,266 @@ def _init_doc_scan_state(context, all_chunks: list, doc_name: str):
 def _get_doc_scan(context):
     return context.user_data.get("doc_scan")
 
+async def doc_scan_all_pages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User tapped 'Scan All Pages' — sets selected_pages to full range."""
+    query = update.callback_query
+    await query.answer()
+
+    chat_id     = query.message.chat_id
+    total_pages = context.user_data.get("doc_scan_pages")
+    is_pdf      = context.user_data.get("doc_scan_is_pdf", False)
+
+    if is_pdf and total_pages:
+        selected_pages = list(range(1, total_pages + 1))
+    else:
+        selected_pages = []  # empty = all for DOCX/TXT
+
+    context.user_data["doc_scan_selected_pages"] = selected_pages
+    context.user_data["add_q_state"]             = "DOC_SCAN_RUNNING"
+
+    doc_name = context.user_data.get("doc_scan_name", "document")
+
+    if selected_pages:
+        status_text = (
+            f"✅ Scanning all *{len(selected_pages)}* pages of:\n"
+            f"📄 *{escape_md(doc_name)}*\n\n"
+            f"⏳ Starting now…"
+        )
+    else:
+        status_text = (
+            f"✅ Scanning:\n"
+            f"📄 *{escape_md(doc_name)}*\n\n"
+            f"⏳ Starting now…"
+        )
+
+    try:
+        await query.message.edit_text(
+            status_text,
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    context.user_data["doc_scan_status_id"] = query.message.message_id
+    await _doc_scan_begin(chat_id, context)
+
+
+async def doc_scan_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User tapped Cancel before scanning started."""
+    query = update.callback_query
+    await query.answer()
+
+    # Clean up all doc scan state
+    for key in (
+        "doc_scan_file", "doc_scan_name", "doc_scan_is_pdf",
+        "doc_scan_is_docx", "doc_scan_is_txt", "doc_scan_pages",
+        "doc_scan_status_id", "doc_scan_selected_pages",
+        "add_q_state", "doc_scan",
+    ):
+        context.user_data.pop(key, None)
+
+    await query.message.edit_text(
+        "❌ Document scan cancelled.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏠 Home", callback_data="GO_HOME")]
+        ])
+    )
+
+
+async def _doc_scan_begin(chat_id: int, context):
+    """
+    Central entry point after pages are selected.
+    Decides whether to use text extraction or Gemini OCR,
+    then kicks off the appropriate scan loop.
+    """
+    file_bytes     = context.user_data.get("doc_scan_file", b"")
+    doc_name       = context.user_data.get("doc_scan_name", "document")
+    is_pdf         = context.user_data.get("doc_scan_is_pdf", False)
+    is_docx        = context.user_data.get("doc_scan_is_docx", False)
+    selected_pages = context.user_data.get("doc_scan_selected_pages", [])
+    status_id      = context.user_data.get("doc_scan_status_id")
+
+    raw_text = ""
+    use_ocr  = False
+
+    # ── PDF ───────────────────────────────────────────────────────────────────
+    if is_pdf:
+        # Extract text only from selected pages
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(file_bytes))
+            parts  = []
+            if selected_pages:
+                for p in selected_pages:
+                    idx = p - 1  # pypdf is 0-indexed
+                    if 0 <= idx < len(reader.pages):
+                        t = reader.pages[idx].extract_text()
+                        if t and t.strip():
+                            parts.append(t.strip())
+            else:
+                for page in reader.pages:
+                    t = page.extract_text()
+                    if t and t.strip():
+                        parts.append(t.strip())
+            raw_text = "\n".join(parts)
+        except Exception:
+            raw_text = ""
+
+        if not raw_text.strip():
+            use_ocr = True
+            if status_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_id,
+                        text=(
+                            "📷 No text layer found — switching to "
+                            "*Gemini OCR mode*.\n\n"
+                            "Each selected page will be scanned visually…"
+                        ),
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+
+    # ── DOCX ──────────────────────────────────────────────────────────────────
+    elif is_docx:
+        try:
+            raw_text = _extract_text_from_docx(file_bytes)
+        except RuntimeError as e:
+            if status_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_id,
+                        text=str(e)
+                    )
+                except Exception:
+                    pass
+            return
+
+    # ── TXT ───────────────────────────────────────────────────────────────────
+    else:
+        try:
+            raw_text = _extract_text_from_txt(file_bytes)
+        except RuntimeError as e:
+            if status_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_id,
+                        text=str(e)
+                    )
+                except Exception:
+                    pass
+            return
+
+    # ── OCR MODE (scanned PDF) ────────────────────────────────────────────────
+    if use_ocr:
+        try:
+            all_page_images = _pdf_to_page_images(file_bytes)
+        except RuntimeError as e:
+            if status_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_id,
+                        text=str(e)
+                    )
+                except Exception:
+                    pass
+            return
+
+        # Filter to only selected pages
+        if selected_pages:
+            page_images = []
+            for p in selected_pages:
+                idx = p - 1
+                if 0 <= idx < len(all_page_images):
+                    page_images.append((p, all_page_images[idx]))
+        else:
+            page_images = list(enumerate(all_page_images, start=1))
+
+        if not page_images:
+            if status_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_id,
+                        text="❌ No valid pages found to scan."
+                    )
+                except Exception:
+                    pass
+            return
+
+        _init_doc_scan_state(context, [], doc_name)
+        ds = context.user_data["doc_scan"]
+        ds["ocr_pages"]      = page_images   # list of (page_num, bytes)
+        ds["ocr_page_index"] = 0
+        ds["ocr_mode"]       = True
+        ds["status_msg_id"]  = status_id
+
+        if status_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_id,
+                    text=(
+                        f"✅ OCR mode ready!\n\n"
+                        f"📄 *{escape_md(doc_name)}*\n"
+                        f"📊 {len(page_images)} page(s) selected\n\n"
+                        f"⏳ Scanning now…"
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+
+        await _doc_scan_next_ocr_page(chat_id, context)
+        return
+
+    # ── TEXT MODE ─────────────────────────────────────────────────────────────
+    if not raw_text.strip():
+        if status_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_id,
+                    text="❌ No readable text found in the selected pages."
+                )
+            except Exception:
+                pass
+        return
+
+    chunks = _split_into_chunks(raw_text, chars_per_chunk=6000)
+    _init_doc_scan_state(context, chunks, doc_name)
+    ds = context.user_data["doc_scan"]
+    ds["status_msg_id"] = status_id
+
+    total_chars = len(raw_text)
+    pages_label = (
+        f"Pages: {', '.join(str(p) for p in selected_pages)}\n"
+        if selected_pages else ""
+    )
+
+    if status_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=status_id,
+                text=(
+                    f"✅ Document loaded!\n\n"
+                    f"📄 *{escape_md(doc_name)}*\n"
+                    f"{pages_label}"
+                    f"📊 {total_chars:,} characters · {len(chunks)} chunk(s)\n\n"
+                    f"⏳ Starting scan now…"
+                ),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+    await _doc_scan_next_chunk(chat_id, context)
 
 async def home_scan_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -12421,6 +12770,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ── Download ──────────────────────────────────────────────────────────────
     status_msg = await update.message.reply_text("📥 Downloading document…")
 
     try:
@@ -12431,103 +12781,70 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Download failed: {e}")
         return
 
-    await status_msg.edit_text("🔍 Extracting text from document…")
-
     doc_name = doc.file_name or "document"
-    raw_text = ""
-    use_ocr  = False
 
-    # ── PDF: try text first, fall back to Gemini OCR ──────────────────────────
+    # ── Get page count ────────────────────────────────────────────────────────
+    total_pages = None
+
     if is_pdf:
         try:
-            raw_text = _extract_text_from_pdf(file_bytes)
+            from pypdf import PdfReader
+            reader      = PdfReader(io.BytesIO(file_bytes))
+            total_pages = len(reader.pages)
         except Exception:
-            raw_text = ""
+            total_pages = None
 
-        if not raw_text.strip():
-            # No text layer found — this is a scanned/image PDF
-            use_ocr = True
-            await status_msg.edit_text(
-                "📷 No text layer found — switching to *Gemini OCR mode*.\n\n"
-                "Each page will be scanned visually. This may take a moment…",
-                parse_mode="Markdown"
-            )
-
-    # ── DOCX / TXT: normal text extraction ───────────────────────────────────
     elif is_docx:
-        try:
-            raw_text = _extract_text_from_docx(file_bytes)
-        except RuntimeError as e:
-            await status_msg.edit_text(str(e))
-            return
-    else:
-        try:
-            raw_text = _extract_text_from_txt(file_bytes)
-        except RuntimeError as e:
-            await status_msg.edit_text(str(e))
-            return
+        # DOCX has no fixed pages — treat paragraphs as units
+        total_pages = None
 
-    # ── GEMINI OCR PATH (scanned PDF) ─────────────────────────────────────────
-    if use_ocr:
-        try:
-            page_images = _pdf_to_page_images(file_bytes)
-        except RuntimeError as e:
-            await status_msg.edit_text(str(e))
-            return
+    # ── Store file in state for later use ─────────────────────────────────────
+    context.user_data["doc_scan_file"]      = file_bytes
+    context.user_data["doc_scan_name"]      = doc_name
+    context.user_data["doc_scan_is_pdf"]    = is_pdf
+    context.user_data["doc_scan_is_docx"]   = is_docx
+    context.user_data["doc_scan_is_txt"]    = is_txt
+    context.user_data["doc_scan_pages"]     = total_pages
+    context.user_data["doc_scan_status_id"] = status_msg.message_id
+    context.user_data["add_q_state"]        = "DOC_SCAN_WAIT_PAGES"
 
-        if not page_images:
-            await status_msg.edit_text("❌ Could not extract any pages from this PDF.")
-            return
-
-        total_pages = len(page_images)
-
-        # Store page images in doc_scan state for chunk-by-chunk OCR scanning
-        _init_doc_scan_state(context, [], doc_name)
-        context.user_data["doc_scan"]["ocr_pages"]       = page_images
-        context.user_data["doc_scan"]["ocr_page_index"]  = 0
-        context.user_data["doc_scan"]["ocr_mode"]        = True
-        context.user_data["add_q_state"]                 = "DOC_SCAN_RUNNING"
-
-        await status_msg.edit_text(
-            f"✅ PDF loaded in OCR mode!\n\n"
-            f"📄 *{escape_md(doc_name)}*\n"
-            f"📊 {total_pages} page(s) to scan with Gemini AI\n\n"
-            f"⏳ Starting scan now…",
-            parse_mode="Markdown"
-        )
-
-        context.user_data["doc_scan"]["status_msg_id"] = status_msg.message_id
-        context.user_data.setdefault("question_flow_msgs", []).append(status_msg.message_id)
-
-        await _doc_scan_next_ocr_page(chat_id, context)
-        return
-
-    # ── TEXT PATH (normal PDF / DOCX / TXT) ──────────────────────────────────
-    if not raw_text or not raw_text.strip():
-        await status_msg.edit_text(
-            "❌ No readable text found in this document.\n\n"
-            "Please make sure the file contains actual text content."
-        )
-        return
-
-    chunks = _split_into_chunks(raw_text, chars_per_chunk=6000)
-
-    _init_doc_scan_state(context, chunks, doc_name)
-    context.user_data["add_q_state"] = "DOC_SCAN_RUNNING"
-
-    total_chars = len(raw_text)
-    await status_msg.edit_text(
-        f"✅ Document loaded!\n\n"
-        f"📄 *{escape_md(doc_name)}*\n"
-        f"📊 {total_chars:,} characters · {len(chunks)} chunk(s) to scan\n\n"
-        f"⏳ Starting scan now…",
-        parse_mode="Markdown"
-    )
-
-    context.user_data["doc_scan"]["status_msg_id"] = status_msg.message_id
     context.user_data.setdefault("question_flow_msgs", []).append(status_msg.message_id)
 
-    await _doc_scan_next_chunk(chat_id, context)
+    # ── Ask which pages to scan ───────────────────────────────────────────────
+    if is_pdf and total_pages:
+        page_info = (
+            f"📄 *{escape_md(doc_name)}*\n"
+            f"📊 Total pages: *{total_pages}*\n\n"
+            f"Which pages do you want to scan?\n\n"
+            f"Type page numbers separated by commas:\n"
+            f"Example: `1,3,5,10`\n\n"
+            f"Or tap *Scan All Pages* to scan everything."
+        )
+    elif is_pdf:
+        page_info = (
+            f"📄 *{escape_md(doc_name)}*\n\n"
+            f"Which pages do you want to scan?\n\n"
+            f"Type page numbers separated by commas:\n"
+            f"Example: `1,3,5,10`\n\n"
+            f"Or tap *Scan All Pages* to scan everything."
+        )
+    else:
+        # DOCX and TXT have no page concept — scan all automatically
+        page_info = (
+            f"📄 *{escape_md(doc_name)}*\n\n"
+            f"✅ Document ready. Tap *Scan All* to begin."
+        )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 Scan All Pages", callback_data="DOC_SCAN_ALL_PAGES")],
+        [InlineKeyboardButton("❌ Cancel",          callback_data="DOC_SCAN_CANCEL")],
+    ])
+
+    await status_msg.edit_text(
+        page_info,
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
 
 async def _doc_scan_next_ocr_page(chat_id: int, context):
     """
@@ -12543,8 +12860,8 @@ async def _doc_scan_next_ocr_page(chat_id: int, context):
     total_pages  = len(page_images)
 
     while ds["ocr_page_index"] < total_pages:
-        idx        = ds["ocr_page_index"]
-        page_bytes = page_images[idx]
+        idx              = ds["ocr_page_index"]
+        page_num, page_bytes = page_images[idx]
 
         status_id = ds.get("status_msg_id")
         if status_id:
@@ -12553,7 +12870,8 @@ async def _doc_scan_next_ocr_page(chat_id: int, context):
                     chat_id=chat_id,
                     message_id=status_id,
                     text=(
-                        f"🔍 OCR scanning page {idx + 1}/{total_pages}…\n"
+                        f"🔍 OCR scanning page {page_num} "
+                        f"({idx + 1}/{total_pages})…\n"
                         f"📦 Questions found so far: {len(ds['pending'])}"
                     )
                 )
@@ -13104,6 +13422,8 @@ app.add_handler(CallbackQueryHandler(qb_pick_folder_start, pattern="^QB_PICK_FOL
 app.add_handler(CallbackQueryHandler(qb_folder_prev, pattern="^QB_FOLDER_PREV$"))
 app.add_handler(CallbackQueryHandler(qb_folder_next, pattern="^QB_FOLDER_NEXT$"))
 app.add_handler(CallbackQueryHandler(home_scan_document, pattern="^HOME_SCAN_DOCUMENT$"))
+app.add_handler(CallbackQueryHandler(doc_scan_all_pages, pattern="^DOC_SCAN_ALL_PAGES$"))
+app.add_handler(CallbackQueryHandler(doc_scan_cancel,    pattern="^DOC_SCAN_CANCEL$"))
 app.add_handler(CallbackQueryHandler(doc_scan_save,      pattern="^DOC_SCAN_SAVE$"))
 app.add_handler(CallbackQueryHandler(doc_scan_skip,      pattern="^DOC_SCAN_SKIP$"))
 app.add_handler(CallbackQueryHandler(doc_scan_stop,      pattern="^DOC_SCAN_STOP$"))
