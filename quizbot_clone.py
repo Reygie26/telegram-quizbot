@@ -3697,7 +3697,34 @@ async def qfs_apply_duration(update: Update, context: ContextTypes.DEFAULT_TYPE)
     action_word = "renewed" if is_renew else "added"
     await flash_message(context.bot, chat_id, f"✅ *{name}* {action_word} with *{sub_type}* access.", delay=2)
 
-    _dummy_msg = await context.bot.send_message(chat_id, "⏳")
+    # 🔔 Send notice to the subscriber (new subscriptions and renewals)
+    try:
+        if sub_type == "Lifetime":
+            duration_text = "♾ *Lifetime* (no expiry)"
+        else:
+            duration_text = f"📅 *{sub_type}*"
+
+        notice_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ I Agree", callback_data="QFS_SUB_AGREE_NOTICE")]
+        ])
+        await context.bot.send_message(
+            chat_id=new_user_id,
+            text=(
+                f"🧠 *Welcome to TeleQuiz (Quiz Access)*\n\n"
+                f"⚠️ *Important Notice*\n\n"
+                f"You have been granted access to quizzes in folder: *{escape_md(folder)}*\n\n"
+                f"Subscription Duration: {duration_text}\n\n"
+                f"All quiz access is tied to your subscription. "
+                f"If your subscription expires and is not renewed, "
+                f"you will lose access to all quizzes in this folder.\n\n"
+                f"Please tap I Agree to acknowledge."
+            ),
+            reply_markup=notice_keyboard,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print(f"⚠️ Could not send QFS notice to {new_user_id}: {e}")
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add Quiz Subscriber", callback_data=f"QFS_ADD|{folder}")],
         [
@@ -3706,11 +3733,19 @@ async def qfs_apply_duration(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ],
         [InlineKeyboardButton("⬅️ Back", callback_data=f"OPEN_FOLDER|{folder}")],
     ])
-    await _dummy_msg.edit_text(
-        f"👥 *Quiz Subscribers*\n📁 Folder: {escape_md(folder)}",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
+    try:
+        await query.message.edit_text(
+            f"👥 *Quiz Subscribers*\n📁 Folder: {escape_md(folder)}",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    except Exception:
+        msg = await context.bot.send_message(
+            chat_id,
+            f"👥 *Quiz Subscribers*\n📁 Folder: {escape_md(folder)}",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
 
 async def qfs_renew_subscriber(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -11848,6 +11883,15 @@ async def subscriber_agree_notice(update: Update, context: ContextTypes.DEFAULT_
     )
     context.user_data.setdefault("chat_messages", []).append(msg.message_id)
 
+async def qfs_sub_agree_notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dismisses the QFS one-time subscription notice."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
 async def sub_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -12096,6 +12140,7 @@ app.add_handler(CallbackQueryHandler(sub_revoke_confirm,      pattern="^SUB_REVO
 app.add_handler(CallbackQueryHandler(sub_revoke_apply,        pattern="^SUB_REVOKE_CONFIRM$"))
 app.add_handler(CallbackQueryHandler(sub_revoke_cancel,       pattern="^SUB_REVOKE_CANCEL$"))
 app.add_handler(CallbackQueryHandler(subscriber_agree_notice, pattern="^SUB_AGREE_NOTICE$"))
+app.add_handler(CallbackQueryHandler(qfs_sub_agree_notice, pattern="^QFS_SUB_AGREE_NOTICE$"))
 app.add_handler(CallbackQueryHandler(sub_cancel,              pattern="^SUB_CANCEL$"))
 app.add_handler(CallbackQueryHandler(sub_delete, pattern="^SUB_DELETE\\|"))
 app.add_handler(CallbackQueryHandler(db_rename_folder_start, pattern="^DB_RENAME_FOLDER\\|"))
