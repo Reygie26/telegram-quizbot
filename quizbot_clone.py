@@ -12100,17 +12100,42 @@ async def gemini_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 import io
 
 def _extract_text_from_pdf(file_bytes: bytes) -> str:
+    """
+    Try pypdf text extraction first.
+    If no text found (scanned/image PDF), returns empty string
+    so the caller can fall back to Gemini OCR.
+    """
     try:
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(file_bytes))
         parts = []
         for page in reader.pages:
             t = page.extract_text()
-            if t:
-                parts.append(t)
+            if t and t.strip():
+                parts.append(t.strip())
         return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def _pdf_to_page_images(file_bytes: bytes) -> list:
+    """
+    Converts each page of a PDF into a JPEG image (bytes).
+    Uses PyMuPDF (fitz). Returns a list of bytes, one per page.
+    """
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        images = []
+        for page in doc:
+            # Render at 150 DPI — good balance of quality vs speed
+            mat = fitz.Matrix(150 / 72, 150 / 72)
+            pix = page.get_pixmap(matrix=mat)
+            images.append(pix.tobytes("jpeg"))
+        doc.close()
+        return images
     except Exception as e:
-        raise RuntimeError(f"❌ Could not read PDF: {e}")
+        raise RuntimeError(f"❌ Could not convert PDF pages to images: {e}")
 
 
 def _extract_text_from_docx(file_bytes: bytes) -> str:
@@ -12408,26 +12433,84 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await status_msg.edit_text("🔍 Extracting text from document…")
 
-    try:
-        if is_pdf:
+    doc_name = doc.file_name or "document"
+    raw_text = ""
+    use_ocr  = False
+
+    # ── PDF: try text first, fall back to Gemini OCR ──────────────────────────
+    if is_pdf:
+        try:
             raw_text = _extract_text_from_pdf(file_bytes)
-        elif is_docx:
+        except Exception:
+            raw_text = ""
+
+        if not raw_text.strip():
+            # No text layer found — this is a scanned/image PDF
+            use_ocr = True
+            await status_msg.edit_text(
+                "📷 No text layer found — switching to *Gemini OCR mode*.\n\n"
+                "Each page will be scanned visually. This may take a moment…",
+                parse_mode="Markdown"
+            )
+
+    # ── DOCX / TXT: normal text extraction ───────────────────────────────────
+    elif is_docx:
+        try:
             raw_text = _extract_text_from_docx(file_bytes)
-        else:
+        except RuntimeError as e:
+            await status_msg.edit_text(str(e))
+            return
+    else:
+        try:
             raw_text = _extract_text_from_txt(file_bytes)
-    except RuntimeError as e:
-        await status_msg.edit_text(str(e))
+        except RuntimeError as e:
+            await status_msg.edit_text(str(e))
+            return
+
+    # ── GEMINI OCR PATH (scanned PDF) ─────────────────────────────────────────
+    if use_ocr:
+        try:
+            page_images = _pdf_to_page_images(file_bytes)
+        except RuntimeError as e:
+            await status_msg.edit_text(str(e))
+            return
+
+        if not page_images:
+            await status_msg.edit_text("❌ Could not extract any pages from this PDF.")
+            return
+
+        total_pages = len(page_images)
+
+        # Store page images in doc_scan state for chunk-by-chunk OCR scanning
+        _init_doc_scan_state(context, [], doc_name)
+        context.user_data["doc_scan"]["ocr_pages"]       = page_images
+        context.user_data["doc_scan"]["ocr_page_index"]  = 0
+        context.user_data["doc_scan"]["ocr_mode"]        = True
+        context.user_data["add_q_state"]                 = "DOC_SCAN_RUNNING"
+
+        await status_msg.edit_text(
+            f"✅ PDF loaded in OCR mode!\n\n"
+            f"📄 *{escape_md(doc_name)}*\n"
+            f"📊 {total_pages} page(s) to scan with Gemini AI\n\n"
+            f"⏳ Starting scan now…",
+            parse_mode="Markdown"
+        )
+
+        context.user_data["doc_scan"]["status_msg_id"] = status_msg.message_id
+        context.user_data.setdefault("question_flow_msgs", []).append(status_msg.message_id)
+
+        await _doc_scan_next_ocr_page(chat_id, context)
         return
 
+    # ── TEXT PATH (normal PDF / DOCX / TXT) ──────────────────────────────────
     if not raw_text or not raw_text.strip():
         await status_msg.edit_text(
             "❌ No readable text found in this document.\n\n"
-            "If this is a scanned PDF (image-only), please send a text-based PDF instead."
+            "Please make sure the file contains actual text content."
         )
         return
 
-    chunks   = _split_into_chunks(raw_text, chars_per_chunk=6000)
-    doc_name = doc.file_name or "document"
+    chunks = _split_into_chunks(raw_text, chars_per_chunk=6000)
 
     _init_doc_scan_state(context, chunks, doc_name)
     context.user_data["add_q_state"] = "DOC_SCAN_RUNNING"
@@ -12446,6 +12529,146 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await _doc_scan_next_chunk(chat_id, context)
 
+async def _doc_scan_next_ocr_page(chat_id: int, context):
+    """
+    OCR mode: sends one PDF page image at a time to Gemini,
+    accumulates questions, and triggers the review batch every 10 questions.
+    """
+    ds = _get_doc_scan(context)
+    if not ds:
+        return
+
+    BATCH_SIZE   = 10
+    page_images  = ds.get("ocr_pages", [])
+    total_pages  = len(page_images)
+
+    while ds["ocr_page_index"] < total_pages:
+        idx        = ds["ocr_page_index"]
+        page_bytes = page_images[idx]
+
+        status_id = ds.get("status_msg_id")
+        if status_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_id,
+                    text=(
+                        f"🔍 OCR scanning page {idx + 1}/{total_pages}…\n"
+                        f"📦 Questions found so far: {len(ds['pending'])}"
+                    )
+                )
+            except Exception:
+                pass
+
+        ds["ocr_page_index"] += 1
+
+        # Use existing Gemini image scanner but ask for questions + options onlyasync def doc_scan_resume
+        try:
+            question, options = await scan_image_with_gemini(page_bytes)
+
+            # scan_image_with_gemini returns ONE question per image.
+            # For document pages that may have multiple questions,
+            # we also run the text chunk parser on the OCR'd text.
+            # Strategy: get raw text from Gemini first, then parse it.
+            raw_page_text = await _ocr_page_to_text(page_bytes)
+            if raw_page_text.strip():
+                parsed = await _parse_questions_from_chunk(raw_page_text)
+                ds["pending"].extend(parsed)
+            elif question:
+                # Fallback: use the single question from scan_image_with_gemini
+                ds["pending"].append({"question": question, "options": options})
+
+        except RuntimeError as e:
+            # Rate limit hit
+            status_id = ds.get("status_msg_id")
+            if status_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_id,
+                        text=str(e) + "\n\nPlease wait a minute and tap ▶️ Resume.",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("▶️ Resume", callback_data="DOC_SCAN_RESUME")],
+                            [InlineKeyboardButton("🛑 Stop",   callback_data="DOC_SCAN_STOP")],
+                        ])
+                    )
+                except Exception:
+                    pass
+            return
+
+        except Exception as e:
+            print(f"⚠️ OCR page {idx + 1} error: {e}")
+            continue  # skip bad pages, keep going
+
+        if len(ds["pending"]) >= BATCH_SIZE:
+            batch                 = ds["pending"][:BATCH_SIZE]
+            ds["pending"]         = ds["pending"][BATCH_SIZE:]
+            ds["batch_questions"] = batch
+            await _doc_scan_show_review(chat_id, context)
+            return
+
+    # All pages done
+    if ds["pending"]:
+        ds["batch_questions"] = ds["pending"][:]
+        ds["pending"]         = []
+        await _doc_scan_show_review(chat_id, context)
+    else:
+        await _doc_scan_finish(chat_id, context)
+
+
+async def _ocr_page_to_text(page_bytes: bytes) -> str:
+    """
+    Sends a single PDF page image to Gemini and asks it to return
+    ALL the text on the page as plain text (not structured JSON).
+    This raw text is then fed into _parse_questions_from_chunk.
+    """
+    global _gemini_key_index
+
+    prompt = (
+        "Read this image and return ALL the text you see on it, "
+        "exactly as written. Do not summarize, format, or add anything. "
+        "Just return the raw text content of the page."
+    )
+
+    image_part = google_genai.types.Part.from_bytes(
+        data=page_bytes,
+        mime_type="image/jpeg",
+    )
+    text_part = google_genai.types.Part.from_text(text=prompt)
+    loop      = asyncio.get_event_loop()
+
+    keys_tried = 0
+    total_keys = len(GEMINI_API_KEYS)
+
+    while True:
+        try:
+            client = _get_gemini_client()
+
+            def _call():
+                return client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=[image_part, text_part],
+                ).text
+
+            return await loop.run_in_executor(None, _call)
+
+        except Exception as e:
+            err = str(e).lower()
+            is_rate = any(x in err for x in [
+                "429", "quota", "rate", "503", "unavailable",
+                "high demand", "resource_exhausted", "too many requests"
+            ])
+            if is_rate:
+                keys_tried += 1
+                if keys_tried >= total_keys:
+                    raise RuntimeError(
+                        "🔴 All Gemini API keys are rate-limited. Please try again later."
+                    )
+                _rotate_gemini_key()
+                await asyncio.sleep(2)
+                continue
+            print(f"⚠️ OCR page text error: {e}")
+            return ""
 
 async def _doc_scan_next_chunk(chat_id: int, context):
     ds = _get_doc_scan(context)
@@ -12672,7 +12895,12 @@ async def doc_scan_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
     await query.message.edit_text("⏳ Resuming scan in 5 seconds…")
     await asyncio.sleep(5)
-    await _doc_scan_next_chunk(chat_id, context)
+
+    # Resume correct mode — OCR or text chunk
+    if ds.get("ocr_mode"):
+        await _doc_scan_next_ocr_page(chat_id, context)
+    else:
+        await _doc_scan_next_chunk(chat_id, context)
 
 
 async def _doc_scan_finish(chat_id: int, context):
