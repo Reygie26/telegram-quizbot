@@ -4,3 +4,4 @@ google-genai
 fpdf2
 pypdf
 python-docx
+pymupdf
