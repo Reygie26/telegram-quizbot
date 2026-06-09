@@ -4678,6 +4678,9 @@ async def home_create_question(update: Update, context: ContextTypes.DEFAULT_TYP
             InlineKeyboardButton("✏️ Create Manually", callback_data="HOME_CREATE_MANUALLY"),
             InlineKeyboardButton("📷 Send Photo",      callback_data="HOME_CREATE_PHOTO"),
         ],
+        [
+            InlineKeyboardButton("📄 Scan Document",   callback_data="HOME_SCAN_DOCUMENT"),
+        ],
         [InlineKeyboardButton("❌ Cancel", callback_data="GO_HOME")],
     ])
 
@@ -12090,6 +12093,642 @@ async def gemini_key_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     asyncio.create_task(_delete_keystatus())
 
+# ════════════════════════════════════════════════════
+# DOCUMENT SCANNER — NEW FUNCTIONS
+# ════════════════════════════════════════════════════
+
+import io
+
+def _extract_text_from_pdf(file_bytes: bytes) -> str:
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(file_bytes))
+        parts = []
+        for page in reader.pages:
+            t = page.extract_text()
+            if t:
+                parts.append(t)
+        return "\n".join(parts)
+    except Exception as e:
+        raise RuntimeError(f"❌ Could not read PDF: {e}")
+
+
+def _extract_text_from_docx(file_bytes: bytes) -> str:
+    try:
+        from docx import Document
+        doc = Document(io.BytesIO(file_bytes))
+        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+    except Exception as e:
+        raise RuntimeError(f"❌ Could not read DOCX: {e}")
+
+
+def _extract_text_from_txt(file_bytes: bytes) -> str:
+    for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+        try:
+            return file_bytes.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    raise RuntimeError("❌ Could not decode text file (unsupported encoding).")
+
+
+def _split_into_chunks(text: str, chars_per_chunk: int = 6000) -> list:
+    lines   = text.splitlines()
+    chunks  = []
+    current = []
+    length  = 0
+    for line in lines:
+        line_len = len(line) + 1
+        if length + line_len > chars_per_chunk and current:
+            chunks.append("\n".join(current))
+            current = [line]
+            length  = line_len
+        else:
+            current.append(line)
+            length += line_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+async def _parse_questions_from_chunk(chunk_text: str) -> list:
+    import json
+    global _gemini_key_index
+
+    prompt = f"""You are a quiz question extractor. Read the text below and extract EVERY multiple-choice question you find.
+
+Rules:
+- A question is any sentence/phrase followed by 2-4 answer choices (labeled A/B/C/D, a/b/c/d, 1/2/3/4, or any letter/number prefix).
+- Extract ONLY the question text and its options — do NOT guess or invent the correct answer.
+- Strip leading labels (e.g. "1.", "Q1.", "A.", "(a)") from both questions and options.
+- If an item has fewer than 2 options, skip it.
+- Pad options list to exactly 4 items; use "" for missing options.
+- Respond ONLY with a valid JSON array — no markdown, no explanation:
+
+[
+  {{"question": "...", "options": ["opt1", "opt2", "opt3", "opt4"]}},
+  ...
+]
+
+If no questions are found, respond with exactly: []
+
+TEXT:
+{chunk_text}"""
+
+    text_part = google_genai.types.Part.from_text(text=prompt)
+    loop      = asyncio.get_event_loop()
+    keys_tried = 0
+    total_keys = len(GEMINI_API_KEYS)
+
+    while True:
+        try:
+            client = _get_gemini_client()
+
+            def _call():
+                return client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=[text_part],
+                ).text
+
+            raw = await loop.run_in_executor(None, _call)
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            raw = raw.strip()
+
+            data = json.loads(raw)
+            if not isinstance(data, list):
+                return []
+
+            results = []
+            for item in data:
+                q    = (item.get("question") or "").strip()
+                opts = [str(o).strip() for o in (item.get("options") or [])]
+                while len(opts) < 4:
+                    opts.append("")
+                opts = opts[:4]
+                if q:
+                    results.append({"question": q, "options": opts})
+            return results
+
+        except Exception as e:
+            err = str(e).lower()
+            is_rate = any(x in err for x in [
+                "429", "quota", "rate", "503", "unavailable",
+                "high demand", "resource_exhausted", "too many requests"
+            ])
+            if is_rate:
+                keys_tried += 1
+                if keys_tried >= total_keys:
+                    raise RuntimeError(
+                        "🔴 All Gemini API keys are rate-limited. Please try again later."
+                    )
+                _rotate_gemini_key()
+                await asyncio.sleep(2)
+                continue
+            print(f"⚠️ Gemini chunk parse error: {e}")
+            return []
+
+
+def _is_duplicate_doc(new_text: str, owner_id: int, threshold: float = 0.80) -> bool:
+    _conn, _cur = get_db()
+    _cur.execute(
+        """
+        SELECT qb.question
+        FROM question_bank qb
+        JOIN question_bank_folders f ON f.id = qb.folder_id
+        WHERE f.owner_id = ?
+        """,
+        (owner_id,)
+    )
+    rows = _cur.fetchall()
+    _conn.close()
+    for (existing,) in rows:
+        ratio = SequenceMatcher(None, new_text.lower(), existing.lower()).ratio()
+        if ratio >= threshold:
+            return True
+    return False
+
+
+async def _save_questions_to_default_folder(questions: list, owner_id: int) -> int:
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name='Default'",
+        (owner_id,)
+    )
+    row = _cur.fetchone()
+    _conn.close()
+
+    if not row:
+        async with DB_LOCK:
+            _conn2, _cur2 = get_db()
+            _cur2.execute(
+                "INSERT OR IGNORE INTO question_bank_folders (owner_id, name) VALUES (?, 'Default')",
+                (owner_id,)
+            )
+            _conn2.commit()
+            _conn2.close()
+        _conn3, _cur3 = get_db()
+        _cur3.execute(
+            "SELECT id FROM question_bank_folders WHERE owner_id=? AND name='Default'",
+            (owner_id,)
+        )
+        row = _cur3.fetchone()
+        _conn3.close()
+
+    if not row:
+        return 0
+
+    folder_id = row[0]
+    saved     = 0
+
+    async with DB_LOCK:
+        _conn4, _cur4 = get_db()
+        for q in questions:
+            opt_text = "||".join(q["options"])
+            _cur4.execute(
+                """
+                INSERT INTO question_bank
+                    (folder_id, question, image_file_id, options, correct, explanation)
+                VALUES (?, ?, NULL, ?, 0, NULL)
+                """,
+                (folder_id, q["question"], opt_text)
+            )
+            saved += 1
+        _conn4.commit()
+        _conn4.close()
+
+    return saved
+
+
+def _init_doc_scan_state(context, all_chunks: list, doc_name: str):
+    context.user_data["doc_scan"] = {
+        "chunks":          all_chunks,
+        "chunk_index":     0,
+        "pending":         [],
+        "batch_questions": [],
+        "total_saved":     0,
+        "total_skipped":   0,
+        "total_duplicate": 0,
+        "doc_name":        doc_name,
+        "status_msg_id":   None,
+        "review_msg_id":   None,
+    }
+
+
+def _get_doc_scan(context):
+    return context.user_data.get("doc_scan")
+
+
+async def home_scan_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    for key in ("add_q_state", "new_question", "ocr_flow", "question_flow_msgs",
+                "doc_scan", "active_question_id", "edit_q_field"):
+        context.user_data.pop(key, None)
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Back",  callback_data="HOME_CREATE_QUESTION"),
+         InlineKeyboardButton("❌ Cancel", callback_data="GO_HOME")],
+    ])
+
+    await query.message.edit_text(
+        "📄 *Scan Document*\n\n"
+        "Send me a document to extract quiz questions from.\n\n"
+        "Supported formats:\n"
+        "• 📕 PDF  (.pdf)\n"
+        "• 📘 Word (.docx)\n"
+        "• 📄 Text (.txt)\n\n"
+        "The bot will scan the document in batches of 10 questions for you to review before saving.",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+    context.user_data["add_q_state"] = "DOC_SCAN_WAIT_FILE"
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user is None:
+        return
+    if update.effective_chat and update.effective_chat.type in ("channel",):
+        return
+    if context.user_data.get("add_q_state") != "DOC_SCAN_WAIT_FILE":
+        return
+
+    doc = update.message.document
+    if doc is None:
+        return
+
+    chat_id = update.effective_chat.id
+    fname   = (doc.file_name or "document").lower()
+    mime    = (doc.mime_type or "").lower()
+
+    context.user_data.setdefault("question_flow_msgs", []).append(update.message.message_id)
+
+    is_pdf  = fname.endswith(".pdf") or "pdf" in mime
+    is_docx = fname.endswith(".docx") or "wordprocessingml" in mime or "msword" in mime
+    is_txt  = fname.endswith(".txt")  or mime in ("text/plain",)
+
+    if not (is_pdf or is_docx or is_txt):
+        err = await update.message.reply_text(
+            "❌ Unsupported file type.\n\nPlease send a PDF, DOCX, or TXT file."
+        )
+        await asyncio.sleep(3)
+        await asyncio.gather(
+            context.bot.delete_message(chat_id, err.message_id),
+            context.bot.delete_message(chat_id, update.message.message_id),
+            return_exceptions=True
+        )
+        return
+
+    MAX_BYTES = 20 * 1024 * 1024
+    if doc.file_size and doc.file_size > MAX_BYTES:
+        err = await update.message.reply_text(
+            "❌ File is too large (max 20 MB). Please split the document and try again."
+        )
+        await asyncio.sleep(3)
+        await asyncio.gather(
+            context.bot.delete_message(chat_id, err.message_id),
+            context.bot.delete_message(chat_id, update.message.message_id),
+            return_exceptions=True
+        )
+        return
+
+    status_msg = await update.message.reply_text("📥 Downloading document…")
+
+    try:
+        tg_file    = await context.bot.get_file(doc.file_id)
+        file_bytes = await tg_file.download_as_bytearray()
+        file_bytes = bytes(file_bytes)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Download failed: {e}")
+        return
+
+    await status_msg.edit_text("🔍 Extracting text from document…")
+
+    try:
+        if is_pdf:
+            raw_text = _extract_text_from_pdf(file_bytes)
+        elif is_docx:
+            raw_text = _extract_text_from_docx(file_bytes)
+        else:
+            raw_text = _extract_text_from_txt(file_bytes)
+    except RuntimeError as e:
+        await status_msg.edit_text(str(e))
+        return
+
+    if not raw_text or not raw_text.strip():
+        await status_msg.edit_text(
+            "❌ No readable text found in this document.\n\n"
+            "If this is a scanned PDF (image-only), please send a text-based PDF instead."
+        )
+        return
+
+    chunks   = _split_into_chunks(raw_text, chars_per_chunk=6000)
+    doc_name = doc.file_name or "document"
+
+    _init_doc_scan_state(context, chunks, doc_name)
+    context.user_data["add_q_state"] = "DOC_SCAN_RUNNING"
+
+    total_chars = len(raw_text)
+    await status_msg.edit_text(
+        f"✅ Document loaded!\n\n"
+        f"📄 *{escape_md(doc_name)}*\n"
+        f"📊 {total_chars:,} characters · {len(chunks)} chunk(s) to scan\n\n"
+        f"⏳ Starting scan now…",
+        parse_mode="Markdown"
+    )
+
+    context.user_data["doc_scan"]["status_msg_id"] = status_msg.message_id
+    context.user_data.setdefault("question_flow_msgs", []).append(status_msg.message_id)
+
+    await _doc_scan_next_chunk(chat_id, context)
+
+
+async def _doc_scan_next_chunk(chat_id: int, context):
+    ds = _get_doc_scan(context)
+    if not ds:
+        return
+
+    BATCH_SIZE = 10
+
+    while ds["chunk_index"] < len(ds["chunks"]):
+        idx   = ds["chunk_index"]
+        chunk = ds["chunks"][idx]
+        total = len(ds["chunks"])
+
+        status_id = ds.get("status_msg_id")
+        if status_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_id,
+                    text=(
+                        f"🔍 Scanning chunk {idx + 1}/{total}…\n"
+                        f"📦 Questions found so far: {len(ds['pending'])}"
+                    )
+                )
+            except Exception:
+                pass
+
+        ds["chunk_index"] += 1
+
+        try:
+            parsed = await _parse_questions_from_chunk(chunk)
+        except RuntimeError as e:
+            status_id = ds.get("status_msg_id")
+            if status_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_id,
+                        text=str(e) + "\n\nPlease wait a minute and tap ▶️ Resume.",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("▶️ Resume", callback_data="DOC_SCAN_RESUME")],
+                            [InlineKeyboardButton("🛑 Stop",   callback_data="DOC_SCAN_STOP")],
+                        ])
+                    )
+                except Exception:
+                    pass
+            return
+
+        ds["pending"].extend(parsed)
+
+        if len(ds["pending"]) >= BATCH_SIZE:
+            batch             = ds["pending"][:BATCH_SIZE]
+            ds["pending"]     = ds["pending"][BATCH_SIZE:]
+            ds["batch_questions"] = batch
+            await _doc_scan_show_review(chat_id, context)
+            return
+
+    if ds["pending"]:
+        ds["batch_questions"] = ds["pending"][:]
+        ds["pending"]         = []
+        await _doc_scan_show_review(chat_id, context)
+    else:
+        await _doc_scan_finish(chat_id, context)
+
+
+async def _doc_scan_show_review(chat_id: int, context):
+    ds = _get_doc_scan(context)
+    if not ds:
+        return
+
+    owner_id     = get_active_user_id(context)
+    batch        = ds["batch_questions"]
+    chunks_done  = ds["chunk_index"]
+    total_chunks = len(ds["chunks"])
+    more_chunks  = chunks_done < total_chunks
+
+    lines = [f"📋 *Review Batch* — {len(batch)} question(s)\n"]
+    for i, q in enumerate(batch, 1):
+        q_text = q["question"]
+        opts   = q["options"]
+        dup    = _is_duplicate_doc(q_text, owner_id)
+        flag   = " ⚠️ _duplicate_" if dup else ""
+        lines.append(
+            f"*{i}.* {escape_md(q_text[:120])}{flag}\n"
+            + "\n".join(
+                f"   {'ABCD'[j]}. {escape_md(opts[j][:80])}"
+                for j in range(len(opts)) if opts[j]
+            )
+        )
+
+    progress = f"\n\n📊 Chunks scanned: {chunks_done}/{total_chunks}"
+    if more_chunks:
+        progress += " — more pending after this batch"
+
+    text = "\n\n".join(lines) + progress
+
+    if len(text) > 4000:
+        text = text[:3950] + "\n\n_(preview truncated — all questions will be saved)_"
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Save Batch",    callback_data="DOC_SCAN_SAVE"),
+            InlineKeyboardButton("⏭ Skip Batch",    callback_data="DOC_SCAN_SKIP"),
+        ],
+        [
+            InlineKeyboardButton("🛑 Stop Scanning", callback_data="DOC_SCAN_STOP"),
+        ],
+    ])
+
+    status_id = ds.get("status_msg_id")
+    if status_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=status_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+            ds["review_msg_id"] = status_id
+            return
+        except Exception:
+            pass
+
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    ds["review_msg_id"] = msg.message_id
+    ds["status_msg_id"] = msg.message_id
+    context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
+
+
+async def doc_scan_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    ds = _get_doc_scan(context)
+    if not ds:
+        return
+
+    owner_id = get_active_user_id(context)
+    batch    = ds.get("batch_questions", [])
+
+    to_save = []
+    dupes   = 0
+    for q in batch:
+        if _is_duplicate_doc(q["question"], owner_id):
+            dupes += 1
+        else:
+            to_save.append(q)
+
+    saved = await _save_questions_to_default_folder(to_save, owner_id)
+
+    ds["total_saved"]     += saved
+    ds["total_duplicate"] += dupes
+    ds["batch_questions"]  = []
+
+    chat_id = query.message.chat_id
+
+    if ds["chunk_index"] < len(ds["chunks"]) or ds["pending"]:
+        await _doc_scan_next_chunk(chat_id, context)
+    else:
+        await _doc_scan_finish(chat_id, context)
+
+
+async def doc_scan_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    ds = _get_doc_scan(context)
+    if not ds:
+        return
+
+    batch = ds.get("batch_questions", [])
+    ds["total_skipped"]   += len(batch)
+    ds["batch_questions"]  = []
+
+    chat_id = query.message.chat_id
+
+    if ds["chunk_index"] < len(ds["chunks"]) or ds["pending"]:
+        await _doc_scan_next_chunk(chat_id, context)
+    else:
+        await _doc_scan_finish(chat_id, context)
+
+
+async def doc_scan_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    ds      = _get_doc_scan(context)
+    chat_id = query.message.chat_id
+
+    saved   = ds["total_saved"]    if ds else 0
+    skipped = ds["total_skipped"]  if ds else 0
+    dupes   = ds["total_duplicate"] if ds else 0
+
+    context.user_data.pop("doc_scan", None)
+    context.user_data.pop("add_q_state", None)
+
+    await query.message.edit_text(
+        f"🛑 *Scan stopped.*\n\n"
+        f"✅ Saved:                {saved} question(s)\n"
+        f"⏭ Skipped:             {skipped} question(s)\n"
+        f"⚠️ Duplicates skipped: {dupes}\n\n"
+        f"All saved questions are in your *Default DB Folder*.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏠 Home", callback_data="GO_HOME")]
+        ])
+    )
+
+
+async def doc_scan_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    ds = _get_doc_scan(context)
+    if not ds:
+        return
+
+    chat_id = query.message.chat_id
+    await query.message.edit_text("⏳ Resuming scan in 5 seconds…")
+    await asyncio.sleep(5)
+    await _doc_scan_next_chunk(chat_id, context)
+
+
+async def _doc_scan_finish(chat_id: int, context):
+    ds = _get_doc_scan(context)
+    if not ds:
+        return
+
+    saved    = ds["total_saved"]
+    skipped  = ds["total_skipped"]
+    dupes    = ds["total_duplicate"]
+    doc_name = ds["doc_name"]
+    review_id = ds.get("review_msg_id") or ds.get("status_msg_id")
+
+    context.user_data.pop("doc_scan", None)
+    context.user_data.pop("add_q_state", None)
+
+    summary = (
+        f"🎉 *Document Scan Complete!*\n\n"
+        f"📄 _{escape_md(doc_name)}_\n\n"
+        f"✅ Saved:                {saved} question(s)\n"
+        f"⏭ Skipped:             {skipped} question(s)\n"
+        f"⚠️ Duplicates skipped: {dupes}\n\n"
+        f"All saved questions are in your *Default DB Folder*."
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🗄 View Database", callback_data="HOME_DATABASE"),
+            InlineKeyboardButton("🏠 Home",          callback_data="GO_HOME"),
+        ]
+    ])
+
+    if review_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=review_id,
+                text=summary,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+            return
+        except Exception:
+            pass
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=summary,
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+# ════════════════════════════════════════════════════
+# END OF DOCUMENT SCANNER FUNCTIONS
+# ════════════════════════════════════════════════════
+
 # =========================
 # HANDLERS
 # =========================
@@ -12119,6 +12758,7 @@ app.add_handler(CommandHandler("backup", backup_db))
 app.add_handler(CommandHandler("keystatus", gemini_key_status))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
 # =========================
 # Must Stay on Top of other CallbackQueryHandler
@@ -12235,6 +12875,11 @@ app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pat
 app.add_handler(CallbackQueryHandler(qb_pick_folder_start, pattern="^QB_PICK_FOLDER$"))
 app.add_handler(CallbackQueryHandler(qb_folder_prev, pattern="^QB_FOLDER_PREV$"))
 app.add_handler(CallbackQueryHandler(qb_folder_next, pattern="^QB_FOLDER_NEXT$"))
+app.add_handler(CallbackQueryHandler(home_scan_document, pattern="^HOME_SCAN_DOCUMENT$"))
+app.add_handler(CallbackQueryHandler(doc_scan_save,      pattern="^DOC_SCAN_SAVE$"))
+app.add_handler(CallbackQueryHandler(doc_scan_skip,      pattern="^DOC_SCAN_SKIP$"))
+app.add_handler(CallbackQueryHandler(doc_scan_stop,      pattern="^DOC_SCAN_STOP$"))
+app.add_handler(CallbackQueryHandler(doc_scan_resume,    pattern="^DOC_SCAN_RESUME$"))
 app.add_handler(CallbackQueryHandler(home_create_manually, pattern="^HOME_CREATE_MANUALLY$"))
 app.add_handler(CallbackQueryHandler(home_create_photo,    pattern="^HOME_CREATE_PHOTO$"))
 app.add_handler(CallbackQueryHandler(ocr_back_to_method,   pattern="^OCR_BACK_TO_METHOD$"))
