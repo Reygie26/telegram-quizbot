@@ -2,3 +2,5 @@ python-telegram-bot[job-queue]==21.9
 APScheduler==3.10.4
 google-genai
 fpdf2
+pypdf
+python-docx
