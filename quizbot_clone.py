@@ -1298,7 +1298,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _doc_scan_begin(chat_id, context)
         return
 
-
     if state == "DB_ADD_FOLDER":
         chat_id = update.effective_chat.id
         user_msg_id = update.message.message_id
@@ -1528,6 +1527,90 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ================= ADD QUESTION FLOW =================
     q_state = context.user_data.get("add_q_state")
+
+    # ── DSR EDIT: waiting for text input ─────────────────────────────────────
+    if q_state == "DSR_WAIT_EDIT_INPUT":
+        chat_id     = update.effective_chat.id
+        user_msg_id = update.message.message_id
+        editing     = context.user_data.get("dsr_editing")
+        ds          = _get_doc_scan(context)
+
+        # Delete user's typed message immediately
+        try:
+            await context.bot.delete_message(chat_id, user_msg_id)
+        except Exception:
+            pass
+
+        if not ds or not ds.get("batch_questions"):
+            return
+
+        if editing == "QUESTION":
+            new_text = text.strip()
+            if len(new_text) > MAX_QUESTION_LENGTH:
+                err = await context.bot.send_message(
+                    chat_id,
+                    f"❌ Too long ({len(new_text)} chars). Max {MAX_QUESTION_LENGTH}. Send again:"
+                )
+                await asyncio.sleep(3)
+                try: await err.delete()
+                except: pass
+                return
+            ds["batch_questions"][0]["question"] = new_text
+            context.user_data.pop("dsr_editing", None)
+            context.user_data.pop("add_q_state", None)
+            await _doc_scan_show_review(chat_id, context)
+
+        elif editing == "CHOICES":
+            new_opts = context.user_data.setdefault("dsr_new_options", [])
+            if len(text) > MAX_OPTION_LENGTH:
+                err = await context.bot.send_message(
+                    chat_id,
+                    f"❌ Too long ({len(text)} chars). Max {MAX_OPTION_LENGTH}. Send again:"
+                )
+                await asyncio.sleep(3)
+                try: await err.delete()
+                except: pass
+                return
+
+            new_opts.append(text.strip())
+            count = len(new_opts)
+            q     = ds["batch_questions"][0]
+            opts  = q.get("options", [])
+
+            if count < 4:
+                next_label = ["A", "B", "C", "D"][count]
+                next_opt   = opts[count] if count < len(opts) else ""
+
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Keep", callback_data=f"DSR_OPT_KEEP|{count}"),
+                        InlineKeyboardButton("❌ Cancel Edit", callback_data="DSR_EDIT_CANCEL"),
+                    ]
+                ])
+
+                status_id = ds.get("status_msg_id")
+                if status_id:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=status_id,
+                            text=(
+                                f"✏️ *Edit Choices — Option {next_label}*\n\n"
+                                f"Current: _{escape_md(next_opt)}_\n\n"
+                                f"Send new text or tap Keep:"
+                            ),
+                            reply_markup=keyboard,
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
+            else:
+                ds["batch_questions"][0]["options"] = context.user_data.pop("dsr_new_options")
+                context.user_data.pop("dsr_editing", None)
+                context.user_data.pop("add_q_state", None)
+                await _doc_scan_show_review(chat_id, context)
+        return
+
 
     # ================= EDIT QUESTION EXPLANATION =================
     if context.user_data.get("edit_q_field") == "EXPLANATION":
@@ -12432,14 +12515,14 @@ async def _parse_questions_from_chunk(chunk_text: str) -> list:
 
 Rules:
 - A question is any sentence/phrase followed by 2-4 answer choices (labeled A/B/C/D, a/b/c/d, 1/2/3/4, or any letter/number prefix).
-- Extract ONLY the question text and its options — do NOT guess or invent the correct answer.
 - Strip leading labels (e.g. "1.", "Q1.", "A.", "(a)") from both questions and options.
 - If an item has fewer than 2 options, skip it.
 - Pad options list to exactly 4 items; use "" for missing options.
+- For the correct answer: look for visual clues such as bold text, asterisks (*word*), underscores (_word_), ALL CAPS emphasis, a marker like (*), (✓), (correct), or any annotation indicating the right answer. If found, set "correct" to the 0-based index of that option. If no correct answer is identifiable, set "correct" to -1.
 - Respond ONLY with a valid JSON array — no markdown, no explanation:
 
 [
-  {{"question": "...", "options": ["opt1", "opt2", "opt3", "opt4"]}},
+  {{"question": "...", "options": ["opt1", "opt2", "opt3", "opt4"], "correct": 1}},
   ...
 ]
 
@@ -12477,13 +12560,17 @@ TEXT:
 
             results = []
             for item in data:
-                q    = (item.get("question") or "").strip()
-                opts = [str(o).strip() for o in (item.get("options") or [])]
+                q       = (item.get("question") or "").strip()
+                opts    = [str(o).strip() for o in (item.get("options") or [])]
+                correct = item.get("correct", -1)
                 while len(opts) < 4:
                     opts.append("")
                 opts = opts[:4]
+                # Validate correct index; -1 means unknown
+                if not isinstance(correct, int) or correct < 0 or correct >= len([o for o in opts if o]):
+                    correct = -1
                 if q:
-                    results.append({"question": q, "options": opts})
+                    results.append({"question": q, "options": opts, "correct": correct})
             return results
 
         except Exception as e:
@@ -12560,14 +12647,18 @@ async def _save_questions_to_default_folder(questions: list, owner_id: int) -> i
     async with DB_LOCK:
         _conn4, _cur4 = get_db()
         for q in questions:
-            opt_text = "||".join(q["options"])
+            opt_text    = "||".join(q["options"])
+            correct_idx = q.get("correct", -1)
+            # If unknown (-1), store 0 as placeholder (user reviewed before saving anyway)
+            if correct_idx < 0:
+                correct_idx = 0
             _cur4.execute(
                 """
                 INSERT INTO question_bank
                     (folder_id, question, image_file_id, options, correct, explanation)
-                VALUES (?, ?, NULL, ?, 0, NULL)
+                VALUES (?, ?, NULL, ?, ?, NULL)
                 """,
-                (folder_id, q["question"], opt_text)
+                (folder_id, q["question"], opt_text, correct_idx)
             )
             saved += 1
         _conn4.commit()
@@ -13211,52 +13302,96 @@ async def _doc_scan_next_chunk(chat_id: int, context):
     else:
         await _doc_scan_finish(chat_id, context)
 
+def _build_doc_review_text(q: dict, is_duplicate: bool) -> str:
+    """
+    Builds the display text for a single scanned question during doc scan review.
+    q must have: "question", "options" (list of 4), "correct" (int, -1 = unknown)
+    """
+    labels  = ["A", "B", "C", "D"]
+    correct = q.get("correct", -1)
+    dup_tag = ' _(⚠️ duplicate)_' if is_duplicate else ''
+
+    text = f"📝 *{escape_md(q['question'])}*{dup_tag}\n\n"
+    for i, opt in enumerate(q["options"]):
+        if not opt:
+            continue
+        lbl = labels[i] if i < len(labels) else str(i + 1)
+        if i == correct:
+            marker = " ✅"
+        elif correct == -1 and i == q.get("_random_correct", 0):
+            marker = " ❓"
+        else:
+            marker = ""
+        text += f"{lbl}. {escape_md(opt)}{marker}\n"
+    return text
 
 async def _doc_scan_show_review(chat_id: int, context):
+    """
+    Sends/shows the FIRST question in batch_questions for one-by-one review.
+    Replaces the old batch-list approach.
+    """
     ds = _get_doc_scan(context)
     if not ds:
         return
 
-    owner_id     = get_active_user_id(context)
-    batch        = ds["batch_questions"]
-    chunks_done  = ds["chunk_index"]
-    total_chunks = len(ds["chunks"])
-    more_chunks  = chunks_done < total_chunks
+    # If batch is empty, continue scanning or finish
+    if not ds.get("batch_questions"):
+        if ds["chunk_index"] < len(ds["chunks"]) or ds["pending"]:
+            await _doc_scan_next_chunk(chat_id, context)
+        elif ds.get("ocr_mode") and ds.get("ocr_page_index", 0) < len(ds.get("ocr_pages", [])):
+            await _doc_scan_next_ocr_page(chat_id, context)
+        else:
+            await _doc_scan_finish(chat_id, context)
+        return
 
-    lines = [f"📋 *Review Batch* — {len(batch)} question(s)\n"]
-    for i, q in enumerate(batch, 1):
-        q_text = q["question"]
-        opts   = q["options"]
-        dup    = _is_duplicate_doc(q_text, owner_id)
-        flag   = " ⚠️ _duplicate_" if dup else ""
-        lines.append(
-            f"*{i}.* {escape_md(q_text[:120])}{flag}\n"
-            + "\n".join(
-                f"   {'ABCD'[j]}. {escape_md(opts[j][:80])}"
-                for j in range(len(opts)) if opts[j]
-            )
-        )
+    owner_id = get_active_user_id(context)
+    q        = ds["batch_questions"][0]
 
-    progress = f"\n\n📊 Chunks scanned: {chunks_done}/{total_chunks}"
-    if more_chunks:
-        progress += " — more pending after this batch"
+    # Assign a random correct if none detected
+    if q.get("correct", -1) == -1:
+        import random as _random
+        rnd = _random.randint(0, len([o for o in q["options"] if o]) - 1)
+        q["_random_correct"] = rnd
+    else:
+        q.pop("_random_correct", None)
 
-    text = "\n\n".join(lines) + progress
+    is_dup = _is_duplicate_doc(q["question"], owner_id)
 
-    if len(text) > 4000:
-        text = text[:3950] + "\n\n_(preview truncated — all questions will be saved)_"
+    text = _build_doc_review_text(q, is_dup)
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Save Batch",    callback_data="DOC_SCAN_SAVE"),
-            InlineKeyboardButton("⏭ Skip Batch",    callback_data="DOC_SCAN_SKIP"),
-        ],
-        [
-            InlineKeyboardButton("🛑 Stop Scanning", callback_data="DOC_SCAN_STOP"),
-        ],
-    ])
+    # Build keyboard based on duplicate status
+    if is_dup:
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✏️ Edit Question", callback_data="DSR_EDIT_Q"),
+                InlineKeyboardButton("✏️ Edit Choices",  callback_data="DSR_EDIT_OPTS"),
+                InlineKeyboardButton("✏️ Edit Answer",   callback_data="DSR_EDIT_ANS"),
+            ],
+            [
+                InlineKeyboardButton("⏭ Skip",          callback_data="DSR_SKIP"),
+                InlineKeyboardButton("🔄 Update",        callback_data="DSR_UPDATE"),
+                InlineKeyboardButton("✅ Create Anyway", callback_data="DSR_CREATE"),
+            ],
+            [
+                InlineKeyboardButton("❌ Cancel",        callback_data="DSR_CANCEL"),
+            ],
+        ])
+    else:
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✏️ Edit Question", callback_data="DSR_EDIT_Q"),
+                InlineKeyboardButton("✏️ Edit Choices",  callback_data="DSR_EDIT_OPTS"),
+                InlineKeyboardButton("✏️ Edit Answer",   callback_data="DSR_EDIT_ANS"),
+            ],
+            [
+                InlineKeyboardButton("⏭ Skip",          callback_data="DSR_SKIP"),
+                InlineKeyboardButton("✅ Accept",        callback_data="DSR_ACCEPT"),
+                InlineKeyboardButton("❌ Cancel",        callback_data="DSR_CANCEL"),
+            ],
+        ])
 
     status_id = ds.get("status_msg_id")
+
     if status_id:
         try:
             await context.bot.edit_message_text(
@@ -13435,6 +13570,335 @@ async def _doc_scan_finish(chat_id: int, context):
 # END OF DOCUMENT SCANNER FUNCTIONS
 # ════════════════════════════════════════════════════
 
+# ════════════════════════════════════════════════════
+# DOC SCAN REVIEW — ONE-BY-ONE HANDLERS
+# ════════════════════════════════════════════════════
+
+async def dsr_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Skip current question, move to next."""
+    query = update.callback_query
+    await query.answer()
+
+    ds = _get_doc_scan(context)
+    if not ds or not ds.get("batch_questions"):
+        return
+
+    ds["total_skipped"] += 1
+    ds["batch_questions"].pop(0)
+
+    await _doc_scan_show_review(query.message.chat_id, context)
+
+
+async def dsr_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save current question to DB then move to next."""
+    query = update.callback_query
+    await query.answer()
+
+    ds = _get_doc_scan(context)
+    if not ds or not ds.get("batch_questions"):
+        return
+
+    owner_id = get_active_user_id(context)
+    q        = ds["batch_questions"].pop(0)
+
+    # Resolve final correct index
+    correct = q.get("correct", -1)
+    if correct == -1:
+        correct = q.get("_random_correct", 0)
+
+    q["correct"] = correct
+    saved = await _save_questions_to_default_folder([q], owner_id)
+    ds["total_saved"] += saved
+
+    await _doc_scan_show_review(query.message.chat_id, context)
+
+
+async def dsr_create_anyway(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save even though duplicate exists."""
+    query = update.callback_query
+    await query.answer()
+
+    ds = _get_doc_scan(context)
+    if not ds or not ds.get("batch_questions"):
+        return
+
+    owner_id = get_active_user_id(context)
+    q        = ds["batch_questions"].pop(0)
+
+    correct = q.get("correct", -1)
+    if correct == -1:
+        correct = q.get("_random_correct", 0)
+    q["correct"] = correct
+
+    saved = await _save_questions_to_default_folder([q], owner_id)
+    ds["total_saved"] += saved
+
+    await _doc_scan_show_review(query.message.chat_id, context)
+
+
+async def dsr_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Replace the most-similar existing question with the scanned one."""
+    query = update.callback_query
+    await query.answer()
+
+    ds = _get_doc_scan(context)
+    if not ds or not ds.get("batch_questions"):
+        return
+
+    owner_id = get_active_user_id(context)
+    q        = ds["batch_questions"].pop(0)
+
+    correct = q.get("correct", -1)
+    if correct == -1:
+        correct = q.get("_random_correct", 0)
+
+    new_text     = q["question"]
+    options_text = "||".join(q["options"])
+
+    # Find best match
+    from difflib import SequenceMatcher
+    _conn_dup, _cur_dup = get_db()
+    _cur_dup.execute(
+        """
+        SELECT qb.id, qb.question
+        FROM question_bank qb
+        JOIN question_bank_folders f ON f.id = qb.folder_id
+        WHERE f.owner_id = ?
+        """,
+        (owner_id,)
+    )
+    existing = _cur_dup.fetchall()
+    _conn_dup.close()
+
+    best_id, best_score = None, 0.0
+    for qid, existing_text in existing:
+        ratio = SequenceMatcher(None, new_text.lower(), existing_text.lower()).ratio()
+        if ratio > best_score:
+            best_score, best_id = ratio, qid
+
+    if best_id:
+        async with DB_LOCK:
+            _conn, _cur = get_db()
+            _cur.execute(
+                "UPDATE question_bank SET question=?, options=?, correct=? WHERE id=?",
+                (new_text, options_text, correct, best_id)
+            )
+            _conn.commit()
+            _conn.close()
+        ds["total_saved"] += 1
+
+    await _doc_scan_show_review(query.message.chat_id, context)
+
+
+async def dsr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel review — clean up all messages and state."""
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+
+    # Delete the review message
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    # Delete any other tracked flow messages
+    for mid in context.user_data.get("question_flow_msgs", []):
+        if mid != query.message.message_id:
+            try:
+                await context.bot.delete_message(chat_id, mid)
+            except Exception:
+                pass
+
+    # Clean all doc scan state
+    for key in (
+        "doc_scan", "doc_scan_file", "doc_scan_name",
+        "doc_scan_is_pdf", "doc_scan_is_docx", "doc_scan_is_txt",
+        "doc_scan_pages", "doc_scan_status_id", "doc_scan_selected_pages",
+        "add_q_state", "question_flow_msgs",
+    ):
+        context.user_data.pop(key, None)
+
+
+async def dsr_edit_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Edit the question text of the current scanned question."""
+    query = update.callback_query
+    await query.answer()
+
+    ds = _get_doc_scan(context)
+    if not ds or not ds.get("batch_questions"):
+        return
+
+    context.user_data["dsr_editing"] = "QUESTION"
+    chat_id = query.message.chat_id
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel Edit", callback_data="DSR_EDIT_CANCEL")]
+    ])
+
+    try:
+        await query.message.edit_text(
+            "✏️ *Edit Question Text*\n\nSend the corrected question text:",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    context.user_data["add_q_state"] = "DSR_WAIT_EDIT_INPUT"
+
+
+async def dsr_edit_choices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Begin editing all 4 options of the current scanned question."""
+    query = update.callback_query
+    await query.answer()
+
+    ds = _get_doc_scan(context)
+    if not ds or not ds.get("batch_questions"):
+        return
+
+    context.user_data["dsr_editing"]      = "CHOICES"
+    context.user_data["dsr_new_options"]  = []
+    chat_id = query.message.chat_id
+
+    q    = ds["batch_questions"][0]
+    opts = q.get("options", [])
+    current_opt = opts[0] if opts else ""
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Keep", callback_data="DSR_OPT_KEEP|0"),
+            InlineKeyboardButton("❌ Cancel Edit", callback_data="DSR_EDIT_CANCEL"),
+        ]
+    ])
+
+    try:
+        await query.message.edit_text(
+            f"✏️ *Edit Choices — Option A*\n\n"
+            f"Current: _{escape_md(current_opt)}_\n\n"
+            f"Send new text or tap Keep:",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    context.user_data["add_q_state"] = "DSR_WAIT_EDIT_INPUT"
+
+
+async def dsr_edit_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Let user pick the correct answer for the current scanned question."""
+    query = update.callback_query
+    await query.answer()
+
+    ds = _get_doc_scan(context)
+    if not ds or not ds.get("batch_questions"):
+        return
+
+    q    = ds["batch_questions"][0]
+    opts = q.get("options", [])
+    labels = ["A", "B", "C", "D"]
+
+    buttons = []
+    for i, opt in enumerate(opts):
+        if not opt:
+            continue
+        lbl = labels[i] if i < len(labels) else str(i + 1)
+        buttons.append([
+            InlineKeyboardButton(f"{lbl}. {opt[:50]}", callback_data=f"DSR_SET_ANS|{i}")
+        ])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="DSR_EDIT_CANCEL")])
+
+    try:
+        await query.message.edit_text(
+            "✏️ *Select Correct Answer*\n\nTap the correct option:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+
+async def dsr_set_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Apply the selected correct answer index."""
+    query = update.callback_query
+    await query.answer()
+
+    idx = int(query.data.split("|", 1)[1])
+    ds  = _get_doc_scan(context)
+    if not ds or not ds.get("batch_questions"):
+        return
+
+    ds["batch_questions"][0]["correct"]        = idx
+    ds["batch_questions"][0].pop("_random_correct", None)
+
+    # Return to review
+    await _doc_scan_show_review(query.message.chat_id, context)
+
+
+async def dsr_opt_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User tapped Keep for the current option — keep original text."""
+    query = update.callback_query
+    await query.answer()
+
+    opt_index = int(query.data.split("|", 1)[1])
+    ds        = _get_doc_scan(context)
+    if not ds or not ds.get("batch_questions"):
+        return
+
+    q    = ds["batch_questions"][0]
+    opts = q.get("options", [])
+
+    kept_text = opts[opt_index] if opt_index < len(opts) else ""
+    new_opts  = context.user_data.setdefault("dsr_new_options", [])
+    new_opts.append(kept_text)
+    count = len(new_opts)
+
+    chat_id = query.message.chat_id
+
+    if count < 4:
+        next_label   = ["A", "B", "C", "D"][count]
+        next_opt     = opts[count] if count < len(opts) else ""
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Keep", callback_data=f"DSR_OPT_KEEP|{count}"),
+                InlineKeyboardButton("❌ Cancel Edit", callback_data="DSR_EDIT_CANCEL"),
+            ]
+        ])
+
+        try:
+            await query.message.edit_text(
+                f"✏️ *Edit Choices — Option {next_label}*\n\n"
+                f"Current: _{escape_md(next_opt)}_\n\n"
+                f"Send new text or tap Keep:",
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+        context.user_data["add_q_state"] = "DSR_WAIT_EDIT_INPUT"
+    else:
+        # All 4 done — commit
+        ds["batch_questions"][0]["options"] = context.user_data.pop("dsr_new_options")
+        context.user_data.pop("dsr_editing", None)
+        context.user_data.pop("add_q_state", None)
+        await _doc_scan_show_review(chat_id, context)
+
+
+async def dsr_edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel an in-progress edit and return to review screen."""
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data.pop("dsr_editing", None)
+    context.user_data.pop("dsr_new_options", None)
+    context.user_data.pop("add_q_state", None)
+
+    await _doc_scan_show_review(query.message.chat_id, context)
+
 # =========================
 # HANDLERS
 # =========================
@@ -13584,10 +14048,21 @@ app.add_handler(CallbackQueryHandler(qb_folder_next, pattern="^QB_FOLDER_NEXT$")
 app.add_handler(CallbackQueryHandler(home_scan_document, pattern="^HOME_SCAN_DOCUMENT$"))
 app.add_handler(CallbackQueryHandler(doc_scan_all_pages, pattern="^DOC_SCAN_ALL_PAGES$"))
 app.add_handler(CallbackQueryHandler(doc_scan_cancel,    pattern="^DOC_SCAN_CANCEL$"))
-app.add_handler(CallbackQueryHandler(doc_scan_save,      pattern="^DOC_SCAN_SAVE$"))
-app.add_handler(CallbackQueryHandler(doc_scan_skip,      pattern="^DOC_SCAN_SKIP$"))
 app.add_handler(CallbackQueryHandler(doc_scan_stop,      pattern="^DOC_SCAN_STOP$"))
 app.add_handler(CallbackQueryHandler(doc_scan_resume,    pattern="^DOC_SCAN_RESUME$"))
+
+app.add_handler(CallbackQueryHandler(dsr_skip,          pattern="^DSR_SKIP$"))
+app.add_handler(CallbackQueryHandler(dsr_accept,         pattern="^DSR_ACCEPT$"))
+app.add_handler(CallbackQueryHandler(dsr_create_anyway,  pattern="^DSR_CREATE$"))
+app.add_handler(CallbackQueryHandler(dsr_update,         pattern="^DSR_UPDATE$"))
+app.add_handler(CallbackQueryHandler(dsr_cancel,         pattern="^DSR_CANCEL$"))
+app.add_handler(CallbackQueryHandler(dsr_edit_question,  pattern="^DSR_EDIT_Q$"))
+app.add_handler(CallbackQueryHandler(dsr_edit_choices,   pattern="^DSR_EDIT_OPTS$"))
+app.add_handler(CallbackQueryHandler(dsr_edit_answer,    pattern="^DSR_EDIT_ANS$"))
+app.add_handler(CallbackQueryHandler(dsr_set_answer,     pattern=r"^DSR_SET_ANS\|"))
+app.add_handler(CallbackQueryHandler(dsr_opt_keep,       pattern=r"^DSR_OPT_KEEP\|"))
+app.add_handler(CallbackQueryHandler(dsr_edit_cancel,    pattern="^DSR_EDIT_CANCEL$"))
+
 app.add_handler(CallbackQueryHandler(home_create_manually, pattern="^HOME_CREATE_MANUALLY$"))
 app.add_handler(CallbackQueryHandler(home_create_photo,    pattern="^HOME_CREATE_PHOTO$"))
 app.add_handler(CallbackQueryHandler(ocr_back_to_method,   pattern="^OCR_BACK_TO_METHOD$"))
