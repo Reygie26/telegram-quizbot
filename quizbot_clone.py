@@ -7810,7 +7810,7 @@ async def show_ocr_review(message, context):
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✏️ Edit Question", callback_data="OCR_EDIT_QUESTION"),
-            InlineKeyboardButton("✏️ Edit Answer",   callback_data="OCR_EDIT_OPTIONS"),
+            InlineKeyboardButton("✏️ Edit Options",  callback_data="OCR_EDIT_OPTIONS"),
         ],
         [
             InlineKeyboardButton("🔄 Retake",             callback_data="OCR_RETAKE"),
@@ -7857,7 +7857,7 @@ async def show_ocr_review_by_id(chat_id: int, message_id: int, context):
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✏️ Edit Question", callback_data="OCR_EDIT_QUESTION"),
-            InlineKeyboardButton("✏️ Edit Answer",   callback_data="OCR_EDIT_OPTIONS"),
+            InlineKeyboardButton("✏️ Edit Options",  callback_data="OCR_EDIT_OPTIONS"),
         ],
         [
             InlineKeyboardButton("🔄 Retake",             callback_data="OCR_RETAKE"),
@@ -8116,19 +8116,80 @@ async def ocr_edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ocr_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     User tapped Confirm & Continue.
-    Runs the duplicate check before proceeding to answer selection.
+    Now asks for the correct answer FIRST, before any duplicate check.
     """
     query = update.callback_query
     await query.answer()
 
-    q        = context.user_data.get("new_question", {})
-    new_text = q.get("text", "").strip()
+    q    = context.user_data.get("new_question", {})
+    opts = q.get("options", [])
 
-    if not new_text:
+    if not q.get("text", "").strip():
         await query.answer("❌ Question text is empty.", show_alert=True)
         return
 
-    # ── DUPLICATE CHECK (identical logic to the manual flow) ──────
+    if not opts or not any(opts):
+        await query.answer("❌ No options found.", show_alert=True)
+        return
+
+    # Clean up OCR staging keys — no longer needed
+    context.user_data.pop("ocr_question",      None)
+    context.user_data.pop("ocr_options",       None)
+    context.user_data.pop("ocr_review_msg_id", None)
+    context.user_data.pop("ocr_new_options",   None)
+
+    context.user_data["add_q_state"] = "OCR_WAIT_CORRECT"
+
+    labels = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{labels[i]} {opts[i]}", callback_data=f"OCR_CORRECT_{i}")]
+        for i in range(len(opts))
+    ])
+
+    try:
+        await query.message.edit_text(
+            "✅ Choose the correct answer:",
+            reply_markup=keyboard
+        )
+    except Exception:
+        msg = await query.message.reply_text(
+            "✅ Choose the correct answer:",
+            reply_markup=keyboard
+        )
+        context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
+
+async def ocr_choose_correct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    User selected the correct answer in the OCR flow.
+    NOW run the duplicate check, then save or warn.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    correct_index = int(query.data.replace("OCR_CORRECT_", ""))
+    q    = context.user_data.get("new_question", {})
+    opts = q.get("options", [])
+
+    # ✅ Store the correct answer
+    context.user_data["new_question"]["correct"] = correct_index
+
+    # ✅ Show green check on selected answer immediately
+    labels = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
+    updated_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{'✅ ' if i == correct_index else ''}{labels[i]} {opts[i]}",
+            callback_data="LOCKED"
+        )]
+        for i in range(len(opts))
+    ])
+    try:
+        await query.message.edit_reply_markup(reply_markup=updated_keyboard)
+    except Exception:
+        pass
+
+    new_text = q.get("text", "").strip()
+
+    # ── DUPLICATE CHECK ────────────────────────────────────────────
     similar_matches = []
 
     _conn_dup, _cur_dup = get_db()
@@ -8169,9 +8230,9 @@ async def ocr_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _conn_qr.close()
 
             if q_row:
-                opts        = q_row[0].split("||")
-                correct_idx = q_row[1]
-                correct_text = opts[correct_idx] if 0 <= correct_idx < len(opts) else "—"
+                existing_opts = q_row[0].split("||")
+                correct_idx   = q_row[1]
+                correct_text  = existing_opts[correct_idx] if 0 <= correct_idx < len(existing_opts) else "—"
                 warning_text += (
                     f"{i}. {escape_md(q_text[:80])}\n"
                     f"    ✅ _{escape_md(correct_text)}_\n\n"
@@ -8193,7 +8254,7 @@ async def ocr_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["add_q_state"] = "OCR_CONFIRM_DUPLICATE"
 
         try:
-            await query.message.edit_text(
+            await query.message.reply_text(
                 warning_text,
                 reply_markup=keyboard,
                 parse_mode="Markdown"
@@ -8207,8 +8268,8 @@ async def ocr_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
         return
 
-    # ── NO DUPLICATE — proceed straight to answer selection ───────
-    await _ocr_proceed_to_correct(query.message, context)
+    # ── NO DUPLICATE — proceed to save with explanation prompt ────
+    await _ocr_proceed_to_explanation(query.message, context)
 
 async def ocr_dup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -8291,7 +8352,7 @@ async def ocr_dup_create_anyway(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
 
-    await _ocr_proceed_to_correct(query.message, context)
+    await _ocr_proceed_to_explanation(query.message, context)
 
 async def ocr_retake(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Rescans the previously uploaded photo and shows result with [Use This][Retake][Cancel]."""
@@ -8409,36 +8470,25 @@ async def ocr_retake(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🔑 Keep the ocr_review_msg_id pointing to this message for consistency
     context.user_data["ocr_review_msg_id"] = query.message.message_id
 
-async def _ocr_proceed_to_correct(message, context):
+async def _ocr_proceed_to_explanation(message, context):
     """
-    Shared final step: cleans up OCR staging data and shows
-    the correct-answer selection keyboard.
+    Called after correct answer is chosen and duplicate check passed.
+    Moves to the explanation step, exactly like the manual flow.
     """
-    q    = context.user_data.get("new_question", {})
-    opts = q.get("options", [])
+    context.user_data["add_q_state"] = "NEW_Q_EXPLANATION"
 
-    # Clean up OCR staging keys — no longer needed
-    context.user_data.pop("ocr_question",      None)
-    context.user_data.pop("ocr_options",       None)
-    context.user_data.pop("ocr_review_msg_id", None)
-    context.user_data.pop("ocr_new_options",   None)
-
-    context.user_data["add_q_state"] = "NEW_Q_CORRECT"
-
-    labels = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{labels[i]} {opts[i]}", callback_data=f"CORRECT_{i}")]
-        for i in range(len(opts))
+        [InlineKeyboardButton("⏭ Skip explanation", callback_data="SKIP_Q_EXPLANATION")]
     ])
 
     try:
         await message.edit_text(
-            "✅ Choose the correct answer:",
+            "📝 Send explanation:",
             reply_markup=keyboard
         )
     except Exception:
         msg = await message.reply_text(
-            "✅ Choose the correct answer:",
+            "📝 Send explanation:",
             reply_markup=keyboard
         )
         context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
@@ -13518,6 +13568,7 @@ app.add_handler(CallbackQueryHandler(ocr_edit_options,      pattern="^OCR_EDIT_O
 app.add_handler(CallbackQueryHandler(ocr_accept_option,     pattern=r"^OCR_ACCEPT_OPT\|"))
 app.add_handler(CallbackQueryHandler(ocr_edit_cancel,       pattern="^OCR_EDIT_CANCEL$"))
 app.add_handler(CallbackQueryHandler(ocr_confirm,           pattern="^OCR_CONFIRM$"))
+app.add_handler(CallbackQueryHandler(ocr_choose_correct,    pattern="^OCR_CORRECT_"))
 app.add_handler(CallbackQueryHandler(ocr_dup_cancel,        pattern="^OCR_DUP_CANCEL$"))
 app.add_handler(CallbackQueryHandler(ocr_dup_create_anyway, pattern="^OCR_DUP_CREATE_ANYWAY$"))
 app.add_handler(CallbackQueryHandler(duplicate_update,   pattern="^DUP_UPDATE$"))
