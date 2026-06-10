@@ -8409,66 +8409,10 @@ async def ocr_retake(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "options": options[:],
         "image":   None,
     }
-    context.user_data["add_q_state"] = "NEW_Q_PHOTO_CONFIRM"
-
-    # ── Build the same result preview shown after first scan ──
-    labels      = ["A", "B", "C", "D"]
-    result_text = "🔍 *Scanned Result (Gemini AI):*\n\n"
-
-    if question:
-        result_text += f"📝 *Question:*\n{escape_md(question)}\n\n"
-    else:
-        result_text += "⚠️ _No question text detected._\n\n"
-
-    if options:
-        result_text += "🔤 *Options:*\n"
-        for i, opt in enumerate(options):
-            label = labels[i] if i < len(labels) else str(i + 1)
-            result_text += f"{label}. {escape_md(opt)}\n"
-    else:
-        result_text += "⚠️ _No options detected._\n"
-
-    buttons = []
-    if question and len(options) == 4 and all(options):
-        buttons.append([
-            InlineKeyboardButton("✅ Use This",  callback_data="OCR_ACCEPT"),
-            InlineKeyboardButton("🔄 Retake",    callback_data="OCR_RETAKE"),
-        ])
-    else:
-        missing = []
-        if not question:
-            missing.append("question text")
-        missing_opts = [labels[i] for i in range(len(options)) if not options[i]]
-        if missing_opts:
-            missing.append(f"option(s) {', '.join(missing_opts)}")
-        if not options:
-            missing.append("all options")
-
-        result_text += (
-            f"\n\n⚠️ _Could not fully detect: {', '.join(missing)}. "
-            "Retake with a clearer photo or cancel._"
-        )
-        if question and len([o for o in options if o]) >= 2:
-            buttons.append([
-                InlineKeyboardButton("✅ Use This",  callback_data="OCR_ACCEPT"),
-                InlineKeyboardButton("🔄 Retake",    callback_data="OCR_RETAKE"),
-            ])
-        else:
-            buttons.append([
-                InlineKeyboardButton("🔄 Retake", callback_data="OCR_RETAKE"),
-            ])
-
-    buttons.append([
-        InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")
-    ])
-
-    await query.message.edit_text(
-        result_text,
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode="Markdown"
-    )
-    # 🔑 Keep the ocr_review_msg_id pointing to this message for consistency
+    context.user_data["add_q_state"]      = "OCR_REVIEW"
     context.user_data["ocr_review_msg_id"] = query.message.message_id
+
+    await show_ocr_review_by_id(query.message.chat_id, query.message.message_id, context)
 
 async def _ocr_proceed_to_explanation(message, context):
     """
