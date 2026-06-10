@@ -10330,11 +10330,16 @@ async def ocr_dup_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    new_text = context.user_data.get("new_question", {}).get("text", "").strip()
+    q        = context.user_data.get("new_question", {})
+    new_text = q.get("text", "").strip()
+    opts     = q.get("options", [])
+    correct  = q.get("correct", 0)
+
     if not new_text:
+        await flash_message(context.bot, query.message.chat_id, "❌ No question data found.")
         return
 
-    # Find the most similar existing question
+    # ── Find the most similar existing question ──────────────────
     _conn_dup, _cur_dup = get_db()
     _cur_dup.execute(
         """
@@ -10360,20 +10365,77 @@ async def ocr_dup_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await flash_message(context.bot, query.message.chat_id, "❌ Could not find the duplicate question.")
         return
 
+    # ── Update text, options, AND correct answer ─────────────────
+    options_text = "||".join(opts)
+
     async with DB_LOCK:
         _conn, _cur = get_db()
         _cur.execute(
-            "UPDATE question_bank SET question=? WHERE id=?",
-            (new_text, best_id)
+            "UPDATE question_bank SET question=?, options=?, correct=? WHERE id=?",
+            (new_text, options_text, correct, best_id)
         )
         _conn.commit()
         _conn.close()
 
-    # Use the same cleanup as ocr_dup_cancel
-    await ocr_dup_cancel(update, context)
-
+    # ── Clean up ALL flow messages ────────────────────────────────
     chat_id = query.message.chat_id
+
+    delete_ids = set()
+    delete_ids.add(query.message.message_id)
+
+    prompt_id = context.user_data.get("create_q_prompt_msg_id")
+    if prompt_id:
+        delete_ids.add(prompt_id)
+
+    review_id = context.user_data.get("ocr_review_msg_id")
+    if review_id:
+        delete_ids.add(review_id)
+
+    for mid in context.user_data.get("question_flow_msgs", []):
+        delete_ids.add(mid)
+
+    delete_tasks = [
+        context.bot.delete_message(chat_id, mid)
+        for mid in delete_ids
+    ]
+    if delete_tasks:
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+    # ── Clear all OCR and question creation state ─────────────────
+    for key in (
+        "ocr_question", "ocr_options", "ocr_review_msg_id",
+        "ocr_new_options", "ocr_edit_prompt_id", "ocr_edit_quote_msg_id",
+        "ocr_photo_file_id", "new_question", "pending_duplicate_text",
+        "create_q_prompt_msg_id", "question_flow_msgs", "add_q_state",
+    ):
+        context.user_data.pop(key, None)
+
     await flash_message(context.bot, chat_id, "✅ Existing question updated.", delay=2)
+
+    # ── Restart Send Photo prompt fresh ──────────────────────────
+    context.user_data["add_q_state"]       = "NEW_Q_PHOTO_WAIT"
+    context.user_data["new_question"]      = {"options": []}
+    context.user_data["ocr_flow"]          = True
+    context.user_data["question_flow_msgs"] = []
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⬅️ Back",  callback_data="OCR_BACK_TO_METHOD"),
+            InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION"),
+        ]
+    ])
+
+    msg = await context.bot.send_message(
+        chat_id,
+        "📷 *Send Photo*\n\n"
+        "Send a clear photo of your next question.\n"
+        "Make sure the text and answer options are fully visible.",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+    context.user_data["create_q_prompt_msg_id"] = msg.message_id
+    context.user_data["question_flow_msgs"].append(msg.message_id)
 
 # =========================
 # DB MOVE QUESTIONS INTO FOLDER
