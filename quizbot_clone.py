@@ -1795,78 +1795,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return_exceptions=True
             )
             return
-        # ──────────────────────────────────────────────────
-        similar_matches = []
-
-        _conn_dup, _cur_dup = get_db()
-        _cur_dup.execute(
-            """
-            SELECT qb.id, qb.question
-            FROM question_bank qb
-            JOIN question_bank_folders f ON f.id = qb.folder_id
-            WHERE f.owner_id = ?
-            """,
-            (get_active_user_id(context),)
-        )
-        existing_questions = _cur_dup.fetchall()
-        _conn_dup.close()
-
-        for qid, existing_text in existing_questions:
-            similarity = SequenceMatcher(
-                None,
-                new_text.lower(),
-                existing_text.lower()
-            ).ratio()
-
-            if similarity >= 0.80:
-                similar_matches.append((similarity, existing_text))
-
-        similar_matches.sort(reverse=True, key=lambda x: x[0])
-
-        if similar_matches:
-            top_matches = similar_matches[:5]
-
-            warning_text = "⚠️ *Similar question(s) found:*\n\n"
-
-            for i, (_, q_text) in enumerate(top_matches, 1):
-                # Fetch options and correct answer for this question
-                _conn_qr, _cur_qr = get_db()
-                _cur_qr.execute(
-                    "SELECT options, correct FROM question_bank WHERE question=? LIMIT 1",
-                    (q_text,)
-                )
-                q_row = _cur_qr.fetchone()
-                _conn_qr.close()
-                if q_row:
-                    opts = q_row[0].split("||")
-                    correct_idx = q_row[1]
-                    correct_text = opts[correct_idx] if 0 <= correct_idx < len(opts) else "—"
-                    warning_text += f"{i}. {escape_md(q_text[:80])}\n    ✅ _{escape_md(correct_text)}_\n\n"
-                else:
-                    warning_text += f"{i}. {q_text[:80]}\n\n"
-
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ Create Anyway", callback_data="DUP_CREATE_ANYWAY"),
-                    InlineKeyboardButton("✏️ Change Question", callback_data="DUP_EDIT"),
-                ],
-                [
-                    InlineKeyboardButton("🔄 Update Existing", callback_data="DUP_UPDATE"),
-                    InlineKeyboardButton("❌ Cancel",           callback_data="DUP_CANCEL"),
-                ]
-            ])
-
-            context.user_data["pending_duplicate_text"] = new_text
-            context.user_data["add_q_state"] = "CONFIRM_DUPLICATE_Q"
-
-            msg = await update.message.reply_text(
-                warning_text,
-                reply_markup=keyboard,
-                parse_mode="Markdown"
-            )
-
-            context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
-            return
 
         context.user_data["new_question"]["text"] = new_text
         context.user_data["add_q_state"] = "NEW_Q_IMAGE"
@@ -5094,8 +5022,88 @@ async def choose_correct_answer(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def save_new_question(message, context):
     q = context.user_data["new_question"]
-    options_text = "||".join(q["options"])
     active_uid = get_active_user_id(context)
+
+    # ── DUPLICATE CHECK ────────────────────────────────────────────
+    new_text = q.get("text", "").strip()
+    similar_matches = []
+
+    _conn_dup, _cur_dup = get_db()
+    _cur_dup.execute(
+        """
+        SELECT qb.id, qb.question
+        FROM question_bank qb
+        JOIN question_bank_folders f ON f.id = qb.folder_id
+        WHERE f.owner_id = ?
+        """,
+        (active_uid,)
+    )
+    existing_questions = _cur_dup.fetchall()
+    _conn_dup.close()
+
+    for _qid, existing_text in existing_questions:
+        similarity = SequenceMatcher(
+            None,
+            new_text.lower(),
+            existing_text.lower()
+        ).ratio()
+        if similarity >= 0.80:
+            similar_matches.append((similarity, existing_text))
+
+    similar_matches.sort(reverse=True, key=lambda x: x[0])
+
+    if similar_matches:
+        top_matches = similar_matches[:5]
+
+        warning_text = "⚠️ *Similar question(s) found:*\n\n"
+        for i, (_, q_text) in enumerate(top_matches, 1):
+            _conn_qr, _cur_qr = get_db()
+            _cur_qr.execute(
+                "SELECT options, correct FROM question_bank WHERE question=? LIMIT 1",
+                (q_text,)
+            )
+            q_row = _cur_qr.fetchone()
+            _conn_qr.close()
+            if q_row:
+                opts         = q_row[0].split("||")
+                correct_idx  = q_row[1]
+                correct_text = opts[correct_idx] if 0 <= correct_idx < len(opts) else "—"
+                warning_text += (
+                    f"{i}. {escape_md(q_text[:80])}\n"
+                    f"    ✅ _{escape_md(correct_text)}_\n\n"
+                )
+            else:
+                warning_text += f"{i}. {escape_md(q_text[:80])}\n\n"
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Create Anyway",    callback_data="DUP_CREATE_ANYWAY"),
+                InlineKeyboardButton("✏️ Change Question",  callback_data="DUP_EDIT"),
+            ],
+            [
+                InlineKeyboardButton("🔄 Update Existing",  callback_data="DUP_UPDATE"),
+                InlineKeyboardButton("❌ Cancel",            callback_data="DUP_CANCEL"),
+            ]
+        ])
+
+        context.user_data["add_q_state"] = "CONFIRM_DUPLICATE_Q"
+
+        msg = await message.reply_text(
+            warning_text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+        context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
+        return
+
+    # ── NO DUPLICATE — proceed to save ────────────────────────────
+    await _do_save_new_question(message, context)
+
+async def _do_save_new_question(message, context):
+    """Performs the actual DB insert and post-save flow."""
+    q          = context.user_data["new_question"]
+    active_uid = get_active_user_id(context)
+    options_text = "||".join(q["options"])
 
     _conn, _cur = get_db()
     _cur.execute(
@@ -5160,7 +5168,6 @@ async def save_new_question(message, context):
 
     chat_id = message.chat_id
 
-    # 🔑 Also include the OCR review message if it exists
     review_id = context.user_data.pop("ocr_review_msg_id", None)
     if review_id:
         flow_msgs = context.user_data.get("question_flow_msgs", [])
@@ -5186,7 +5193,6 @@ async def save_new_question(message, context):
         [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
     ])
 
-    # 🔑 Restart in the same mode the user originally chose
     if context.user_data.get("ocr_flow"):
         context.user_data["add_q_state"] = "NEW_Q_PHOTO_WAIT"
         context.user_data["new_question"] = {"options": []}
@@ -10153,60 +10159,49 @@ async def duplicate_create_anyway(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer()
 
-    chat_id = query.message.chat_id
-
-    new_text = context.user_data.get("pending_duplicate_text")
-    if not new_text:
-        return
-
-    # Save question text
-    context.user_data["new_question"]["text"] = new_text
-    context.user_data.pop("pending_duplicate_text", None)
-
-    # Clean warning message
+    # Delete the duplicate warning message
     try:
         await query.message.delete()
     except:
         pass
 
-    context.user_data["add_q_state"] = "NEW_Q_IMAGE"
+    context.user_data["add_q_state"] = None
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏭ Skip image", callback_data="SKIP_Q_IMAGE")]
-    ])
-
-    msg = await context.bot.send_message(
-        chat_id,
-        "🖼 Send image for this question:",
-        reply_markup=keyboard
-    )
-
-    context.user_data.setdefault("question_flow_msgs", []).append(msg.message_id)
+    await _do_save_new_question(query.message, context)
 
 async def duplicate_edit_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     chat_id = query.message.chat_id
-    delete_tasks = []
 
-    # 1️⃣ Delete duplicate warning message
-    delete_tasks.append(
-        context.bot.delete_message(chat_id, query.message.message_id)
+    # Delete duplicate warning message
+    try:
+        await query.message.delete()
+    except:
+        pass
+
+    # Clear question data and restart from question text entry
+    context.user_data.pop("new_question",              None)
+    context.user_data.pop("pending_duplicate_text",    None)
+    context.user_data.pop("last_user_question_msg_id", None)
+
+    context.user_data["add_q_state"]        = "NEW_Q_TEXT"
+    context.user_data["new_question"]       = {"options": []}
+    context.user_data["question_flow_msgs"] = []
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
+    ])
+
+    msg = await context.bot.send_message(
+        chat_id,
+        "❓ Create a Question\n\n📝 Send question text:",
+        reply_markup=keyboard
     )
 
-    # 2️⃣ Delete user's previous question text
-    user_msg_id = context.user_data.get("last_user_question_msg_id")
-    if user_msg_id:
-        delete_tasks.append(
-            context.bot.delete_message(chat_id, user_msg_id)
-        )
-
-    if delete_tasks:
-        await asyncio.gather(*delete_tasks, return_exceptions=True)
-
-    # Reset state to allow retyping
-    context.user_data["add_q_state"] = "NEW_Q_TEXT"
+    context.user_data["question_flow_msgs"].append(msg.message_id)
+    context.user_data["create_q_prompt_msg_id"] = msg.message_id
 
 async def duplicate_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -10256,11 +10251,17 @@ async def duplicate_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    new_text = context.user_data.get("pending_duplicate_text", "").strip()
+    q        = context.user_data.get("new_question", {})
+    new_text = q.get("text", "").strip()
+    opts     = q.get("options", [])
+    correct  = q.get("correct", 0)
+    explanation = q.get("explanation")
+
     if not new_text:
+        await flash_message(context.bot, query.message.chat_id, "❌ No question data found.")
         return
 
-    # Find the most similar existing question
+    # ── Find the most similar existing question ──────────────────
     _conn_dup, _cur_dup = get_db()
     _cur_dup.execute(
         """
@@ -10286,44 +10287,65 @@ async def duplicate_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await flash_message(context.bot, query.message.chat_id, "❌ Could not find the duplicate question.")
         return
 
-    # Update the question text in place
+    # ── Update text, options, correct answer AND explanation ──────
+    options_text = "||".join(opts)
+
     async with DB_LOCK:
         _conn, _cur = get_db()
         _cur.execute(
-            "UPDATE question_bank SET question=? WHERE id=?",
-            (new_text, best_id)
+            "UPDATE question_bank SET question=?, options=?, correct=?, explanation=? WHERE id=?",
+            (new_text, options_text, correct, explanation, best_id)
         )
         _conn.commit()
         _conn.close()
 
-    # Clean up state the same way duplicate_cancel does
+    # ── Clean up ALL flow messages ────────────────────────────────
     chat_id = query.message.chat_id
-    delete_tasks = []
 
-    delete_tasks.append(context.bot.delete_message(chat_id, query.message.message_id))
-
-    user_msg_id = context.user_data.get("last_user_question_msg_id")
-    if user_msg_id:
-        delete_tasks.append(context.bot.delete_message(chat_id, user_msg_id))
+    delete_ids = set()
+    delete_ids.add(query.message.message_id)
 
     prompt_id = context.user_data.get("create_q_prompt_msg_id")
     if prompt_id:
-        delete_tasks.append(context.bot.delete_message(chat_id, prompt_id))
+        delete_ids.add(prompt_id)
 
     for mid in context.user_data.get("question_flow_msgs", []):
-        delete_tasks.append(context.bot.delete_message(chat_id, mid))
+        delete_ids.add(mid)
 
-    await asyncio.gather(*delete_tasks, return_exceptions=True)
+    delete_tasks = [
+        context.bot.delete_message(chat_id, mid)
+        for mid in delete_ids
+    ]
+    if delete_tasks:
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
 
-    context.user_data.pop("pending_duplicate_text",    None)
-    context.user_data.pop("new_question",              None)
-    context.user_data.pop("add_q_state",               None)
-    context.user_data.pop("question_flow_msgs",        None)
-    context.user_data.pop("last_user_question_msg_id", None)
-    context.user_data.pop("create_q_prompt_msg_id",    None)
+    # ── Clear all question creation state ─────────────────────────
+    for key in (
+        "new_question", "pending_duplicate_text", "add_q_state",
+        "question_flow_msgs", "last_user_question_msg_id",
+        "create_q_prompt_msg_id",
+    ):
+        context.user_data.pop(key, None)
 
     await flash_message(context.bot, chat_id, "✅ Existing question updated.", delay=2)
 
+    # ── Restart fresh question prompt ─────────────────────────────
+    context.user_data["add_q_state"]        = "NEW_Q_TEXT"
+    context.user_data["new_question"]       = {"options": []}
+    context.user_data["question_flow_msgs"] = []
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")]
+    ])
+
+    msg = await context.bot.send_message(
+        chat_id,
+        "❓ Create a Question\n\n📝 Send question text:",
+        reply_markup=keyboard
+    )
+
+    context.user_data["question_flow_msgs"].append(msg.message_id)
+    context.user_data["create_q_prompt_msg_id"] = msg.message_id
 
 async def ocr_dup_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Replaces the most similar existing question with the new one (OCR flow)."""
