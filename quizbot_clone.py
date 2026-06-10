@@ -1,10 +1,3 @@
-####################################################################################################################################################################################################################################
-# CODE BY PARTS - PART 1 (START OF CODE)
-####################################################################################################################################################################################################################################
-# TeleQuiz.py
-# FULL STABLE VERSION – TIMER & SHUFFLE FIXED
-# All Edit buttons now open real menus
-
 import asyncio
 import uuid
 import sqlite3
@@ -1160,64 +1153,32 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data["ocr_question"] = question
         context.user_data["ocr_options"]  = options
-        context.user_data["add_q_state"]  = "NEW_Q_PHOTO_CONFIRM"
 
-        labels      = ["A", "B", "C", "D"]
-        result_text = "🔍 *Scanned Result (Gemini AI):*\n\n"
+        # Stage directly into new_question — skip the "Use This" step
+        context.user_data["new_question"] = {
+            "text":    question,
+            "options": options[:],
+            "image":   None,
+        }
+        context.user_data["add_q_state"] = "OCR_REVIEW"
 
-        if question:
-            result_text += f"📝 *Question:*\n{escape_md(question)}\n\n"
-        else:
-            result_text += "⚠️ _No question text detected._\n\n"
+        # 🧹 Delete the photo and the Send Photo prompt
+        photo_msg_id  = context.user_data.pop("ocr_photo_msg_id", None)
+        prompt_msg_id = context.user_data.pop("create_q_prompt_msg_id", None)
 
-        if options:
-            result_text += "🔤 *Options:*\n"
-            for i, opt in enumerate(options):
-                label = labels[i] if i < len(labels) else str(i + 1)
-                result_text += f"{label}. {escape_md(opt)}\n"
-        else:
-            result_text += "⚠️ _No options detected._\n"
-
-        buttons = []
-        if question and len(options) == 4 and all(options):
-            buttons.append([
-                InlineKeyboardButton("✅ Use This",  callback_data="OCR_ACCEPT"),
-                InlineKeyboardButton("🔄 Retake",    callback_data="OCR_RETAKE"),
-            ])
-        else:
-            missing = []
-            if not question:
-                missing.append("question text")
-            missing_opts = [labels[i] for i in range(len(options)) if not options[i]]
-            if missing_opts:
-                missing.append(f"option(s) {', '.join(missing_opts)}")
-            if not options:
-                missing.append("all options")
-
-            result_text += (
-                f"\n\n⚠️ _Could not fully detect: {', '.join(missing)}. "
-                "Retake with a clearer photo or cancel._"
+        delete_tasks = []
+        if photo_msg_id:
+            delete_tasks.append(
+                context.bot.delete_message(chat_id=update.effective_chat.id, message_id=photo_msg_id)
             )
-            if question and len([o for o in options if o]) >= 2:
-                buttons.append([
-                    InlineKeyboardButton("✅ Use This",  callback_data="OCR_ACCEPT"),
-                    InlineKeyboardButton("🔄 Retake",    callback_data="OCR_RETAKE"),
-                ])
-            else:
-                buttons.append([
-                    InlineKeyboardButton("🔄 Retake", callback_data="OCR_RETAKE"),
-                ])
+        if prompt_msg_id and prompt_msg_id != update.message.message_id:
+            delete_tasks.append(
+                context.bot.delete_message(chat_id=update.effective_chat.id, message_id=prompt_msg_id)
+            )
+        if delete_tasks:
+            await asyncio.gather(*delete_tasks, return_exceptions=True)
 
-        buttons.append([
-            InlineKeyboardButton("❌ Cancel", callback_data="CANCEL_CREATE_QUESTION")
-        ])
-
-        msg = await update.message.reply_text(
-            result_text,
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode="Markdown"
-        )
-        context.user_data["question_flow_msgs"].append(msg.message_id)
+        await show_ocr_review(update.message, context)
         return
 
     photo = update.message.photo[-1]
@@ -1890,7 +1851,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton("✏️ Change Question", callback_data="DUP_EDIT"),
                 ],
                 [
-                    InlineKeyboardButton("❌ Cancel Question Creation", callback_data="DUP_CANCEL")
+                    InlineKeyboardButton("🔄 Update Existing", callback_data="DUP_UPDATE"),
+                    InlineKeyboardButton("❌ Cancel",           callback_data="DUP_CANCEL"),
                 ]
             ])
 
@@ -4434,9 +4396,6 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context=context
         )
 
-####################################################################################################################################################################################################################################
-# CODE BY PARTS - PART 2
-####################################################################################################################################################################################################################################
 # =========================
 # 🔀 SHUFFLE MENU (REAL)
 # =========================
@@ -6407,10 +6366,6 @@ async def countdown_timer(user_id, context, seconds, play):
         print("⚠️ Timer error:", e)
         return
 
-####################################################################################################################################################################################################################################
-# CODE BY PARTS - PART 3
-####################################################################################################################################################################################################################################
-
 async def show_leaderboard(chat_id, quiz_id, bot):
     _conn, _cur = get_db()
     _cur.execute("""
@@ -7748,10 +7703,6 @@ async def show_qb_move_folders(message, context):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-####################################################################################################################################################################################################################################
-# CODE BY PARTS - PART 4
-####################################################################################################################################################################################################################################
-
 async def qb_move_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -7859,11 +7810,14 @@ async def show_ocr_review(message, context):
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✏️ Edit Question", callback_data="OCR_EDIT_QUESTION"),
-            InlineKeyboardButton("✏️ Edit Options",  callback_data="OCR_EDIT_OPTIONS"),
+            InlineKeyboardButton("✏️ Edit Answer",   callback_data="OCR_EDIT_OPTIONS"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Retake",             callback_data="OCR_RETAKE"),
+            InlineKeyboardButton("✅ Confirm & Continue", callback_data="OCR_CONFIRM"),
         ],
         [
             InlineKeyboardButton("❌ Cancel",             callback_data="CANCEL_CREATE_QUESTION"),
-            InlineKeyboardButton("✅ Confirm & Continue", callback_data="OCR_CONFIRM"),
         ],
     ])
 
@@ -7903,11 +7857,14 @@ async def show_ocr_review_by_id(chat_id: int, message_id: int, context):
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✏️ Edit Question", callback_data="OCR_EDIT_QUESTION"),
-            InlineKeyboardButton("✏️ Edit Options",  callback_data="OCR_EDIT_OPTIONS"),
+            InlineKeyboardButton("✏️ Edit Answer",   callback_data="OCR_EDIT_OPTIONS"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Retake",             callback_data="OCR_RETAKE"),
+            InlineKeyboardButton("✅ Confirm & Continue", callback_data="OCR_CONFIRM"),
         ],
         [
             InlineKeyboardButton("❌ Cancel",             callback_data="CANCEL_CREATE_QUESTION"),
-            InlineKeyboardButton("✅ Confirm & Continue", callback_data="OCR_CONFIRM"),
         ],
     ])
 
@@ -8228,7 +8185,8 @@ async def ocr_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("✏️ Edit Question", callback_data="OCR_EDIT_QUESTION"),
             ],
             [
-                InlineKeyboardButton("❌ Cancel", callback_data="OCR_DUP_CANCEL"),
+                InlineKeyboardButton("🔄 Update Existing", callback_data="OCR_DUP_UPDATE"),
+                InlineKeyboardButton("❌ Cancel",           callback_data="OCR_DUP_CANCEL"),
             ]
         ])
 
@@ -10298,6 +10256,130 @@ async def duplicate_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("question_flow_msgs", None)
     context.user_data.pop("last_user_question_msg_id", None)
     context.user_data.pop("create_q_prompt_msg_id", None)
+
+async def duplicate_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Replaces the most similar existing question with the new one (manual flow)."""
+    query = update.callback_query
+    await query.answer()
+
+    new_text = context.user_data.get("pending_duplicate_text", "").strip()
+    if not new_text:
+        return
+
+    # Find the most similar existing question
+    _conn_dup, _cur_dup = get_db()
+    _cur_dup.execute(
+        """
+        SELECT qb.id, qb.question
+        FROM question_bank qb
+        JOIN question_bank_folders f ON f.id = qb.folder_id
+        WHERE f.owner_id = ?
+        """,
+        (get_active_user_id(context),)
+    )
+    existing_questions = _cur_dup.fetchall()
+    _conn_dup.close()
+
+    best_id    = None
+    best_score = 0.0
+    for qid, existing_text in existing_questions:
+        ratio = SequenceMatcher(None, new_text.lower(), existing_text.lower()).ratio()
+        if ratio > best_score:
+            best_score = ratio
+            best_id    = qid
+
+    if not best_id:
+        await flash_message(context.bot, query.message.chat_id, "❌ Could not find the duplicate question.")
+        return
+
+    # Update the question text in place
+    async with DB_LOCK:
+        _conn, _cur = get_db()
+        _cur.execute(
+            "UPDATE question_bank SET question=? WHERE id=?",
+            (new_text, best_id)
+        )
+        _conn.commit()
+        _conn.close()
+
+    # Clean up state the same way duplicate_cancel does
+    chat_id = query.message.chat_id
+    delete_tasks = []
+
+    delete_tasks.append(context.bot.delete_message(chat_id, query.message.message_id))
+
+    user_msg_id = context.user_data.get("last_user_question_msg_id")
+    if user_msg_id:
+        delete_tasks.append(context.bot.delete_message(chat_id, user_msg_id))
+
+    prompt_id = context.user_data.get("create_q_prompt_msg_id")
+    if prompt_id:
+        delete_tasks.append(context.bot.delete_message(chat_id, prompt_id))
+
+    for mid in context.user_data.get("question_flow_msgs", []):
+        delete_tasks.append(context.bot.delete_message(chat_id, mid))
+
+    await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+    context.user_data.pop("pending_duplicate_text",    None)
+    context.user_data.pop("new_question",              None)
+    context.user_data.pop("add_q_state",               None)
+    context.user_data.pop("question_flow_msgs",        None)
+    context.user_data.pop("last_user_question_msg_id", None)
+    context.user_data.pop("create_q_prompt_msg_id",    None)
+
+    await flash_message(context.bot, chat_id, "✅ Existing question updated.", delay=2)
+
+
+async def ocr_dup_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Replaces the most similar existing question with the new one (OCR flow)."""
+    query = update.callback_query
+    await query.answer()
+
+    new_text = context.user_data.get("new_question", {}).get("text", "").strip()
+    if not new_text:
+        return
+
+    # Find the most similar existing question
+    _conn_dup, _cur_dup = get_db()
+    _cur_dup.execute(
+        """
+        SELECT qb.id, qb.question
+        FROM question_bank qb
+        JOIN question_bank_folders f ON f.id = qb.folder_id
+        WHERE f.owner_id = ?
+        """,
+        (get_active_user_id(context),)
+    )
+    existing_questions = _cur_dup.fetchall()
+    _conn_dup.close()
+
+    best_id    = None
+    best_score = 0.0
+    for qid, existing_text in existing_questions:
+        ratio = SequenceMatcher(None, new_text.lower(), existing_text.lower()).ratio()
+        if ratio > best_score:
+            best_score = ratio
+            best_id    = qid
+
+    if not best_id:
+        await flash_message(context.bot, query.message.chat_id, "❌ Could not find the duplicate question.")
+        return
+
+    async with DB_LOCK:
+        _conn, _cur = get_db()
+        _cur.execute(
+            "UPDATE question_bank SET question=? WHERE id=?",
+            (new_text, best_id)
+        )
+        _conn.commit()
+        _conn.close()
+
+    # Use the same cleanup as ocr_dup_cancel
+    await ocr_dup_cancel(update, context)
+
+    chat_id = query.message.chat_id
+    await flash_message(context.bot, chat_id, "✅ Existing question updated.", delay=2)
 
 # =========================
 # DB MOVE QUESTIONS INTO FOLDER
@@ -13438,6 +13520,8 @@ app.add_handler(CallbackQueryHandler(ocr_edit_cancel,       pattern="^OCR_EDIT_C
 app.add_handler(CallbackQueryHandler(ocr_confirm,           pattern="^OCR_CONFIRM$"))
 app.add_handler(CallbackQueryHandler(ocr_dup_cancel,        pattern="^OCR_DUP_CANCEL$"))
 app.add_handler(CallbackQueryHandler(ocr_dup_create_anyway, pattern="^OCR_DUP_CREATE_ANYWAY$"))
+app.add_handler(CallbackQueryHandler(duplicate_update,   pattern="^DUP_UPDATE$"))
+app.add_handler(CallbackQueryHandler(ocr_dup_update,     pattern="^OCR_DUP_UPDATE$"))
 app.add_handler(CallbackQueryHandler(ocr_accept,            pattern="^OCR_ACCEPT$"))
 app.add_handler(CallbackQueryHandler(ocr_retake,            pattern="^OCR_RETAKE$"))
 app.add_handler(CallbackQueryHandler(home_create_question, pattern="^HOME_CREATE_QUESTION$"))
@@ -13532,6 +13616,3 @@ app.run_polling(
     drop_pending_updates=True,
     close_loop=False
 )
-####################################################################################################################################################################################################################################
-# CODE BY PARTS - END OF CODE
-####################################################################################################################################################################################################################################
