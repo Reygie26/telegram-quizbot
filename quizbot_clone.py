@@ -13939,6 +13939,14 @@ async def dsr_opt_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         ])
 
+        # 🧹 Delete the OLD quote message before sending the new one
+        old_quote_id = context.user_data.pop("dsr_edit_quote_msg_id", None)
+        if old_quote_id:
+            try:
+                await context.bot.delete_message(chat_id, old_quote_id)
+            except Exception:
+                pass
+
         # Text Box 1: instruction + buttons
         try:
             await query.message.edit_text(
@@ -13964,10 +13972,18 @@ async def dsr_opt_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         # All 4 done — commit
         ds["batch_questions"][0]["options"] = context.user_data.pop("dsr_new_options")
+
+        # 🧹 Delete the last quote message
+        last_quote_id = context.user_data.pop("dsr_edit_quote_msg_id", None)
+        if last_quote_id:
+            try:
+                await context.bot.delete_message(chat_id, last_quote_id)
+            except Exception:
+                pass
+
         context.user_data.pop("dsr_editing", None)
         context.user_data.pop("add_q_state", None)
         await _doc_scan_show_review(chat_id, context)
-
 
 async def dsr_edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel an in-progress edit and return to review screen."""
