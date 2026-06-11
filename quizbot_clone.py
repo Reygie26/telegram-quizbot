@@ -138,6 +138,19 @@ def escape_md(text: str) -> str:
         text = text.replace(ch, f'\\{ch}')
     return text
 
+def escape_md_soft(text: str) -> str:
+    """
+    Like escape_md but preserves underscores (____) so fill-in-the-blank
+    questions display correctly in doc scan review.
+    Only escapes * ` [ to prevent Markdown parse errors.
+    """
+    if not text:
+        return ""
+    escape_chars = ['*', '`', '[']
+    for ch in escape_chars:
+        text = text.replace(ch, f'\\{ch}')
+    return text
+
 # =========================
 # OWNER RESTORE
 # =========================
@@ -1556,6 +1569,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
                 return
             ds["batch_questions"][0]["question"] = new_text
+
+            # 🧹 Delete the quote message (scanned text box)
+            quote_id = context.user_data.pop("dsr_edit_quote_msg_id", None)
+            if quote_id:
+                try:
+                    await context.bot.delete_message(chat_id, quote_id)
+                except Exception:
+                    pass
+
             context.user_data.pop("dsr_editing", None)
             context.user_data.pop("add_q_state", None)
             await _doc_scan_show_review(chat_id, context)
@@ -1588,6 +1610,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ]
                 ])
 
+                # 🧹 Delete old quote message before sending new one
+                old_quote_id = context.user_data.pop("dsr_edit_quote_msg_id", None)
+                if old_quote_id:
+                    try:
+                        await context.bot.delete_message(chat_id, old_quote_id)
+                    except Exception:
+                        pass
+
                 status_id = ds.get("status_msg_id")
                 if status_id:
                     try:
@@ -1596,7 +1626,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             message_id=status_id,
                             text=(
                                 f"✏️ *Edit Choices — Option {next_label}*\n\n"
-                                f"Current: _{escape_md(next_opt)}_\n\n"
                                 f"Send new text or tap Keep:"
                             ),
                             reply_markup=keyboard,
@@ -1604,8 +1633,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                     except Exception:
                         pass
+
+                # Text Box 2: copyable scanned option text
+                if next_opt:
+                    quote_msg = await context.bot.send_message(chat_id, next_opt)
+                    context.user_data["dsr_edit_quote_msg_id"] = quote_msg.message_id
+                else:
+                    context.user_data["dsr_edit_quote_msg_id"] = None
             else:
                 ds["batch_questions"][0]["options"] = context.user_data.pop("dsr_new_options")
+
+                # 🧹 Delete the quote message (scanned text box)
+                quote_id = context.user_data.pop("dsr_edit_quote_msg_id", None)
+                if quote_id:
+                    try:
+                        await context.bot.delete_message(chat_id, quote_id)
+                    except Exception:
+                        pass
+
                 context.user_data.pop("dsr_editing", None)
                 context.user_data.pop("add_q_state", None)
                 await _doc_scan_show_review(chat_id, context)
@@ -13148,7 +13193,9 @@ async def _doc_scan_next_ocr_page(chat_id: int, context):
                 ds["pending"].append({"question": question, "options": options})
 
         except RuntimeError as e:
-            # Rate limit hit
+            # 🔑 Step back so this page is retried on Resume
+            ds["ocr_page_index"] -= 1
+
             status_id = ds.get("status_msg_id")
             if status_id:
                 try:
@@ -13270,6 +13317,9 @@ async def _doc_scan_next_chunk(chat_id: int, context):
         try:
             parsed = await _parse_questions_from_chunk(chunk)
         except RuntimeError as e:
+            # 🔑 Step back so this chunk is retried on Resume
+            ds["chunk_index"] -= 1
+
             status_id = ds.get("status_msg_id")
             if status_id:
                 try:
@@ -13303,15 +13353,11 @@ async def _doc_scan_next_chunk(chat_id: int, context):
         await _doc_scan_finish(chat_id, context)
 
 def _build_doc_review_text(q: dict, is_duplicate: bool) -> str:
-    """
-    Builds the display text for a single scanned question during doc scan review.
-    q must have: "question", "options" (list of 4), "correct" (int, -1 = unknown)
-    """
     labels  = ["A", "B", "C", "D"]
     correct = q.get("correct", -1)
     dup_tag = ' _(⚠️ duplicate)_' if is_duplicate else ''
 
-    text = f"📝 *{escape_md(q['question'])}*{dup_tag}\n\n"
+    text = f"📝 *{escape_md_soft(q['question'])}*{dup_tag}\n\n"
     for i, opt in enumerate(q["options"]):
         if not opt:
             continue
@@ -13322,7 +13368,7 @@ def _build_doc_review_text(q: dict, is_duplicate: bool) -> str:
             marker = " ❓"
         else:
             marker = ""
-        text += f"{lbl}. {escape_md(opt)}{marker}\n"
+        text += f"{lbl}. {escape_md_soft(opt)}{marker}\n"
     return text
 
 async def _doc_scan_show_review(chat_id: int, context):
@@ -13733,10 +13779,14 @@ async def dsr_edit_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["dsr_editing"] = "QUESTION"
     chat_id = query.message.chat_id
 
+    # Get current scanned question text
+    current_text = ds["batch_questions"][0].get("question", "")
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ Cancel Edit", callback_data="DSR_EDIT_CANCEL")]
     ])
 
+    # Text Box 1: instruction + Cancel button
     try:
         await query.message.edit_text(
             "✏️ *Edit Question Text*\n\nSend the corrected question text:",
@@ -13745,6 +13795,17 @@ async def dsr_edit_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception:
         pass
+
+    # Text Box 2: copyable scanned question text (separate message)
+    if current_text:
+        quote_msg = await context.bot.send_message(
+            chat_id,
+            current_text,
+        )
+        context.user_data["dsr_edit_quote_msg_id"] = quote_msg.message_id
+        context.user_data.setdefault("question_flow_msgs", []).append(quote_msg.message_id)
+    else:
+        context.user_data["dsr_edit_quote_msg_id"] = None
 
     context.user_data["add_q_state"] = "DSR_WAIT_EDIT_INPUT"
 
@@ -13758,12 +13819,12 @@ async def dsr_edit_choices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ds or not ds.get("batch_questions"):
         return
 
-    context.user_data["dsr_editing"]      = "CHOICES"
-    context.user_data["dsr_new_options"]  = []
+    context.user_data["dsr_editing"]     = "CHOICES"
+    context.user_data["dsr_new_options"] = []
     chat_id = query.message.chat_id
 
-    q    = ds["batch_questions"][0]
-    opts = q.get("options", [])
+    q           = ds["batch_questions"][0]
+    opts        = q.get("options", [])
     current_opt = opts[0] if opts else ""
 
     keyboard = InlineKeyboardMarkup([
@@ -13773,16 +13834,26 @@ async def dsr_edit_choices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     ])
 
+    # Text Box 1: instruction + buttons
     try:
         await query.message.edit_text(
-            f"✏️ *Edit Choices — Option A*\n\n"
-            f"Current: _{escape_md(current_opt)}_\n\n"
-            f"Send new text or tap Keep:",
+            "✏️ *Edit Choices — Option A*\n\nSend new text or tap Keep:",
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
     except Exception:
         pass
+
+    # Text Box 2: copyable scanned option text (separate message)
+    if current_opt:
+        quote_msg = await context.bot.send_message(
+            chat_id,
+            current_opt,
+        )
+        context.user_data["dsr_edit_quote_msg_id"] = quote_msg.message_id
+        context.user_data.setdefault("question_flow_msgs", []).append(quote_msg.message_id)
+    else:
+        context.user_data["dsr_edit_quote_msg_id"] = None
 
     context.user_data["add_q_state"] = "DSR_WAIT_EDIT_INPUT"
 
@@ -13858,8 +13929,8 @@ async def dsr_opt_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
 
     if count < 4:
-        next_label   = ["A", "B", "C", "D"][count]
-        next_opt     = opts[count] if count < len(opts) else ""
+        next_label = ["A", "B", "C", "D"][count]
+        next_opt   = opts[count] if count < len(opts) else ""
 
         keyboard = InlineKeyboardMarkup([
             [
@@ -13868,16 +13939,26 @@ async def dsr_opt_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         ])
 
+        # Text Box 1: instruction + buttons
         try:
             await query.message.edit_text(
-                f"✏️ *Edit Choices — Option {next_label}*\n\n"
-                f"Current: _{escape_md(next_opt)}_\n\n"
-                f"Send new text or tap Keep:",
+                f"✏️ *Edit Choices — Option {next_label}*\n\nSend new text or tap Keep:",
                 reply_markup=keyboard,
                 parse_mode="Markdown"
             )
         except Exception:
             pass
+
+        # Text Box 2: copyable scanned option text (separate message)
+        if next_opt:
+            quote_msg = await context.bot.send_message(
+                chat_id,
+                next_opt,
+            )
+            context.user_data["dsr_edit_quote_msg_id"] = quote_msg.message_id
+            context.user_data.setdefault("question_flow_msgs", []).append(quote_msg.message_id)
+        else:
+            context.user_data["dsr_edit_quote_msg_id"] = None
 
         context.user_data["add_q_state"] = "DSR_WAIT_EDIT_INPUT"
     else:
@@ -13893,11 +13974,21 @@ async def dsr_edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    chat_id = query.message.chat_id
+
+    # 🧹 Delete the quote message (scanned text box) if it exists
+    quote_id = context.user_data.pop("dsr_edit_quote_msg_id", None)
+    if quote_id:
+        try:
+            await context.bot.delete_message(chat_id, quote_id)
+        except Exception:
+            pass
+
     context.user_data.pop("dsr_editing", None)
     context.user_data.pop("dsr_new_options", None)
     context.user_data.pop("add_q_state", None)
 
-    await _doc_scan_show_review(query.message.chat_id, context)
+    await _doc_scan_show_review(chat_id, context)
 
 # =========================
 # HANDLERS
