@@ -1222,6 +1222,91 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("add_q_state"):
         context.user_data.setdefault("question_flow_msgs", []).append(update.message.message_id)
 
+    # ── DOC SCAN: waiting for OTHER/NEXT specific page number input ──────────
+    if context.user_data.get("add_q_state") == "DOC_SCAN_WAIT_NEXT_PAGE":
+        chat_id     = update.effective_chat.id
+        user_msg_id = update.message.message_id
+        raw_input   = text.strip()
+        total_pages = context.user_data.get("doc_scan_pages")
+        doc_name    = context.user_data.get("doc_scan_name", "document")
+        status_id   = context.user_data.get("doc_scan_status_id")
+
+        # 🧹 Delete user's typed message immediately
+        try:
+            await context.bot.delete_message(chat_id, user_msg_id)
+        except Exception:
+            pass
+
+        # ── Parse comma-separated page numbers ───────────────────────────────
+        selected_pages = []
+        invalid_pages  = []
+
+        for part in raw_input.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if part.isdigit():
+                p = int(part)
+                if total_pages and (p < 1 or p > total_pages):
+                    invalid_pages.append(str(p))
+                else:
+                    if p not in selected_pages:
+                        selected_pages.append(p)
+            else:
+                invalid_pages.append(part)
+
+        # ── Invalid pages — show error and let user try again ─────────────────
+        if invalid_pages:
+            err_text = (
+                f"❌ Invalid page number(s): *{', '.join(invalid_pages)}*\n\n"
+                f"📄 *{escape_md(doc_name)}*\n"
+                + (f"📊 Total pages: *{total_pages}*\n\n" if total_pages else "\n")
+                + f"Please send valid page numbers separated by commas.\n"
+                f"Example: `1,3,5,10`"
+            )
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data="DOC_SCAN_DONE")]
+            ])
+            if status_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=status_id,
+                        text=err_text,
+                        reply_markup=keyboard,
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+            return
+
+        if not selected_pages:
+            return
+
+        selected_pages.sort()
+
+        # 🔑 Update last scanned page and begin scan
+        context.user_data["doc_scan_last_page"]      = max(selected_pages)
+        context.user_data["doc_scan_selected_pages"] = selected_pages
+        context.user_data["add_q_state"]             = "DOC_SCAN_RUNNING"
+
+        if status_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_id,
+                    text=(
+                        f"✅ Scanning pages: *{', '.join(str(p) for p in selected_pages)}*\n\n"
+                        f"⏳ Starting now…"
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+
+        await _doc_scan_begin(chat_id, context)
+        return
+
     # ── DOC SCAN: waiting for page numbers ───────────────────────────────────
     if context.user_data.get("add_q_state") == "DOC_SCAN_WAIT_PAGES":
         chat_id     = update.effective_chat.id
@@ -12929,6 +13014,10 @@ async def _doc_scan_begin(chat_id: int, context):
         ds["ocr_mode"]       = True
         ds["status_msg_id"]  = status_id
 
+        # 🔑 Track last scanned page for "Scan Next Page" button
+        if page_images:
+            context.user_data["doc_scan_last_page"] = page_images[-1][0]
+
         if status_id:
             try:
                 await context.bot.edit_message_text(
@@ -12965,6 +13054,10 @@ async def _doc_scan_begin(chat_id: int, context):
     _init_doc_scan_state(context, chunks, doc_name)
     ds = context.user_data["doc_scan"]
     ds["status_msg_id"] = status_id
+
+    # 🔑 Track last scanned page for "Scan Next Page" button
+    if selected_pages:
+        context.user_data["doc_scan_last_page"] = max(selected_pages)
 
     total_chars = len(raw_text)
     pages_label = (
@@ -13573,8 +13666,16 @@ async def _doc_scan_finish(chat_id: int, context):
     doc_name = ds["doc_name"]
     review_id = ds.get("review_msg_id") or ds.get("status_msg_id")
 
+    # ── Preserve file + page info for continued scanning ──────────────────────
+    last_page    = context.user_data.get("doc_scan_last_page", 0)
+    total_pages  = context.user_data.get("doc_scan_pages")
+    has_next     = total_pages and (last_page < total_pages)
+
+    context.user_data["doc_scan_finish_msg_id"] = review_id
     context.user_data.pop("doc_scan", None)
     context.user_data.pop("add_q_state", None)
+    # NOTE: intentionally keep doc_scan_file, doc_scan_name, doc_scan_pages,
+    #       doc_scan_is_pdf, doc_scan_is_docx, doc_scan_is_txt for re-use.
 
     summary = (
         f"🎉 *Document Scan Complete!*\n\n"
@@ -13585,12 +13686,27 @@ async def _doc_scan_finish(chat_id: int, context):
         f"All saved questions are in your *Default DB Folder*."
     )
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🗄 View Database", callback_data="HOME_DATABASE"),
-            InlineKeyboardButton("🏠 Home",          callback_data="GO_HOME"),
-        ]
+    buttons = []
+
+    # Row 1 — View Database / Home
+    buttons.append([
+        InlineKeyboardButton("🗄 View Database", callback_data="HOME_DATABASE"),
+        InlineKeyboardButton("🏠 Home",          callback_data="GO_HOME"),
     ])
+
+    # Row 2 — Scan Other Page / Scan Next Page (only if PDF with known pages)
+    row2 = []
+    row2.append(InlineKeyboardButton("📄 Scan Other Page", callback_data="DOC_SCAN_OTHER_PAGE"))
+    if has_next:
+        row2.append(InlineKeyboardButton("⏭ Scan Next Page", callback_data="DOC_SCAN_NEXT_PAGE"))
+    buttons.append(row2)
+
+    # Row 3 — Cancel
+    buttons.append([
+        InlineKeyboardButton("❌ Cancel", callback_data="DOC_SCAN_DONE")
+    ])
+
+    keyboard = InlineKeyboardMarkup(buttons)
 
     if review_id:
         try:
@@ -13601,16 +13717,133 @@ async def _doc_scan_finish(chat_id: int, context):
                 reply_markup=keyboard,
                 parse_mode="Markdown"
             )
+            context.user_data["doc_scan_finish_msg_id"] = review_id
             return
         except Exception:
             pass
 
-    await context.bot.send_message(
+    msg = await context.bot.send_message(
         chat_id=chat_id,
         text=summary,
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
+    context.user_data["doc_scan_finish_msg_id"] = msg.message_id
+
+async def doc_scan_other_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    User tapped 'Scan Other Page' — prompts for a specific page number to scan.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    chat_id     = query.message.chat_id
+    total_pages = context.user_data.get("doc_scan_pages")
+    doc_name    = context.user_data.get("doc_scan_name", "document")
+
+    context.user_data["add_q_state"]        = "DOC_SCAN_WAIT_NEXT_PAGE"
+    context.user_data["doc_scan_status_id"] = query.message.message_id
+
+    if total_pages:
+        prompt_text = (
+            f"📄 *{escape_md(doc_name)}*\n"
+            f"📊 Total pages: *{total_pages}*\n\n"
+            f"Send the page number(s) you want to scan.\n"
+            f"Separate multiple pages with commas.\n\n"
+            f"Example: `1,3,5`"
+        )
+    else:
+        prompt_text = (
+            f"📄 *{escape_md(doc_name)}*\n\n"
+            f"Send the page number(s) you want to scan.\n"
+            f"Separate multiple pages with commas.\n\n"
+            f"Example: `1,3,5`"
+        )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="DOC_SCAN_DONE")]
+    ])
+
+    try:
+        await query.message.edit_text(
+            prompt_text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+
+async def doc_scan_next_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    User tapped 'Scan Next Page' — auto-advances to the page after the last scanned one.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    chat_id     = query.message.chat_id
+    last_page   = context.user_data.get("doc_scan_last_page", 0)
+    total_pages = context.user_data.get("doc_scan_pages")
+    next_page   = last_page + 1
+
+    if total_pages and next_page > total_pages:
+        await query.answer(
+            f"✅ You've already reached the last page ({total_pages}).",
+            show_alert=True
+        )
+        return
+
+    doc_name = context.user_data.get("doc_scan_name", "document")
+
+    # 🔑 Set up for a fresh scan of the next single page
+    context.user_data["doc_scan_selected_pages"] = [next_page]
+    context.user_data["doc_scan_last_page"]      = next_page
+    context.user_data["doc_scan_status_id"]      = query.message.message_id
+    context.user_data["add_q_state"]             = "DOC_SCAN_RUNNING"
+
+    try:
+        await query.message.edit_text(
+            f"⏳ Scanning page *{next_page}*"
+            + (f" of {total_pages}" if total_pages else "")
+            + f"…\n\n📄 *{escape_md(doc_name)}*\n\nPlease wait…",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    await _doc_scan_begin(chat_id, context)
+
+
+async def doc_scan_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    User tapped 'Cancel' on the finish screen — deletes the message and cleans up all state.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    # 🧹 Delete the finish message
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    # 🧹 Clean up ALL document scan related state
+    for key in (
+        "doc_scan",
+        "doc_scan_file",
+        "doc_scan_name",
+        "doc_scan_is_pdf",
+        "doc_scan_is_docx",
+        "doc_scan_is_txt",
+        "doc_scan_pages",
+        "doc_scan_status_id",
+        "doc_scan_selected_pages",
+        "doc_scan_last_page",
+        "doc_scan_finish_msg_id",
+        "add_q_state",
+        "question_flow_msgs",
+    ):
+        context.user_data.pop(key, None)
 
 # ════════════════════════════════════════════════════
 # END OF DOCUMENT SCANNER FUNCTIONS
@@ -14154,6 +14387,9 @@ app.add_handler(CallbackQueryHandler(qb_folder_prev, pattern="^QB_FOLDER_PREV$")
 app.add_handler(CallbackQueryHandler(qb_folder_next, pattern="^QB_FOLDER_NEXT$"))
 app.add_handler(CallbackQueryHandler(home_scan_document, pattern="^HOME_SCAN_DOCUMENT$"))
 app.add_handler(CallbackQueryHandler(doc_scan_all_pages, pattern="^DOC_SCAN_ALL_PAGES$"))
+app.add_handler(CallbackQueryHandler(doc_scan_other_page, pattern="^DOC_SCAN_OTHER_PAGE$"))
+app.add_handler(CallbackQueryHandler(doc_scan_next_page,  pattern="^DOC_SCAN_NEXT_PAGE$"))
+app.add_handler(CallbackQueryHandler(doc_scan_done,       pattern="^DOC_SCAN_DONE$"))
 app.add_handler(CallbackQueryHandler(doc_scan_cancel,    pattern="^DOC_SCAN_CANCEL$"))
 app.add_handler(CallbackQueryHandler(doc_scan_stop,      pattern="^DOC_SCAN_STOP$"))
 app.add_handler(CallbackQueryHandler(doc_scan_resume,    pattern="^DOC_SCAN_RESUME$"))
