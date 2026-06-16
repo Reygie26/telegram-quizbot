@@ -92,6 +92,7 @@ DB_FILE = "/var/data/quizbot.db"
 ##### =============================================================================================
 ##### print("📂 Using database file at:", DB_FILE)
 ##### =============================================================================================
+##### FOR TEST BOT                   - (empty)
 ##### FOR GITHUB                     - print("📂 Using database file at:", DB_FILE)
 print("📂 Using database file at:", DB_FILE)
 
@@ -422,6 +423,40 @@ def is_authorized(user_id: int) -> bool:
     if subscription_type == "Lifetime":
         return True
     return expires_at > now
+
+def _find_best_duplicate(new_text: str, owner_id: int):
+    """
+    Returns (question_text, correct_option_text) of the most similar
+    existing question, or (None, None) if none found at ratio >= 1.0.
+    """
+    _conn, _cur = get_db()
+    _cur.execute(
+        """
+        SELECT qb.question, qb.options, qb.correct
+        FROM question_bank qb
+        JOIN question_bank_folders f ON f.id = qb.folder_id
+        WHERE f.owner_id = ?
+        """,
+        (owner_id,)
+    )
+    rows = _cur.fetchall()
+    _conn.close()
+
+    best_id    = None
+    best_score = 0.0
+    best_row   = None
+    for q_text, opts_str, correct_idx in rows:
+        ratio = SequenceMatcher(None, new_text.lower(), q_text.lower()).ratio()
+        if ratio > best_score:
+            best_score = ratio
+            best_row = (q_text, opts_str, correct_idx)
+
+    if best_row and best_score >= 0.98:
+        q_text, opts_str, correct_idx = best_row
+        opts = opts_str.split("||")
+        correct_text = opts[correct_idx] if 0 <= correct_idx < len(opts) else "—"
+        return q_text, correct_text
+    return None, None
 
 # =========================
 # LEADERBOARD KEY HELPER
@@ -5260,7 +5295,7 @@ async def save_new_question(message, context):
             new_text.lower(),
             existing_text.lower()
         ).ratio()
-        if similarity >= 0.80:
+        if similarity >= 0.98:
             similar_matches.append((similarity, existing_text))
 
     similar_matches.sort(reverse=True, key=lambda x: x[0])
@@ -8430,7 +8465,7 @@ async def ocr_choose_correct(update: Update, context: ContextTypes.DEFAULT_TYPE)
             new_text.lower(),
             existing_text.lower()
         ).ratio()
-        if similarity >= 0.80:
+        if similarity >= 0.98:
             similar_matches.append((similarity, existing_text))
 
     similar_matches.sort(reverse=True, key=lambda x: x[0])
@@ -12722,7 +12757,7 @@ TEXT:
             return []
 
 
-def _is_duplicate_doc(new_text: str, owner_id: int, threshold: float = 0.80) -> bool:
+def _is_duplicate_doc(new_text: str, owner_id: int, threshold: float = 0.98) -> bool:
     _conn, _cur = get_db()
     _cur.execute(
         """
@@ -13322,6 +13357,34 @@ async def _doc_scan_next_ocr_page(chat_id: int, context):
         ds["pending"]         = []
         await _doc_scan_show_review(chat_id, context)
     else:
+        # Ensure status_msg_id is still valid before finishing
+        status_id = ds.get("status_msg_id")
+        if status_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_id,
+                    text="✅ All pages scanned. Preparing summary…"
+                )
+            except Exception:
+                # If edit failed (message deleted/replaced), send a new one
+                try:
+                    msg = await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="✅ All pages scanned. Preparing summary…"
+                    )
+                    ds["status_msg_id"] = msg.message_id
+                except Exception:
+                    pass
+        else:
+            try:
+                msg = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="✅ All pages scanned. Preparing summary…"
+                )
+                ds["status_msg_id"] = msg.message_id
+            except Exception:
+                pass
         await _doc_scan_finish(chat_id, context)
 
 
@@ -13443,12 +13506,38 @@ async def _doc_scan_next_chunk(chat_id: int, context):
         ds["pending"]         = []
         await _doc_scan_show_review(chat_id, context)
     else:
+        status_id = ds.get("status_msg_id")
+        if status_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=status_id,
+                    text="✅ All chunks scanned. Preparing summary…"
+                )
+            except Exception:
+                try:
+                    msg = await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="✅ All chunks scanned. Preparing summary…"
+                    )
+                    ds["status_msg_id"] = msg.message_id
+                except Exception:
+                    pass
+        else:
+            try:
+                msg = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="✅ All chunks scanned. Preparing summary…"
+                )
+                ds["status_msg_id"] = msg.message_id
+            except Exception:
+                pass
         await _doc_scan_finish(chat_id, context)
 
-def _build_doc_review_text(q: dict, is_duplicate: bool) -> str:
+def _build_doc_review_text(q: dict, is_duplicate: bool, dup_question: str = None, dup_answer: str = None) -> str:
     labels  = ["A", "B", "C", "D"]
     correct = q.get("correct", -1)
-    dup_tag = ' _(⚠️ duplicate)_' if is_duplicate else ''
+    dup_tag = '\n_(⚠️ Duplicate Question)_' if is_duplicate else ''
 
     text = f"📝 *{escape_md_soft(q['question'])}*{dup_tag}\n\n"
     for i, opt in enumerate(q["options"]):
@@ -13458,10 +13547,14 @@ def _build_doc_review_text(q: dict, is_duplicate: bool) -> str:
         if i == correct:
             marker = " ✅"
         elif correct == -1 and i == q.get("_random_correct", 0):
-            marker = " ❓"
+            marker = " ❓ _(Bot's Random Answer)_"
         else:
             marker = ""
         text += f"{lbl}. {escape_md_soft(opt)}{marker}\n"
+
+    if is_duplicate and dup_question and dup_answer:
+        text += f"\n\n*Duplicate Question:*\n{escape_md_soft(dup_question)} ✅\n"
+        text += f"*Answer:* {escape_md_soft(dup_answer)}"
     return text
 
 async def _doc_scan_show_review(chat_id: int, context):
@@ -13475,6 +13568,11 @@ async def _doc_scan_show_review(chat_id: int, context):
 
     # If batch is empty, continue scanning or finish
     if not ds.get("batch_questions"):
+        # Refresh status_msg_id from the current review message so _doc_scan_finish
+        # has a valid message to edit even after the last review card was shown
+        review_id = ds.get("review_msg_id")
+        if review_id:
+            ds["status_msg_id"] = review_id
         if ds["chunk_index"] < len(ds["chunks"]) or ds["pending"]:
             await _doc_scan_next_chunk(chat_id, context)
         elif ds.get("ocr_mode") and ds.get("ocr_page_index", 0) < len(ds.get("ocr_pages", [])):
@@ -13496,15 +13594,43 @@ async def _doc_scan_show_review(chat_id: int, context):
 
     is_dup = _is_duplicate_doc(q["question"], owner_id)
 
-    text = _build_doc_review_text(q, is_dup)
-
-    # Build keyboard based on duplicate status
+    dup_question, dup_answer = None, None
     if is_dup:
+        dup_question, dup_answer = _find_best_duplicate(q["question"], owner_id)
+
+    text = _build_doc_review_text(q, is_dup, dup_question, dup_answer)
+
+    # Build [A][B][C][D] answer selector row
+    labels = ["A", "B", "C", "D"]
+    answer_confirmed = q.get("answer_confirmed", False)
+    current_correct  = q.get("correct", -1)
+
+    ans_row = []
+    for i, opt in enumerate(q["options"]):
+        if not opt:
+            continue
+        if answer_confirmed and i == current_correct:
+            lbl = f"{labels[i]}✅"
+        else:
+            lbl = labels[i]
+        ans_row.append(InlineKeyboardButton(lbl, callback_data=f"DSR_SET_ANS|{i}"))
+
+    # Build keyboard based on answer_confirmed and duplicate status
+    if not answer_confirmed:
+        # No answer selected yet — show ONLY answer row + Skip/Cancel
         keyboard = InlineKeyboardMarkup([
+            ans_row,
+            [
+                InlineKeyboardButton("⏭ Skip",   callback_data="DSR_SKIP"),
+                InlineKeyboardButton("❌ Cancel", callback_data="DSR_CANCEL"),
+            ],
+        ])
+    elif is_dup:
+        keyboard = InlineKeyboardMarkup([
+            ans_row,
             [
                 InlineKeyboardButton("✏️ Edit Question", callback_data="DSR_EDIT_Q"),
                 InlineKeyboardButton("✏️ Edit Choices",  callback_data="DSR_EDIT_OPTS"),
-                InlineKeyboardButton("✏️ Edit Answer",   callback_data="DSR_EDIT_ANS"),
             ],
             [
                 InlineKeyboardButton("⏭ Skip",          callback_data="DSR_SKIP"),
@@ -13517,10 +13643,10 @@ async def _doc_scan_show_review(chat_id: int, context):
         ])
     else:
         keyboard = InlineKeyboardMarkup([
+            ans_row,
             [
                 InlineKeyboardButton("✏️ Edit Question", callback_data="DSR_EDIT_Q"),
                 InlineKeyboardButton("✏️ Edit Choices",  callback_data="DSR_EDIT_OPTS"),
-                InlineKeyboardButton("✏️ Edit Answer",   callback_data="DSR_EDIT_ANS"),
             ],
             [
                 InlineKeyboardButton("⏭ Skip",          callback_data="DSR_SKIP"),
@@ -13708,6 +13834,7 @@ async def _doc_scan_finish(chat_id: int, context):
 
     keyboard = InlineKeyboardMarkup(buttons)
 
+    sent = False
     if review_id:
         try:
             await context.bot.edit_message_text(
@@ -13718,17 +13845,18 @@ async def _doc_scan_finish(chat_id: int, context):
                 parse_mode="Markdown"
             )
             context.user_data["doc_scan_finish_msg_id"] = review_id
-            return
+            sent = True
         except Exception:
             pass
 
-    msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text=summary,
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
-    context.user_data["doc_scan_finish_msg_id"] = msg.message_id
+    if not sent:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=summary,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+        context.user_data["doc_scan_finish_msg_id"] = msg.message_id
 
 async def doc_scan_other_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -13877,6 +14005,11 @@ async def dsr_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ds or not ds.get("batch_questions"):
         return
 
+    q = ds["batch_questions"][0]
+    if not q.get("answer_confirmed", False):
+        await query.answer("⚠️ Please select an answer first (A/B/C/D).", show_alert=True)
+        return
+
     owner_id = get_active_user_id(context)
     q        = ds["batch_questions"].pop(0)
 
@@ -13901,6 +14034,11 @@ async def dsr_create_anyway(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ds or not ds.get("batch_questions"):
         return
 
+    q = ds["batch_questions"][0]
+    if not q.get("answer_confirmed", False):
+        await query.answer("⚠️ Please select an answer first (A/B/C/D).", show_alert=True)
+        return
+
     owner_id = get_active_user_id(context)
     q        = ds["batch_questions"].pop(0)
 
@@ -13922,6 +14060,11 @@ async def dsr_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ds = _get_doc_scan(context)
     if not ds or not ds.get("batch_questions"):
+        return
+
+    q = ds["batch_questions"][0]
+    if not q.get("answer_confirmed", False):
+        await query.answer("⚠️ Please select an answer first (A/B/C/D).", show_alert=True)
         return
 
     owner_id = get_active_user_id(context)
@@ -14009,6 +14152,11 @@ async def dsr_edit_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ds or not ds.get("batch_questions"):
         return
 
+    q = ds["batch_questions"][0]
+    if not q.get("answer_confirmed", False):
+        await query.answer("⚠️ Please select an answer first (A/B/C/D).", show_alert=True)
+        return
+
     context.user_data["dsr_editing"] = "QUESTION"
     chat_id = query.message.chat_id
 
@@ -14050,6 +14198,11 @@ async def dsr_edit_choices(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ds = _get_doc_scan(context)
     if not ds or not ds.get("batch_questions"):
+        return
+
+    q = ds["batch_questions"][0]
+    if not q.get("answer_confirmed", False):
+        await query.answer("⚠️ Please select an answer first (A/B/C/D).", show_alert=True)
         return
 
     context.user_data["dsr_editing"]     = "CHOICES"
@@ -14125,7 +14278,6 @@ async def dsr_edit_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def dsr_set_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Apply the selected correct answer index."""
     query = update.callback_query
     await query.answer()
 
@@ -14134,12 +14286,12 @@ async def dsr_set_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ds or not ds.get("batch_questions"):
         return
 
-    ds["batch_questions"][0]["correct"]        = idx
+    ds["batch_questions"][0]["correct"]          = idx
+    ds["batch_questions"][0]["answer_confirmed"] = True
     ds["batch_questions"][0].pop("_random_correct", None)
 
-    # Return to review
+    # Refresh the review display with updated keyboard (checkmark on selected)
     await _doc_scan_show_review(query.message.chat_id, context)
-
 
 async def dsr_opt_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User tapped Keep for the current option — keep original text."""
