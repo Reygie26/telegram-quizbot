@@ -460,7 +460,7 @@ def _find_best_duplicate(new_text: str, owner_id: int):
             best_score = ratio
             best_row = (q_text, opts_str, correct_idx)
 
-    if best_row and best_score >= 0.98:
+    if best_row and best_score >= 0.85:
         q_text, opts_str, correct_idx = best_row
         opts = opts_str.split("||")
         correct_text = opts[correct_idx] if 0 <= correct_idx < len(opts) else "—"
@@ -5304,7 +5304,7 @@ async def save_new_question(message, context):
             _normalize_for_dup(new_text),
             _normalize_for_dup(existing_text)
         ).ratio()
-        if similarity >= 0.98:
+        if similarity >= 0.85:
             similar_matches.append((similarity, existing_text))
 
     similar_matches.sort(reverse=True, key=lambda x: x[0])
@@ -8474,7 +8474,7 @@ async def ocr_choose_correct(update: Update, context: ContextTypes.DEFAULT_TYPE)
             _normalize_for_dup(new_text),
             _normalize_for_dup(existing_text)
         ).ratio()
-        if similarity >= 0.98:
+        if similarity >= 0.85:
             similar_matches.append((similarity, existing_text))
 
     similar_matches.sort(reverse=True, key=lambda x: x[0])
@@ -12766,7 +12766,7 @@ TEXT:
             return []
 
 
-def _is_duplicate_doc(new_text: str, owner_id: int, threshold: float = 0.98) -> bool:
+def _is_duplicate_doc(new_text: str, owner_id: int, threshold: float = 0.85) -> bool:
     _conn, _cur = get_db()
     _cur.execute(
         """
