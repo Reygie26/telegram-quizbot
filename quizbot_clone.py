@@ -127,6 +127,15 @@ SUBSCRIPTION_DURATIONS = {
 ## HELPERS
 ## =========================
 
+def _normalize_for_dup(text: str) -> str:
+    """
+    Strips all non-alphabet characters and lowercases text
+    so that punctuation and articles don't prevent duplicate detection.
+    Example: "A change order may be issued when:" → "achangeordermaybeissuedwhen"
+    """
+    import re
+    return re.sub(r'[^a-zA-Z]', '', text).lower()
+
 def escape_md(text: str) -> str:
     """
     Escapes special Markdown characters for Telegram's MarkdownV1 parse mode.
@@ -446,7 +455,7 @@ def _find_best_duplicate(new_text: str, owner_id: int):
     best_score = 0.0
     best_row   = None
     for q_text, opts_str, correct_idx in rows:
-        ratio = SequenceMatcher(None, new_text.lower(), q_text.lower()).ratio()
+        ratio = SequenceMatcher(None, _normalize_for_dup(new_text), _normalize_for_dup(q_text)).ratio()
         if ratio > best_score:
             best_score = ratio
             best_row = (q_text, opts_str, correct_idx)
@@ -1163,7 +1172,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             tg_file    = await context.bot.get_file(file_id)
-            file_bytes = await tg_file.download_as_bytearray()
+            file_bytes = await tg_file.download_as_bytearray(read_timeout=60)
             question, options = await scan_image_with_gemini(bytes(file_bytes))
 
         except Exception as e:
@@ -5292,8 +5301,8 @@ async def save_new_question(message, context):
     for _qid, existing_text in existing_questions:
         similarity = SequenceMatcher(
             None,
-            new_text.lower(),
-            existing_text.lower()
+            _normalize_for_dup(new_text),
+            _normalize_for_dup(existing_text)
         ).ratio()
         if similarity >= 0.98:
             similar_matches.append((similarity, existing_text))
@@ -8462,8 +8471,8 @@ async def ocr_choose_correct(update: Update, context: ContextTypes.DEFAULT_TYPE)
     for _qid, existing_text in existing_questions:
         similarity = SequenceMatcher(
             None,
-            new_text.lower(),
-            existing_text.lower()
+            _normalize_for_dup(new_text),
+            _normalize_for_dup(existing_text)
         ).ratio()
         if similarity >= 0.98:
             similar_matches.append((similarity, existing_text))
@@ -8641,7 +8650,7 @@ async def ocr_retake(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         tg_file    = await context.bot.get_file(file_id)
-        file_bytes = await tg_file.download_as_bytearray()
+        file_bytes = await tg_file.download_as_bytearray(read_timeout=60)
         question, options = await scan_image_with_gemini(bytes(file_bytes))
     except Exception as e:
         error_str = str(e) if str(e).startswith("🔴") else "❌ Failed to re-scan the image. Please try again."
@@ -12771,7 +12780,7 @@ def _is_duplicate_doc(new_text: str, owner_id: int, threshold: float = 0.98) -> 
     rows = _cur.fetchall()
     _conn.close()
     for (existing,) in rows:
-        ratio = SequenceMatcher(None, new_text.lower(), existing.lower()).ratio()
+        ratio = SequenceMatcher(None, _normalize_for_dup(new_text), _normalize_for_dup(existing)).ratio()
         if ratio >= threshold:
             return True
     return False
@@ -13199,7 +13208,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         tg_file    = await context.bot.get_file(doc.file_id)
-        file_bytes = await tg_file.download_as_bytearray()
+        file_bytes = await tg_file.download_as_bytearray(read_timeout=120)
         file_bytes = bytes(file_bytes)
     except Exception as e:
         await status_msg.edit_text(f"❌ Download failed: {e}")
@@ -14094,7 +14103,7 @@ async def dsr_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     best_id, best_score = None, 0.0
     for qid, existing_text in existing:
-        ratio = SequenceMatcher(None, new_text.lower(), existing_text.lower()).ratio()
+        ratio = SequenceMatcher(None, _normalize_for_dup(new_text), _normalize_for_dup(existing_text)).ratio()
         if ratio > best_score:
             best_score, best_id = ratio, qid
 
