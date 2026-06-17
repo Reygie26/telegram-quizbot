@@ -13328,8 +13328,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📄 Scan All Pages", callback_data="DOC_SCAN_ALL_PAGES")],
-        [InlineKeyboardButton("❌ Cancel",          callback_data="DOC_SCAN_CANCEL")],
+        [
+            InlineKeyboardButton("📄 Scan All Pages", callback_data="DOC_SCAN_ALL_PAGES"),
+            InlineKeyboardButton("❌ Cancel",          callback_data="DOC_SCAN_CANCEL"),
+        ],
     ])
 
     await status_msg.edit_text(
@@ -13621,8 +13623,8 @@ def _build_doc_review_text(q: dict, is_duplicate: bool, dup_question: str = None
         text += f"{lbl}. {escape_md_soft(opt)}{marker}\n"
 
     if is_duplicate and dup_question and dup_answer:
-        text += f"\n\n*Duplicate Question:*\n{escape_md_soft(dup_question)}\n"
-        text += f"*Answer:* ✅ {escape_md_soft(dup_answer)}"
+        text += f"\n\n*Duplicate Question:*\n*{escape_md_soft(dup_question)}*\n\n"
+        text += f"*Answer:*\n✅ {escape_md_soft(dup_answer)}"
     return text
 
 async def _doc_scan_show_review(chat_id: int, context):
@@ -14211,11 +14213,6 @@ async def dsr_edit_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ds or not ds.get("batch_questions"):
         return
 
-    q = ds["batch_questions"][0]
-    if not q.get("answer_confirmed", False):
-        await query.answer("⚠️ Please select an answer first (A/B/C/D).", show_alert=True)
-        return
-
     context.user_data["dsr_editing"] = "QUESTION"
     chat_id = query.message.chat_id
 
@@ -14257,11 +14254,6 @@ async def dsr_edit_choices(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ds = _get_doc_scan(context)
     if not ds or not ds.get("batch_questions"):
-        return
-
-    q = ds["batch_questions"][0]
-    if not q.get("answer_confirmed", False):
-        await query.answer("⚠️ Please select an answer first (A/B/C/D).", show_alert=True)
         return
 
     context.user_data["dsr_editing"]     = "CHOICES"
