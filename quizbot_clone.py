@@ -31,6 +31,7 @@ from difflib import SequenceMatcher
 
 from google import genai as google_genai
 import base64
+from telegram.error import RetryAfter, TimedOut, NetworkError, Forbidden, BadRequest
 
 # =============================================================================================
 # GEMINI API KEY ROTATION
@@ -6398,6 +6399,65 @@ async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     await send_next_question(user_id, context)
 
+async def _send_with_retry(context, user_id, q, question_text, reply_markup, max_attempts=3):
+    """
+    Delivers the next-question message with automatic retry on transient
+    Telegram errors (flood limits, timeouts, network blips).
+    Returns the sent Message object, or None if delivery permanently
+    failed (e.g. the user blocked the bot) after exhausting retries.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if q.get("image"):
+                try:
+                    return await context.bot.send_photo(
+                        chat_id=user_id,
+                        photo=q["image"],
+                        caption=question_text,
+                        reply_markup=reply_markup
+                    )
+                except Exception:
+                    # Image-specific failure (e.g. expired file_id) — fall
+                    # back to text, same as the original behavior.
+                    return await context.bot.send_message(
+                        chat_id=user_id,
+                        text=question_text,
+                        reply_markup=reply_markup
+                    )
+            else:
+                return await context.bot.send_message(
+                    chat_id=user_id,
+                    text=question_text,
+                    reply_markup=reply_markup
+                )
+
+        except RetryAfter as e:
+            wait_time = float(getattr(e, "retry_after", 1)) + 0.5
+            print(f"⏳ Flood control hit for user {user_id}, waiting {wait_time}s "
+                  f"(attempt {attempt}/{max_attempts})")
+            await asyncio.sleep(wait_time)
+
+        except (TimedOut, NetworkError) as e:
+            print(f"⚠️ Network error sending question to {user_id} "
+                  f"(attempt {attempt}/{max_attempts}): {e}")
+            await asyncio.sleep(1.5 * attempt)
+
+        except Forbidden:
+            print(f"🚫 User {user_id} blocked the bot. Ending their quiz session.")
+            return None
+
+        except BadRequest as e:
+            print(f"⚠️ BadRequest sending question to {user_id}: {e}")
+            return None
+
+        except Exception as e:
+            print(f"⚠️ Unexpected error sending question to {user_id}: {e}")
+            return None
+
+    print(f"🔴 Gave up sending next question to {user_id} after {max_attempts} attempts.")
+    return None
+
+
 async def send_next_question(user_id, context):
     play = context.user_data.get("play")
     if not play:
@@ -6410,12 +6470,16 @@ async def send_next_question(user_id, context):
 
     quiz_id = play["quiz_id"]
 
-    _conn, _cur = get_db()
-    _cur.execute("SELECT timer FROM quizzes WHERE quiz_id=?", (quiz_id,))
-    row = _cur.fetchone()
-    _conn.close()
-
-    timer_seconds = row[0] if row else 15
+    timer_seconds = 15
+    try:
+        _conn, _cur = get_db()
+        _cur.execute("SELECT timer FROM quizzes WHERE quiz_id=?", (quiz_id,))
+        row = _cur.fetchone()
+        _conn.close()
+        if row:
+            timer_seconds = row[0]
+    except Exception as e:
+        print(f"⚠️ Failed to read timer setting for quiz {quiz_id}, defaulting to 15s: {e}")
 
     index = play["index"]
     total = len(play["questions"])
@@ -6439,42 +6503,35 @@ async def send_next_question(user_id, context):
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    if q.get("image"):
-        try:
-            msg = await context.bot.send_photo(
-                chat_id=user_id,
-                photo=q["image"],
-                caption=question_text,
-                reply_markup=reply_markup
-            )
-        except:
-            msg = await context.bot.send_message(
-                chat_id=user_id,
-                text=question_text,
-                reply_markup=reply_markup
-            )
-    else:
-        msg = await context.bot.send_message(
-            chat_id=user_id,
-            text=question_text,
-            reply_markup=reply_markup
-        )
+    # 🛡️ SAFE SEND — retries on flood/timeout, gives up gracefully on
+    # permanent failure instead of crashing and leaving the quiz stuck.
+    msg = await _send_with_retry(context, user_id, q, question_text, reply_markup)
+
+    if msg is None:
+        # Could not deliver the next question after retries — end this
+        # user's session cleanly instead of leaving it frozen.
+        await stop_active_quiz(user_id, context)
+        return
 
     play["current_question_message_id"] = msg.message_id
     play.setdefault("question_message_ids", [])
     play["question_message_ids"].append(msg.message_id)
     play["locked"] = False
 
-    timer_msg = await context.bot.send_message(
-        chat_id=user_id,
-        text=f"⏱ Time left: {timer_seconds}s"
-    )
-    play.setdefault("timer_message_ids", [])
-    play["timer_message_ids"].append(timer_msg.message_id)
+    try:
+        timer_msg = await context.bot.send_message(
+            chat_id=user_id,
+            text=f"⏱ Time left: {timer_seconds}s"
+        )
+        play.setdefault("timer_message_ids", [])
+        play["timer_message_ids"].append(timer_msg.message_id)
 
-    play["timer_task"] = asyncio.create_task(
-        countdown_timer(user_id, context, timer_seconds, play)
-    )
+        play["timer_task"] = asyncio.create_task(
+            countdown_timer(user_id, context, timer_seconds, play)
+        )
+    except Exception as e:
+        # Non-critical: the question itself was already delivered.
+        print(f"⚠️ Failed to start timer for user {user_id}: {e}")
 
 async def countdown_timer(user_id, context, seconds, play):
     try:
@@ -7754,20 +7811,22 @@ async def advance_quiz(user_id, context):
         # 🔒 Mark as advancing to block any concurrent call
         play["advancing"] = True
 
-        play["index"] += 1
+        try:
+            play["index"] += 1
 
-        # 🏁 END OF QUIZ
-        if play["index"] >= len(play["questions"]):
-            play["finished"] = True
+            # 🏁 END OF QUIZ
+            if play["index"] >= len(play["questions"]):
+                play["finished"] = True
+                await finish_quiz(user_id, context)
+                return
+
+            # ▶️ NEXT QUESTION
+            await send_next_question(user_id, context)
+        finally:
+            # 🔓 ALWAYS release the advance lock, no matter what happened
+            # above. This is the line that guarantees the quiz can never
+            # get permanently stuck again.
             play["advancing"] = False
-            await finish_quiz(user_id, context)
-            return
-
-        # ▶️ NEXT QUESTION
-        await send_next_question(user_id, context)
-
-        # 🔓 Release advance lock after next question is fully sent
-        play["advancing"] = False
 
 async def qb_pick_folder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -14411,6 +14470,7 @@ app = (
     .read_timeout(30)
     .write_timeout(30)
     .pool_timeout(30)
+    .concurrent_updates(512)
     .build()
 )
 
