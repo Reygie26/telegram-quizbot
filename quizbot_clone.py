@@ -13562,8 +13562,8 @@ def _build_doc_review_text(q: dict, is_duplicate: bool, dup_question: str = None
         text += f"{lbl}. {escape_md_soft(opt)}{marker}\n"
 
     if is_duplicate and dup_question and dup_answer:
-        text += f"\n\n*Duplicate Question:*\n{escape_md_soft(dup_question)} ✅\n"
-        text += f"*Answer:* {escape_md_soft(dup_answer)}"
+        text += f"\n\n*Duplicate Question:*\n{escape_md_soft(dup_question)}\n"
+        text += f"*Answer:* ✅ {escape_md_soft(dup_answer)}"
     return text
 
 async def _doc_scan_show_review(chat_id: int, context):
@@ -13625,16 +13625,7 @@ async def _doc_scan_show_review(chat_id: int, context):
         ans_row.append(InlineKeyboardButton(lbl, callback_data=f"DSR_SET_ANS|{i}"))
 
     # Build keyboard based on answer_confirmed and duplicate status
-    if not answer_confirmed:
-        # No answer selected yet — show ONLY answer row + Skip/Cancel
-        keyboard = InlineKeyboardMarkup([
-            ans_row,
-            [
-                InlineKeyboardButton("⏭ Skip",   callback_data="DSR_SKIP"),
-                InlineKeyboardButton("❌ Cancel", callback_data="DSR_CANCEL"),
-            ],
-        ])
-    elif is_dup:
+    if is_dup:
         keyboard = InlineKeyboardMarkup([
             ans_row,
             [
