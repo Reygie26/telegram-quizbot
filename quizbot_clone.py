@@ -105,7 +105,7 @@ QUIZ_FOLDERS_PER_PAGE = 5
 PLACEHOLDER_IMAGE_URL = "https://via.placeholder.com/1x1.png"
 PLACEHOLDER_IMAGE_FILE_ID = "AgACAgUAAxkBAAId1GmNwdjStLkxKCsKAodhZXjm9Fc5AAKJDGsbhHpxVPfj2MXOcpF3AQADAgADeQADOgQ"
 DB_LOCK = asyncio.Lock()
-MAX_QUESTION_LENGTH = 400
+MAX_QUESTION_LENGTH = 500
 MAX_OPTION_LENGTH = 200
 MAX_EXPLANATION_LENGTH = 400
 MAX_TITLE_LENGTH = 50
@@ -1666,6 +1666,89 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         menu_msg = context.user_data.get("db_search_menu_message")
         if menu_msg:
             await show_db_search_results(menu_msg, context)
+        return
+
+    # ================= QB: JUMP TO PAGE =================
+    if state == "QB_WAIT_PAGE":
+        chat_id     = update.effective_chat.id
+        user_msg_id = update.message.message_id
+        folder_name = context.user_data.get("qb_folder_name")
+
+        # 🧹 Delete the user's typed message immediately
+        try:
+            await context.bot.delete_message(chat_id, user_msg_id)
+        except Exception:
+            pass
+
+        prompt_id = context.user_data.pop("qb_jump_prompt_id", None)
+        if prompt_id:
+            try:
+                await context.bot.delete_message(chat_id, prompt_id)
+            except Exception:
+                pass
+
+        raw_input = text.strip()
+
+        if not raw_input.isdigit():
+            err = await context.bot.send_message(chat_id, "❌ Please send a valid page number.")
+            await asyncio.sleep(2)
+            try: await err.delete()
+            except: pass
+            return
+
+        # 🔢 Compute total pages for this folder (must match build_qb_question_keyboard)
+        PER_PAGE = 10
+        _conn_jp, _cur_jp = get_db()
+        _cur_jp.execute(
+            "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
+            (get_active_user_id(context), folder_name)
+        )
+        folder_row = _cur_jp.fetchone()
+        _conn_jp.close()
+
+        if not folder_row:
+            context.user_data.pop("state", None)
+            await flash_message(context.bot, chat_id, "❌ Folder not found.")
+            return
+
+        folder_id = folder_row[0]
+
+        _conn_jp2, _cur_jp2 = get_db()
+        _cur_jp2.execute("SELECT COUNT(*) FROM question_bank WHERE folder_id=?", (folder_id,))
+        total = _cur_jp2.fetchone()[0]
+        _conn_jp2.close()
+
+        pages = (total - 1) // PER_PAGE + 1 if total else 1
+        requested_page = int(raw_input)
+
+        if requested_page < 1 or requested_page > pages:
+            err = await context.bot.send_message(
+                chat_id,
+                f"❌ Invalid page. Please send a number between 1 and {pages}."
+            )
+            await asyncio.sleep(3)
+            try: await err.delete()
+            except: pass
+            return
+
+        # ✅ Jump to the requested page (convert to 0-indexed)
+        context.user_data["qb_q_page"] = requested_page - 1
+        context.user_data.pop("state", None)
+
+        # 🔄 Rebuild the question list on the original menu message
+        menu_msg = context.user_data.get("qb_jump_menu_message")
+        context.user_data.pop("qb_jump_menu_message", None)
+
+        if menu_msg:
+            reply_markup = build_qb_question_keyboard(context)
+            try:
+                await menu_msg.edit_text(
+                    f"📁 **{folder_name}**\n\nSelect questions:",
+                    reply_markup=reply_markup,
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
         return
 
     # ================= ADD QUESTION FLOW =================
@@ -7885,6 +7968,43 @@ async def qb_question_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Reload the same folder
     await qb_open_folder(update, context)
 
+async def qb_jump_to_page_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    folder_name = context.user_data.get("qb_folder_name")
+    if not folder_name:
+        return
+
+    context.user_data["state"] = "QB_WAIT_PAGE"
+    context.user_data["qb_jump_menu_message"] = query.message
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="QB_JUMP_CANCEL")]
+    ])
+
+    msg = await query.message.reply_text(
+        "🔢 Send the page number you want to jump to:",
+        reply_markup=keyboard
+    )
+    context.user_data["qb_jump_prompt_id"] = msg.message_id
+
+async def qb_jump_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+
+    prompt_id = context.user_data.pop("qb_jump_prompt_id", None)
+    if prompt_id:
+        try:
+            await context.bot.delete_message(chat_id, prompt_id)
+        except:
+            pass
+
+    context.user_data.pop("state", None)
+    context.user_data.pop("qb_jump_menu_message", None)
+
 def ensure_default_qb_folder():
     _conn, _cur = get_db()
     _cur.execute(
@@ -9114,6 +9234,7 @@ def build_qb_question_keyboard(context):
         if page > 0:
             nav.append(InlineKeyboardButton("◀ Prev", callback_data="QB_Q_PREV"))
         nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QB_Q_NOP"))
+        nav.append(InlineKeyboardButton("🔢 Go to Page", callback_data="QB_Q_JUMP"))
         if page < pages - 1:
             nav.append(InlineKeyboardButton("Next ▶", callback_data="QB_Q_NEXT"))
         keyboard.append(nav)
@@ -12787,7 +12908,14 @@ TEXT:
                     raw = raw[4:]
             raw = raw.strip()
 
-            data = json.loads(raw)
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                # Gemini sometimes appends extra text after the JSON array.
+                # raw_decode() parses only the first valid JSON value and
+                # ignores anything trailing after it.
+                data, _ = json.JSONDecoder().raw_decode(raw)
+
             if not isinstance(data, list):
                 return []
 
@@ -13376,19 +13504,14 @@ async def _doc_scan_next_ocr_page(chat_id: int, context):
 
         # Use existing Gemini image scanner but ask for questions + options onlyasync def doc_scan_resume
         try:
-            question, options = await scan_image_with_gemini(page_bytes)
-
-            # scan_image_with_gemini returns ONE question per image.
-            # For document pages that may have multiple questions,
-            # we also run the text chunk parser on the OCR'd text.
-            # Strategy: get raw text from Gemini first, then parse it.
+            # Document pages can contain multiple questions, so we extract
+            # the raw page text first, then parse it with the multi-question
+            # chunk parser. (scan_image_with_gemini is NOT used here — it
+            # expects a single-question JSON object and breaks on full pages.)
             raw_page_text = await _ocr_page_to_text(page_bytes)
             if raw_page_text.strip():
                 parsed = await _parse_questions_from_chunk(raw_page_text)
                 ds["pending"].extend(parsed)
-            elif question:
-                # Fallback: use the single question from scan_image_with_gemini
-                ds["pending"].append({"question": question, "options": options})
 
         except RuntimeError as e:
             # 🔑 Step back so this page is retried on Resume
@@ -14536,6 +14659,8 @@ app.add_handler(CallbackQueryHandler(qb_add_this_page, pattern="^QB_ADD_THIS_PAG
 app.add_handler(CallbackQueryHandler(qb_toggle_select_question, pattern="^QB_SELECT_Q\\|"))
 app.add_handler(CallbackQueryHandler(qb_question_prev, pattern="^QB_Q_PREV$"))
 app.add_handler(CallbackQueryHandler(qb_question_next, pattern="^QB_Q_NEXT$"))
+app.add_handler(CallbackQueryHandler(qb_jump_to_page_start, pattern="^QB_Q_JUMP$"))
+app.add_handler(CallbackQueryHandler(qb_jump_cancel, pattern="^QB_JUMP_CANCEL$"))
 app.add_handler(CallbackQueryHandler(cancel_shuffle_menu, pattern="^CANCEL_SHUFFLE_MENU$"))
 app.add_handler(CallbackQueryHandler(cancel_timer_menu, pattern="^CANCEL_TIMER_MENU$"))
 app.add_handler(CallbackQueryHandler(cancel_edit_question_image, pattern="^CANCEL_EDIT_Q_IMAGE$"))
