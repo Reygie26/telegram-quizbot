@@ -13365,7 +13365,7 @@ async def home_scan_document(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
     context.user_data["add_q_state"] = "DOC_SCAN_WAIT_FILE"
-
+    context.user_data["doc_scan_prompt_msg_id"] = query.message.message_id  # ← ADD THIS
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user is None:
@@ -13426,6 +13426,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     doc_name = doc.file_name or "document"
+
+    # 🧹 Delete the "Scan Document" prompt message (Bot message with Back/Cancel)
+    prompt_id = context.user_data.pop("doc_scan_prompt_msg_id", None)
+    if prompt_id:
+        try:
+            await context.bot.delete_message(chat_id, prompt_id)
+        except Exception:
+            pass
 
     # ── Get page count ────────────────────────────────────────────────────────
     total_pages = None
