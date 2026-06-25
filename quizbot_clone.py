@@ -13154,43 +13154,7 @@ async def _doc_scan_begin(chat_id: int, context):
 
     # ── PDF ───────────────────────────────────────────────────────────────────
     if is_pdf:
-        # Extract text only from selected pages
-        try:
-            from pypdf import PdfReader
-            reader = PdfReader(io.BytesIO(file_bytes))
-            parts  = []
-            if selected_pages:
-                for p in selected_pages:
-                    idx = p - 1  # pypdf is 0-indexed
-                    if 0 <= idx < len(reader.pages):
-                        t = reader.pages[idx].extract_text()
-                        if t and t.strip():
-                            parts.append(t.strip())
-            else:
-                for page in reader.pages:
-                    t = page.extract_text()
-                    if t and t.strip():
-                        parts.append(t.strip())
-            raw_text = "\n".join(parts)
-        except Exception:
-            raw_text = ""
-
-        if not raw_text.strip():
-            use_ocr = True
-            if status_id:
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=status_id,
-                        text=(
-                            "📷 No text layer found — switching to "
-                            "*Gemini OCR mode*.\n\n"
-                            "Each selected page will be scanned visually…"
-                        ),
-                        parse_mode="Markdown"
-                    )
-                except Exception:
-                    pass
+        use_ocr = True
 
     # ── DOCX ──────────────────────────────────────────────────────────────────
     elif is_docx:
