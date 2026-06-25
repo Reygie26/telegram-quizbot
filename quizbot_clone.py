@@ -64,6 +64,23 @@ def _rotate_gemini_key():
     _gemini_key_index = (_gemini_key_index + 1) % total
     print(f"🔄 Rotated to Gemini API key index {_gemini_key_index}")
 
+def _rotate_to_untried_key(tried_indices: set):
+    """
+    Rotates _gemini_key_index forward until it lands on an index
+    NOT already in tried_indices. This guards against another
+    concurrent coroutine having already moved the shared global
+    index, which could otherwise cause a key to be skipped or
+    tested twice and trigger a false 'all keys exhausted' result.
+    """
+    global _gemini_key_index
+    total = len(GEMINI_API_KEYS)
+    for _ in range(total):
+        _gemini_key_index = (_gemini_key_index + 1) % total
+        if _gemini_key_index not in tried_indices:
+            return
+    # All indices already tried — leave index as-is, caller will detect
+    # via len(tried_indices) >= total and stop.
+
 ##### =============================================================================================
 ##### BOT TOKEN TO USE
 ##### =============================================================================================
@@ -318,10 +335,11 @@ Rules:
     loop = asyncio.get_event_loop()
 
     # ── Try each key in sequence until one works ──────────────────────
-    keys_tried = 0
+    tried_indices = set()
     total_keys = len(GEMINI_API_KEYS)
 
     while True:
+        tried_indices.add(_gemini_key_index)
         try:
             client = _get_gemini_client()
 
@@ -363,14 +381,13 @@ Rules:
             ])
 
             if is_rate_error:
-                keys_tried += 1
-                if keys_tried >= total_keys:
-                    # Every key has been tried in this call — all rate-limited
+                if len(tried_indices) >= total_keys:
+                    # Every distinct key has actually been tried — all rate-limited
                     raise RuntimeError(
                         "🔴 All Gemini API keys have reached their rate limit. "
                         "Please try again later."
                     )
-                _rotate_gemini_key()
+                _rotate_to_untried_key(tried_indices)
                 print(f"♻️ Retrying with key index {_gemini_key_index}...")
                 continue  # retry with next key
 
@@ -9676,6 +9693,13 @@ async def back_to_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+    # 🔑 NEW: If this question was opened from Search Results, return there
+    preview_return = context.user_data.pop("preview_return", None)
+    if preview_return == "DB_SEARCH":
+        new_msg = await context.bot.send_message(chat_id=chat_id, text="⏳")
+        await show_db_search_results(new_msg, context)
+        return
+
     # Check which mode we are in (Database folder or Quiz question list)
     preview_mode = context.user_data.get("preview_mode", "QUIZ")
 
@@ -12887,10 +12911,11 @@ TEXT:
 
     text_part = google_genai.types.Part.from_text(text=prompt)
     loop      = asyncio.get_event_loop()
-    keys_tried = 0
+    tried_indices = set()
     total_keys = len(GEMINI_API_KEYS)
 
     while True:
+        tried_indices.add(_gemini_key_index)
         try:
             client = _get_gemini_client()
 
@@ -12941,12 +12966,11 @@ TEXT:
                 "high demand", "resource_exhausted", "too many requests"
             ])
             if is_rate:
-                keys_tried += 1
-                if keys_tried >= total_keys:
+                if len(tried_indices) >= total_keys:
                     raise RuntimeError(
                         "🔴 All Gemini API keys are rate-limited. Please try again later."
                     )
-                _rotate_gemini_key()
+                _rotate_to_untried_key(tried_indices)
                 await asyncio.sleep(2)
                 continue
             print(f"⚠️ Gemini chunk parse error: {e}")
@@ -13525,8 +13549,10 @@ async def _doc_scan_next_ocr_page(chat_id: int, context):
                         message_id=status_id,
                         text=str(e) + "\n\nPlease wait a minute and tap ▶️ Resume.",
                         reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("▶️ Resume", callback_data="DOC_SCAN_RESUME")],
-                            [InlineKeyboardButton("🛑 Stop",   callback_data="DOC_SCAN_STOP")],
+                            [
+                                InlineKeyboardButton("▶️ Resume", callback_data="DOC_SCAN_RESUME"),
+                                InlineKeyboardButton("🛑 Stop",   callback_data="DOC_SCAN_STOP"),
+                            ]
                         ])
                     )
                 except Exception:
@@ -13602,10 +13628,11 @@ async def _ocr_page_to_text(page_bytes: bytes) -> str:
     text_part = google_genai.types.Part.from_text(text=prompt)
     loop      = asyncio.get_event_loop()
 
-    keys_tried = 0
+    tried_indices = set()
     total_keys = len(GEMINI_API_KEYS)
 
     while True:
+        tried_indices.add(_gemini_key_index)
         try:
             client = _get_gemini_client()
 
@@ -13624,12 +13651,11 @@ async def _ocr_page_to_text(page_bytes: bytes) -> str:
                 "high demand", "resource_exhausted", "too many requests"
             ])
             if is_rate:
-                keys_tried += 1
-                if keys_tried >= total_keys:
+                if len(tried_indices) >= total_keys:
                     raise RuntimeError(
                         "🔴 All Gemini API keys are rate-limited. Please try again later."
                     )
-                _rotate_gemini_key()
+                _rotate_to_untried_key(tried_indices)
                 await asyncio.sleep(2)
                 continue
             print(f"⚠️ OCR page text error: {e}")
@@ -13677,8 +13703,10 @@ async def _doc_scan_next_chunk(chat_id: int, context):
                         message_id=status_id,
                         text=str(e) + "\n\nPlease wait a minute and tap ▶️ Resume.",
                         reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("▶️ Resume", callback_data="DOC_SCAN_RESUME")],
-                            [InlineKeyboardButton("🛑 Stop",   callback_data="DOC_SCAN_STOP")],
+                            [
+                                InlineKeyboardButton("▶️ Resume", callback_data="DOC_SCAN_RESUME"),
+                                InlineKeyboardButton("🛑 Stop",   callback_data="DOC_SCAN_STOP"),
+                            ]
                         ])
                     )
                 except Exception:
