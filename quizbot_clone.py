@@ -13733,7 +13733,7 @@ def _build_doc_review_text(q: dict, is_duplicate: bool, dup_question: str = None
     correct = q.get("correct", -1)
     dup_tag = '\n_(⚠️ Duplicate Question)_' if is_duplicate else ''
 
-    text = f"📝 *{escape_md_soft(q['question'])}*{dup_tag}\n\n"
+    text = f"🔍 *Scanned Question*\n\n📝 *{escape_md_soft(q['question'])}*{dup_tag}\n\n"
     for i, opt in enumerate(q["options"]):
         if not opt:
             continue
