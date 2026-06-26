@@ -1872,6 +1872,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context.user_data["dsr_edit_quote_msg_id"] = None
             else:
                 ds["batch_questions"][0]["options"] = context.user_data.pop("dsr_new_options")
+                ds["batch_questions"][0]["answer_confirmed"] = False
+                ds["batch_questions"][0]["correct"] = -1
+                ds["batch_questions"][0].pop("_random_correct", None)
 
                 # 🧹 Delete the quote message (scanned text box)
                 quote_id = context.user_data.pop("dsr_edit_quote_msg_id", None)
@@ -12895,7 +12898,7 @@ async def _parse_questions_from_chunk(chunk_text: str) -> list:
 Rules:
 - A question is any sentence/phrase followed by 2-4 answer choices (labeled A/B/C/D, a/b/c/d, 1/2/3/4, or any letter/number prefix).
 - Strip leading labels (e.g. "1.", "Q1.", "A.", "(a)") from both questions and options.
-- If an item has fewer than 2 options, skip it.
+- If no question text is found, skip it. Include the question even if options are missing or empty.
 - Pad options list to exactly 4 items; use "" for missing options.
 - For the correct answer: look for visual clues such as bold text, asterisks (*word*), underscores (_word_), ALL CAPS emphasis, a marker like (*), (✓), (correct), or any annotation indicating the right answer. If found, set "correct" to the 0-based index of that option. If no correct answer is identifiable, set "correct" to -1.
 - Respond ONLY with a valid JSON array — no markdown, no explanation:
@@ -13734,17 +13737,22 @@ def _build_doc_review_text(q: dict, is_duplicate: bool, dup_question: str = None
     dup_tag = '\n_(⚠️ Duplicate Question)_' if is_duplicate else ''
 
     text = f"🔍 *Scanned Question*\n📝 *{escape_md_soft(q['question'])}*{dup_tag}\n\n"
-    for i, opt in enumerate(q["options"]):
-        if not opt:
-            continue
-        lbl = labels[i] if i < len(labels) else str(i + 1)
-        if i == correct:
-            marker = " ✅"
-        elif correct == -1 and i == q.get("_random_correct", 0):
-            marker = " ❓ _(Bot's Random Answer)_"
-        else:
-            marker = ""
-        text += f"{lbl}. {escape_md_soft(opt)}{marker}\n"
+    has_any_option = any(opt for opt in q["options"])
+
+    if has_any_option:
+        for i, opt in enumerate(q["options"]):
+            if not opt:
+                continue
+            lbl = labels[i] if i < len(labels) else str(i + 1)
+            if i == correct:
+                marker = " ✅"
+            elif correct == -1 and i == q.get("_random_correct", 0):
+                marker = " ❓ _(Bot's Random Answer)_"
+            else:
+                marker = ""
+            text += f"{lbl}. {escape_md_soft(opt)}{marker}\n"
+    else:
+        text += "_⚠️ No choices detected. Use Edit Choices to add them._\n"
 
     if is_duplicate and dup_question and dup_answer:
         text += f"\n\n*Duplicate Question:*\n📝 *{escape_md_soft(dup_question)}*\n\n"
@@ -13778,11 +13786,15 @@ async def _doc_scan_show_review(chat_id: int, context):
     owner_id = get_active_user_id(context)
     q        = ds["batch_questions"][0]
 
-    # Assign a random correct if none detected
+    # Assign a random correct only if there are actual options
+    valid_opts = [o for o in q.get("options", []) if o]
     if q.get("correct", -1) == -1:
-        import random as _random
-        rnd = _random.randint(0, len([o for o in q["options"] if o]) - 1)
-        q["_random_correct"] = rnd
+        if valid_opts:
+            import random as _random
+            rnd = _random.randint(0, len(valid_opts) - 1)
+            q["_random_correct"] = rnd
+        else:
+            q.pop("_random_correct", None)
     else:
         q.pop("_random_correct", None)
 
@@ -13800,19 +13812,23 @@ async def _doc_scan_show_review(chat_id: int, context):
     current_correct  = q.get("correct", -1)
 
     ans_row = []
-    for i, opt in enumerate(q["options"]):
-        if not opt:
-            continue
-        if answer_confirmed and i == current_correct:
-            lbl = f"{labels[i]}✅"
-        else:
-            lbl = labels[i]
-        ans_row.append(InlineKeyboardButton(lbl, callback_data=f"DSR_SET_ANS|{i}"))
+    has_any_option = any(opt for opt in q.get("options", []))
+    if has_any_option:
+        for i, opt in enumerate(q["options"]):
+            if not opt:
+                continue
+            if answer_confirmed and i == current_correct:
+                lbl = f"{labels[i]}✅"
+            else:
+                lbl = labels[i]
+            ans_row.append(InlineKeyboardButton(lbl, callback_data=f"DSR_SET_ANS|{i}"))
 
     # Build keyboard based on answer_confirmed and duplicate status
     if is_dup:
-        keyboard = InlineKeyboardMarkup([
-            ans_row,
+        rows = []
+        if ans_row:
+            rows.append(ans_row)
+        rows += [
             [
                 InlineKeyboardButton("✏️ Edit Question", callback_data="DSR_EDIT_Q"),
                 InlineKeyboardButton("✏️ Edit Choices",  callback_data="DSR_EDIT_OPTS"),
@@ -13825,10 +13841,13 @@ async def _doc_scan_show_review(chat_id: int, context):
             [
                 InlineKeyboardButton("❌ Cancel",        callback_data="DSR_CANCEL"),
             ],
-        ])
+        ]
+        keyboard = InlineKeyboardMarkup(rows)
     else:
-        keyboard = InlineKeyboardMarkup([
-            ans_row,
+        rows = []
+        if ans_row:
+            rows.append(ans_row)
+        rows += [
             [
                 InlineKeyboardButton("✏️ Edit Question", callback_data="DSR_EDIT_Q"),
                 InlineKeyboardButton("✏️ Edit Choices",  callback_data="DSR_EDIT_OPTS"),
@@ -13838,7 +13857,8 @@ async def _doc_scan_show_review(chat_id: int, context):
                 InlineKeyboardButton("✅ Accept",        callback_data="DSR_ACCEPT"),
                 InlineKeyboardButton("❌ Cancel",        callback_data="DSR_CANCEL"),
             ],
-        ])
+        ]
+        keyboard = InlineKeyboardMarkup(rows)
 
     status_id = ds.get("status_msg_id")
 
@@ -14191,8 +14211,19 @@ async def dsr_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     q = ds["batch_questions"][0]
+
+    valid_opts = [o for o in q.get("options", []) if o]
+    if len(valid_opts) < 2:
+        await query.answer(
+            "⚠️ Please add at least 2 answer choices using Edit Choices before saving.",
+            show_alert=True
+        )
+        return
     if not q.get("answer_confirmed", False):
-        await query.answer("⚠️ Please select an answer first (A/B/C/D).", show_alert=True)
+        await query.answer(
+            "⚠️ Please select the correct answer (tap A, B, C, or D) before saving.",
+            show_alert=True
+        )
         return
 
     owner_id = get_active_user_id(context)
@@ -14220,8 +14251,19 @@ async def dsr_create_anyway(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     q = ds["batch_questions"][0]
+
+    valid_opts = [o for o in q.get("options", []) if o]
+    if len(valid_opts) < 2:
+        await query.answer(
+            "⚠️ Please add at least 2 answer choices using Edit Choices before saving.",
+            show_alert=True
+        )
+        return
     if not q.get("answer_confirmed", False):
-        await query.answer("⚠️ Please select an answer first (A/B/C/D).", show_alert=True)
+        await query.answer(
+            "⚠️ Please select the correct answer (tap A, B, C, or D) before saving.",
+            show_alert=True
+        )
         return
 
     owner_id = get_active_user_id(context)
@@ -14248,8 +14290,19 @@ async def dsr_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     q = ds["batch_questions"][0]
+
+    valid_opts = [o for o in q.get("options", []) if o]
+    if len(valid_opts) < 2:
+        await query.answer(
+            "⚠️ Please add at least 2 answer choices using Edit Choices before saving.",
+            show_alert=True
+        )
+        return
     if not q.get("answer_confirmed", False):
-        await query.answer("⚠️ Please select an answer first (A/B/C/D).", show_alert=True)
+        await query.answer(
+            "⚠️ Please select the correct answer (tap A, B, C, or D) before saving.",
+            show_alert=True
+        )
         return
 
     owner_id = get_active_user_id(context)
@@ -14532,6 +14585,9 @@ async def dsr_opt_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         # All 4 done — commit
         ds["batch_questions"][0]["options"] = context.user_data.pop("dsr_new_options")
+        ds["batch_questions"][0]["answer_confirmed"] = False
+        ds["batch_questions"][0]["correct"] = -1
+        ds["batch_questions"][0].pop("_random_correct", None)
 
         # 🧹 Delete the last quote message
         last_quote_id = context.user_data.pop("dsr_edit_quote_msg_id", None)
