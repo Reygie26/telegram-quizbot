@@ -454,7 +454,7 @@ def is_authorized(user_id: int) -> bool:
 def _find_best_duplicate(new_text: str, owner_id: int):
     """
     Returns (question_text, correct_option_text) of the most similar
-    existing question, or (None, None) if none found at ratio >= 0.95.
+    existing question, or (None, None) if none found at ratio >= 0.91.
     """
     _conn, _cur = get_db()
     _cur.execute(
@@ -478,7 +478,7 @@ def _find_best_duplicate(new_text: str, owner_id: int):
             best_score = ratio
             best_row = (q_text, opts_str, correct_idx)
 
-    if best_row and best_score >= 0.95:
+    if best_row and best_score >= 0.91:
         q_text, opts_str, correct_idx = best_row
         opts = opts_str.split("||")
         correct_text = opts[correct_idx] if 0 <= correct_idx < len(opts) else "—"
@@ -5405,7 +5405,7 @@ async def save_new_question(message, context):
             _normalize_for_dup(new_text),
             _normalize_for_dup(existing_text)
         ).ratio()
-        if similarity >= 0.95:
+        if similarity >= 0.91:
             similar_matches.append((similarity, existing_text))
 
     similar_matches.sort(reverse=True, key=lambda x: x[0])
@@ -8671,7 +8671,7 @@ async def ocr_choose_correct(update: Update, context: ContextTypes.DEFAULT_TYPE)
             _normalize_for_dup(new_text),
             _normalize_for_dup(existing_text)
         ).ratio()
-        if similarity >= 0.95:
+        if similarity >= 0.91:
             similar_matches.append((similarity, existing_text))
 
     similar_matches.sort(reverse=True, key=lambda x: x[0])
@@ -12978,7 +12978,7 @@ TEXT:
             return []
 
 
-def _is_duplicate_doc(new_text: str, owner_id: int, threshold: float = 0.95) -> bool:
+def _is_duplicate_doc(new_text: str, owner_id: int, threshold: float = 0.91) -> bool:
     _conn, _cur = get_db()
     _cur.execute(
         """
@@ -13733,7 +13733,7 @@ def _build_doc_review_text(q: dict, is_duplicate: bool, dup_question: str = None
     correct = q.get("correct", -1)
     dup_tag = '\n_(⚠️ Duplicate Question)_' if is_duplicate else ''
 
-    text = f"🔍 *Scanned Question*\n\n📝 *{escape_md_soft(q['question'])}*{dup_tag}\n\n"
+    text = f"🔍 *Scanned Question*\n📝 *{escape_md_soft(q['question'])}*{dup_tag}\n\n"
     for i, opt in enumerate(q["options"]):
         if not opt:
             continue
