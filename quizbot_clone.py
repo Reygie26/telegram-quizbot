@@ -2615,7 +2615,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     """
                     INSERT INTO quizzes
                         (quiz_id, owner_id, title, description, folder, shuffle_q, shuffle_a, timer, access)
-                    VALUES (?, ?, ?, NULL, 'Default', 1, 1, 15, 'public')
+                    VALUES (?, ?, ?, NULL, 'Default', 1, 1, 60, 'public')
                     """,
                     (
                         context.user_data["quiz_id"],
@@ -6592,9 +6592,10 @@ async def send_next_question(user_id, context):
         for i, opt in enumerate(q["options"])
     )
 
+    PADDING = "\u2800" * 60
     question_text = (
         f"[{index+1}/{total}] 🧠 {q['text']}\n\n"
-        f"{options_text}"
+        f"{options_text}\n{PADDING}"
     )
 
     keyboard = [[
@@ -13323,7 +13324,7 @@ async def home_scan_document(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "• 📕 PDF  (.pdf)\n"
         "• 📘 Word (.docx)\n"
         "• 📄 Text (.txt)\n\n"
-        "The bot will scan the document in batches of 10 questions for you to review before saving.",
+        "The bot will scan the questions in the uploaded document for you to review before saving.",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
