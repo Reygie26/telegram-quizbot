@@ -488,6 +488,60 @@ def _find_best_duplicate(new_text: str, owner_id: int):
 # =========================
 # LEADERBOARD KEY HELPER
 # =========================
+
+def resolve_leaderboard_name(user_id: int, quiz_id: str, fallback_name: str) -> str:
+    """
+    Returns the name to display on a leaderboard for this user.
+    - Private quizzes: ALWAYS pulls the current registered subscriber name
+      (folder-specific first, then global subscriber table). This makes
+      legacy/stale entries self-heal automatically — no migration needed.
+    - Public quizzes: keeps the stored/fallback name (Telegram display name).
+    """
+    if not quiz_id:
+        return fallback_name
+
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT access, folder, owner_id FROM quizzes WHERE quiz_id=?",
+        (quiz_id,)
+    )
+    row = _cur.fetchone()
+    _conn.close()
+
+    if not row:
+        return fallback_name
+
+    access_val, folder_name, owner_id = row
+    if (access_val or "public") != "private":
+        return fallback_name
+
+    folder_name = folder_name or "Default"
+
+    # 1) Folder-specific registered subscriber name
+    _conn2, _cur2 = get_db()
+    _cur2.execute(
+        """
+        SELECT name FROM quiz_folder_subscribers
+        WHERE folder_name=? AND owner_id=? AND user_id=?
+        """,
+        (folder_name, owner_id, user_id)
+    )
+    row2 = _cur2.fetchone()
+    _conn2.close()
+    if row2 and row2[0]:
+        return row2[0]
+
+    # 2) Fallback: global subscriber table
+    _conn3, _cur3 = get_db()
+    _cur3.execute("SELECT name FROM subscribers WHERE user_id=?", (user_id,))
+    row3 = _cur3.fetchone()
+    _conn3.close()
+    if row3 and row3[0]:
+        return row3[0]
+
+    # 3) Last resort: whatever was already stored
+    return fallback_name
+
 def make_leaderboard_key(quiz_id: str, token: str) -> str:
     """
     Unique identifier for ONE posted quiz instance.
@@ -6973,6 +7027,11 @@ def build_group_quiz_text(leaderboard_key, page=0):
             GROUP_LEADERBOARDS[leaderboard_key][user_id] = {"name": name, "score": score}
             leaderboard.append({"user_id": user_id, "name": name, "score": score})
 
+    # 🔁 Resolve display names dynamically — private quizzes always show
+    # the current registered subscriber name, regardless of what was stored.
+    for entry in leaderboard:
+        entry["name"] = resolve_leaderboard_name(entry["user_id"], quiz_id, entry["name"])
+
     if not leaderboard:
         PADDING = "\u2800" * 32
         text += f"_No attempts yet_\n{PADDING}"
@@ -7836,50 +7895,9 @@ async def finish_quiz(user_id, context):
 
             if user_id not in GROUP_LEADERBOARDS[leaderboard_key]:
 
-                # ── Resolve display name ────────────────────────────────────
-                # For private quizzes, use the registered subscriber name.
-                # For public quizzes, fall back to Telegram display name.
-                display_name = play["user_name"]  # default: Telegram name
-
-                quiz_id_for_check = play.get("quiz_id", "")
-                if quiz_id_for_check:
-                    _conn_ac, _cur_ac = get_db()
-                    _cur_ac.execute(
-                        "SELECT access, folder, owner_id FROM quizzes WHERE quiz_id=?",
-                        (quiz_id_for_check,)
-                    )
-                    ac_row = _cur_ac.fetchone()
-                    _conn_ac.close()
-
-                    if ac_row and (ac_row[0] or "public") == "private":
-                        folder_name = ac_row[1] or "Default"
-                        owner_id_q  = ac_row[2]
-
-                        # Look up in quiz_folder_subscribers first
-                        _conn_sub, _cur_sub = get_db()
-                        _cur_sub.execute(
-                            """
-                            SELECT name FROM quiz_folder_subscribers
-                            WHERE folder_name=? AND owner_id=? AND user_id=?
-                            """,
-                            (folder_name, owner_id_q, user_id)
-                        )
-                        sub_row = _cur_sub.fetchone()
-                        _conn_sub.close()
-
-                        if sub_row and sub_row[0]:
-                            display_name = sub_row[0]
-                        else:
-                            # Fallback: check global subscribers table
-                            _conn_gs, _cur_gs = get_db()
-                            _cur_gs.execute(
-                                "SELECT name FROM subscribers WHERE user_id=?",
-                                (user_id,)
-                            )
-                            gs_row = _cur_gs.fetchone()
-                            _conn_gs.close()
-                            if gs_row and gs_row[0]:
-                                display_name = gs_row[0]
+                display_name = resolve_leaderboard_name(
+                    user_id, play.get("quiz_id", ""), play["user_name"]
+                )
 
                 GROUP_LEADERBOARDS[leaderboard_key][user_id] = {
                     "name":  display_name,
@@ -11681,21 +11699,27 @@ async def qa_leaderboard_show(update: Update, context: ContextTypes.DEFAULT_TYPE
     except (ValueError, IndexError):
         return
 
+    quiz_id = leaderboard_key.split(":", 1)[0]
+
     # Build leaderboard data from memory or DB
     if leaderboard_key in GROUP_LEADERBOARDS and GROUP_LEADERBOARDS[leaderboard_key]:
         leaderboard = [
-            {"name": data["name"], "score": data["score"]}
-            for data in GROUP_LEADERBOARDS[leaderboard_key].values()
+            {"user_id": uid, "name": data["name"], "score": data["score"]}
+            for uid, data in GROUP_LEADERBOARDS[leaderboard_key].items()
         ]
     else:
         _conn, _cur = get_db()
         _cur.execute(
-            "SELECT name, score FROM group_leaderboard WHERE leaderboard_key=? ORDER BY score DESC",
+            "SELECT user_id, name, score FROM group_leaderboard WHERE leaderboard_key=? ORDER BY score DESC",
             (leaderboard_key,)
         )
         rows = _cur.fetchall()
         _conn.close()
-        leaderboard = [{"name": name, "score": score} for name, score in rows]
+        leaderboard = [{"user_id": uid, "name": name, "score": score} for uid, name, score in rows]
+
+    # 🔁 Resolve display names dynamically (same logic as the group post leaderboard)
+    for entry in leaderboard:
+        entry["name"] = resolve_leaderboard_name(entry["user_id"], quiz_id, entry["name"])
 
     leaderboard.sort(key=lambda x: x["score"], reverse=True)
 
