@@ -1446,7 +1446,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=chat_id,
                     message_id=status_id,
                     text=(
-                        f"🔍 Scanning pages: *{', '.join(str(p) for p in selected_pages)}*
+                        f"🔍 Scanning pages: *{', '.join(str(p) for p in selected_pages)}*"
                     ),
                     parse_mode="Markdown"
                 )
