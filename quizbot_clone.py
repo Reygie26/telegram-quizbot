@@ -1358,8 +1358,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=chat_id,
                     message_id=status_id,
                     text=(
-                        f"✅ Scanning pages: *{', '.join(str(p) for p in selected_pages)}*\n\n"
-                        f"⏳ Starting now…"
+                        f"🔍 Scanning pages: *{', '.join(str(p) for p in selected_pages)}*"     
                     ),
                     parse_mode="Markdown"
                 )
@@ -1447,8 +1446,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=chat_id,
                     message_id=status_id,
                     text=(
-                        f"✅ Scanning pages: *{', '.join(str(p) for p in selected_pages)}*\n\n"
-                        f"⏳ Starting now…"
+                        f"🔍 Scanning pages: *{', '.join(str(p) for p in selected_pages)}*
                     ),
                     parse_mode="Markdown"
                 )
@@ -6873,7 +6871,8 @@ async def send_quiz_to_group(chat_id, quiz_id, context, token):
         f"🔀 Questions: {'ON' if sq else 'OFF'} • "
         f"Answers: {'ON' if sa else 'OFF'}\n\n"
     )
-    text += "🏆 *Leaderboard*\n— No attempts yet —"
+    PADDING = "\u2800" * 32
+    text += f"🏆 *Leaderboard*\n— No attempts yet —\n{PADDING}"
 
     keyboard = build_group_post_keyboard(quiz_id, token, leaderboard_key)
 
@@ -6948,7 +6947,8 @@ def build_group_quiz_text(leaderboard_key, page=0):
     show_score = lb_info.get("show_score", 1)
 
     if not show_score:
-        text += "🏆 *Leaderboard*\n🔒 _Score display is currently hidden by \n      the admin._\n"
+        PADDING = "\u2800" * 32
+        text += f"🏆 *Leaderboard*\n🔒 _Score display is currently hidden by \n      the admin._\n{PADDING}"
         return text, 0
 
     text += "🏆 *Leaderboard*\n"
@@ -6974,7 +6974,8 @@ def build_group_quiz_text(leaderboard_key, page=0):
             leaderboard.append({"user_id": user_id, "name": name, "score": score})
 
     if not leaderboard:
-        text += "_No attempts yet_\n"
+        PADDING = "\u2800" * 32
+        text += f"_No attempts yet_\n{PADDING}"
         return text, 0
 
     leaderboard.sort(key=lambda x: x["score"], reverse=True)
@@ -6988,9 +6989,11 @@ def build_group_quiz_text(leaderboard_key, page=0):
 
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
 
+    PADDING = "\u2800" * 32
     for i, user in enumerate(leaderboard[start:end], start=start + 1):
         prefix = medals.get(i, f"{i}.")
         text += f"{prefix} {user['name']} — {user['score']}\n"
+    text += PADDING
 
     return text, pages
 
@@ -7833,8 +7836,53 @@ async def finish_quiz(user_id, context):
 
             if user_id not in GROUP_LEADERBOARDS[leaderboard_key]:
 
+                # ── Resolve display name ────────────────────────────────────
+                # For private quizzes, use the registered subscriber name.
+                # For public quizzes, fall back to Telegram display name.
+                display_name = play["user_name"]  # default: Telegram name
+
+                quiz_id_for_check = play.get("quiz_id", "")
+                if quiz_id_for_check:
+                    _conn_ac, _cur_ac = get_db()
+                    _cur_ac.execute(
+                        "SELECT access, folder, owner_id FROM quizzes WHERE quiz_id=?",
+                        (quiz_id_for_check,)
+                    )
+                    ac_row = _cur_ac.fetchone()
+                    _conn_ac.close()
+
+                    if ac_row and (ac_row[0] or "public") == "private":
+                        folder_name = ac_row[1] or "Default"
+                        owner_id_q  = ac_row[2]
+
+                        # Look up in quiz_folder_subscribers first
+                        _conn_sub, _cur_sub = get_db()
+                        _cur_sub.execute(
+                            """
+                            SELECT name FROM quiz_folder_subscribers
+                            WHERE folder_name=? AND owner_id=? AND user_id=?
+                            """,
+                            (folder_name, owner_id_q, user_id)
+                        )
+                        sub_row = _cur_sub.fetchone()
+                        _conn_sub.close()
+
+                        if sub_row and sub_row[0]:
+                            display_name = sub_row[0]
+                        else:
+                            # Fallback: check global subscribers table
+                            _conn_gs, _cur_gs = get_db()
+                            _cur_gs.execute(
+                                "SELECT name FROM subscribers WHERE user_id=?",
+                                (user_id,)
+                            )
+                            gs_row = _cur_gs.fetchone()
+                            _conn_gs.close()
+                            if gs_row and gs_row[0]:
+                                display_name = gs_row[0]
+
                 GROUP_LEADERBOARDS[leaderboard_key][user_id] = {
-                    "name":  play["user_name"],
+                    "name":  display_name,
                     "score": score,
                 }
 
@@ -7845,7 +7893,7 @@ async def finish_quiz(user_id, context):
                             INSERT OR IGNORE INTO group_leaderboard
                             (leaderboard_key, user_id, name, score)
                             VALUES (?, ?, ?, ?)
-                        """, (leaderboard_key, user_id, play["user_name"], score))
+                        """, (leaderboard_key, user_id, display_name, score))
                         _conn.commit()
                         _conn.close()
                 except Exception as e:
@@ -13095,15 +13143,13 @@ async def doc_scan_all_pages(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if selected_pages:
         status_text = (
-            f"✅ Scanning all *{len(selected_pages)}* pages of:\n"
-            f"📄 *{escape_md(doc_name)}*\n\n"
-            f"⏳ Starting now…"
+            f"🔍 Scanning all *{len(selected_pages)}* pages of:\n"
+            f"📄 *{escape_md(doc_name)}*"
         )
     else:
         status_text = (
-            f"✅ Scanning:\n"
-            f"📄 *{escape_md(doc_name)}*\n\n"
-            f"⏳ Starting now…"
+            f"🔍 Scanning:\n"
+            f"📄 *{escape_md(doc_name)}*"
         )
 
     try:
@@ -13250,7 +13296,7 @@ async def _doc_scan_begin(chat_id: int, context):
                         f"✅ OCR mode ready!\n\n"
                         f"📄 *{escape_md(doc_name)}*\n"
                         f"📊 {len(page_images)} page(s) selected\n\n"
-                        f"⏳ Scanning now…"
+                        f"🔍 Scanning now…"
                     ),
                     parse_mode="Markdown"
                 )
@@ -13755,7 +13801,7 @@ def _build_doc_review_text(q: dict, is_duplicate: bool, dup_question: str = None
         text += "_⚠️ No choices detected. Use Edit Choices to add them._\n"
 
     if is_duplicate and dup_question and dup_answer:
-        text += f"\n\n*Duplicate Question:*\n📝 *{escape_md_soft(dup_question)}*\n\n"
+        text += f"\n\n⚠️ *Duplicate Question:*\n📝 *{escape_md_soft(dup_question)}*\n\n"
         text += f"*Answer:*\n✅ {escape_md_soft(dup_answer)}"
     return text
 
@@ -14136,7 +14182,7 @@ async def doc_scan_next_page(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     try:
         await query.message.edit_text(
-            f"⏳ Scanning page *{next_page}*"
+            f"🔍 Scanning page *{next_page}*"
             + (f" of {total_pages}" if total_pages else "")
             + f"…\n\n📄 *{escape_md(doc_name)}*\n\nPlease wait…",
             parse_mode="Markdown"
