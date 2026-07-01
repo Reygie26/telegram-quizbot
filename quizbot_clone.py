@@ -1091,25 +1091,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📂 Quiz Folder", callback_data="HOME_MY_QUIZZES"),
-            InlineKeyboardButton("➕ Create a new Quiz", callback_data="HOME_CREATE"),
-        ],
-        [
-            InlineKeyboardButton("🗄 Database", callback_data="HOME_DATABASE"),
-            InlineKeyboardButton("❓ Create a Question", callback_data="HOME_CREATE_QUESTION"),
-        ],
-        [
-            InlineKeyboardButton("👥 Manage Subscribers", callback_data="HOME_MANAGE_SUBSCRIBERS"),
+            InlineKeyboardButton("🧠 TeleQuiz", callback_data="SELECT_BOT_TELEQUIZ"),
+            InlineKeyboardButton("🎬 VideoGen", callback_data="SELECT_BOT_VIDEOGEN"),
         ]
     ])
 
     msg = await update.message.reply_text(
-        "🧠 Welcome to TeleQuiz (Bot Creator Panel)\n\nPlease choose an option to start 👇:",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
+        "Choose a Bot to Use:",
+        reply_markup=keyboard
     )
 
-    # 🔥 Track admin panel message
+    # 🔥 Track bot selector message
     context.user_data["chat_messages"].append(msg.message_id)
 
 # =========================
@@ -4963,6 +4955,23 @@ async def go_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(rows)
     )
 
+async def select_bot_telequiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = build_telequiz_admin_keyboard()
+
+    await query.message.edit_text(
+        "🧠 Welcome to TeleQuiz (Bot Creator Panel)\n\nPlease choose an option to start 👇:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+async def select_bot_videogen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await flash_message(context.bot, query.message.chat_id, "🚧 VideoGen is coming soon.")
+
 def home_button():
     return [InlineKeyboardButton("🏠 Home", callback_data="GO_HOME")]
 
@@ -4970,6 +4979,21 @@ def cancel_edit_button():
     return [
         InlineKeyboardButton("❌ Cancel", callback_data="BACK_TO_EDIT_MENU")
     ]
+
+def build_telequiz_admin_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📂 Quiz Folder", callback_data="HOME_MY_QUIZZES"),
+            InlineKeyboardButton("➕ Create a new Quiz", callback_data="HOME_CREATE"),
+        ],
+        [
+            InlineKeyboardButton("🗄 Database", callback_data="HOME_DATABASE"),
+            InlineKeyboardButton("❓ Create a Question", callback_data="HOME_CREATE_QUESTION"),
+        ],
+        [
+            InlineKeyboardButton("👥 Manage Subscribers", callback_data="HOME_MANAGE_SUBSCRIBERS"),
+        ]
+    ])
 
 async def home_create_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -14919,6 +14943,8 @@ app.add_handler(CallbackQueryHandler(back_to_quizzes, pattern="^BACK_TO_QUIZZES$
 app.add_handler(CallbackQueryHandler(delete_folder, pattern="^DELETE_FOLDER\\|"))
 app.add_handler(CallbackQueryHandler(delete_quiz, pattern="^DELETE_QUIZ$"))
 app.add_handler(CallbackQueryHandler(go_home, pattern="^GO_HOME$"))
+app.add_handler(CallbackQueryHandler(select_bot_telequiz, pattern="^SELECT_BOT_TELEQUIZ$"))
+app.add_handler(CallbackQueryHandler(select_bot_videogen, pattern="^SELECT_BOT_VIDEOGEN$"))
 app.add_handler(CallbackQueryHandler(home_create_quiz, pattern="^HOME_CREATE$"))
 app.add_handler(CallbackQueryHandler(home_my_quizzes, pattern="^HOME_MY_QUIZZES$"))
 app.add_handler(CallbackQueryHandler(qfs_menu,             pattern=r"^QFS_MENU\|"))
