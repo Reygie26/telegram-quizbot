@@ -1018,71 +1018,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_type in ("group", "supergroup", "channel"):
         return
 
-    # 🔒 Private chat but NOT owner — check subscriber access
-    if user_id != OWNER_USER_ID:
-        if not is_authorized(user_id):
-            msg = await update.message.reply_text(
-                "👋 Hi!\n\nYou don't have Admin access to this Bot yet. To begin, open a Quiz posted in a group and start answering or avail Admin access.\n\nTo avail of Admin access, please contact the Bot creator on Telegram:\nReygie Marimon Gorgonio\nContact No. : 0928 180 2793\nTelegram      : @Eucresia\n\nTeleQuiz Bot Official links\nChannel : https://t.me/Bot_TeleQuiz\nGroup    : https://t.me/+pbioRS0BWN4wZjM9\n\nYou can also DM the Official Channel to avail Admin Access to the Bot"
-            )
-            context.user_data.setdefault("chat_messages", []).append(msg.message_id)
-            return
-        # ✅ Authorized subscriber — show admin panel
-        context.user_data.clear()
-        context.user_data["active_user_id"] = user_id
-        context.user_data["chat_messages"] = []
-        if update.message:
-            context.user_data["chat_messages"].append(update.message.message_id)
-
-        # 🔔 Check if this subscriber needs to see the first-access notice
-        _conn_n, _cur_n = get_db()
-        _cur_n.execute(
-            "SELECT needs_notice FROM subscribers WHERE user_id=?",
-            (user_id,)
-        )
-        notice_row = _cur_n.fetchone()
-        _conn_n.close()
-        needs_notice = notice_row and notice_row[0] == 1
-
-        if needs_notice:
-            notice_keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ I Agree", callback_data="SUB_AGREE_NOTICE")]
-            ])
-            msg = await update.message.reply_text(
-                "🧠 **Welcome to TeleQuiz (Admin Panel)**\n\n"
-                "⚠️ *Important Notice*\n\n"
-                "All folders, quizzes, and questions you create are tied to your subscription. "
-                "If your subscription becomes inactive and is not renewed within 1 year, "
-                "all your data will be permanently and automatically deleted.\n\n"
-                "Please tap I Agree to continue.",
-                reply_markup=notice_keyboard,
-                parse_mode="Markdown"
-            )
-            context.user_data["chat_messages"].append(msg.message_id)
-            return
-
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📂 Quiz Folder", callback_data="HOME_MY_QUIZZES"),
-                InlineKeyboardButton("➕ Create a new Quiz", callback_data="HOME_CREATE"),
-            ],
-            [
-                InlineKeyboardButton("🗄 Database", callback_data="HOME_DATABASE"),
-                InlineKeyboardButton("❓ Create a Question", callback_data="HOME_CREATE_QUESTION"),
-            ],
-        ])
-
-        msg = await update.message.reply_text(
-            "🧠 Welcome to TeleQuiz (Admin Panel)\n\nPlease choose an option to start 👇:",
-            reply_markup=keyboard,
-            parse_mode="Markdown"
-        )
-        context.user_data["chat_messages"].append(msg.message_id)
-        return
-
-    # ✅ OWNER — show admin home
-    # 🔒 HARD RESET: entering admin mode must clear play state
+    # 🔒 HARD RESET: entering the bot selector must clear old state.
+    # Auth checks (owner / subscriber / unauthorized) now happen AFTER
+    # the person taps a specific bot button, not here.
     context.user_data.clear()
-    context.user_data["active_user_id"] = user_id
     context.user_data["chat_messages"] = []
 
     # 🔥 Track /start again after reset
@@ -4958,6 +4897,70 @@ async def go_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def select_bot_telequiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    user_id = query.from_user.id
+
+    # 🔒 Non-owner: verify subscriber access
+    if user_id != OWNER_USER_ID:
+        if not is_authorized(user_id):
+            await query.message.edit_text(
+                "👋 Hi!\n\nYou don't have Admin access to this Bot yet. To begin, open a Quiz posted in a group and start answering or avail Admin access.\n\nTo avail of Admin access, please contact the Bot creator on Telegram:\nReygie Marimon Gorgonio\nContact No. : 0928 180 2793\nTelegram      : @Eucresia\n\nTeleQuiz Bot Official links\nChannel : https://t.me/Bot_TeleQuiz\nGroup    : https://t.me/+pbioRS0BWN4wZjM9\n\nYou can also DM the Official Channel to avail Admin Access to the Bot"
+            )
+            return
+
+        # ✅ Authorized subscriber — show admin panel
+        context.user_data.clear()
+        context.user_data["active_user_id"] = user_id
+        context.user_data["chat_messages"] = [query.message.message_id]
+
+        # 🔔 Check if this subscriber needs to see the first-access notice
+        _conn_n, _cur_n = get_db()
+        _cur_n.execute(
+            "SELECT needs_notice FROM subscribers WHERE user_id=?",
+            (user_id,)
+        )
+        notice_row = _cur_n.fetchone()
+        _conn_n.close()
+        needs_notice = notice_row and notice_row[0] == 1
+
+        if needs_notice:
+            notice_keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ I Agree", callback_data="SUB_AGREE_NOTICE")]
+            ])
+            await query.message.edit_text(
+                "🧠 **Welcome to TeleQuiz (Admin Panel)**\n\n"
+                "⚠️ *Important Notice*\n\n"
+                "All folders, quizzes, and questions you create are tied to your subscription. "
+                "If your subscription becomes inactive and is not renewed within 1 year, "
+                "all your data will be permanently and automatically deleted.\n\n"
+                "Please tap I Agree to continue.",
+                reply_markup=notice_keyboard,
+                parse_mode="Markdown"
+            )
+            return
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📂 Quiz Folder", callback_data="HOME_MY_QUIZZES"),
+                InlineKeyboardButton("➕ Create a new Quiz", callback_data="HOME_CREATE"),
+            ],
+            [
+                InlineKeyboardButton("🗄 Database", callback_data="HOME_DATABASE"),
+                InlineKeyboardButton("❓ Create a Question", callback_data="HOME_CREATE_QUESTION"),
+            ],
+        ])
+
+        await query.message.edit_text(
+            "🧠 Welcome to TeleQuiz (Admin Panel)\n\nPlease choose an option to start 👇:",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+        return
+
+    # ✅ OWNER — show admin home
+    context.user_data.clear()
+    context.user_data["active_user_id"] = user_id
+    context.user_data["chat_messages"] = [query.message.message_id]
 
     keyboard = build_telequiz_admin_keyboard()
 
