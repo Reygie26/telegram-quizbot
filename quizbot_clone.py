@@ -7075,7 +7075,7 @@ def build_group_quiz_text(leaderboard_key, page=0):
 
     if not show_score:
         PADDING = "\u2800" * 32
-        text += f"🏆 *Leaderboard*\n🔒 _Score display is currently hidden by the admin._\n{PADDING}"
+        text += f"🏆 *Leaderboard*\n🔒 _Score display is currently hidden by the\n        quiz admin._{PADDING}"
         return text, 0
 
     text += "🏆 *Leaderboard*\n"
