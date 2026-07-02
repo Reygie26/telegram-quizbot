@@ -4904,7 +4904,7 @@ async def select_bot_telequiz(update: Update, context: ContextTypes.DEFAULT_TYPE
     if user_id != OWNER_USER_ID:
         if not is_authorized(user_id):
             await query.message.edit_text(
-                "👋 Hi!\n\nYou don't have Admin access to this Bot yet. To begin, open a Quiz posted in a group and start answering or avail Admin access.\n\nTo avail of Admin access, please contact the Bot creator on Telegram:\nReygie Marimon Gorgonio\nContact No. : 0928 180 2793\nTelegram      : @Eucresia\n\nTeleQuiz Bot Official links\nChannel : https://t.me/Bot_TeleQuiz\nGroup    : https://t.me/+pbioRS0BWN4wZjM9\n\nYou can also DM the Official Channel to avail Admin Access to the Bot"
+                "👋 Hi!\n\nYou don't have Admin access to this Bot yet. To begin, open a Quiz posted in a group and start answering or avail Admin access.\n\nTo avail of Admin access, please contact the Bot creator on Telegram:\nReygie Marimon Gorgonio\nContact No. : 0928 180 2793\nTelegram      : @Eucresia\n\nTeleQuiz Bot Official links\nChannel : https://t.me/Bot_TeleQuiz\nGroup    : https://t.me/+nMVAW7Iif8M3NWU1\n\nYou can also DM the Official Channel to avail Admin Access to the Bot"
             )
             return
 
@@ -6357,6 +6357,41 @@ def build_group_message_link(chat_id: int, message_id: int) -> str:
     # (Telegram does NOT support numeric IDs here)
     return None
 
+def _get_live_correct_display_index(qid, orig_map, fallback_correct):
+    """
+    Re-fetches the current correct-answer index from the database at
+    answer-validation time, then maps it through the player's shuffled
+    display order so the option marked ✅ always matches what's stored
+    in question_bank right now — never a stale in-memory snapshot.
+    """
+    try:
+        _conn, _cur = get_db()
+        _cur.execute("SELECT correct, options FROM question_bank WHERE id=?", (qid,))
+        row = _cur.fetchone()
+        _conn.close()
+    except Exception as e:
+        print(f"⚠️ Live correct-answer lookup failed for question {qid}: {e}")
+        return fallback_correct
+
+    if not row:
+        return fallback_correct
+
+    db_correct, db_options_str = row
+    db_option_count = len(db_options_str.split("||")) if db_options_str else 0
+
+    # Safety: if the option count no longer matches what was displayed
+    # (e.g. options were edited after this session started), fall back
+    # rather than risk mapping onto a nonexistent position.
+    if db_correct is None or db_correct < 0 or db_correct >= db_option_count:
+        return fallback_correct
+    if db_option_count != len(orig_map):
+        return fallback_correct
+
+    try:
+        return orig_map.index(db_correct)
+    except ValueError:
+        return fallback_correct
+
 async def play_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     try:
@@ -6374,7 +6409,12 @@ async def play_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 📌 Parse answer
     chosen_index = int(query.data.replace("PLAY_ANSWER_", ""))
     q = play["questions"][play["index"]]
-    correct_index = q["correct"]
+
+    # 🔑 Always validate against the CURRENT database value, not the
+    # snapshot taken when this player started the quiz.
+    correct_index = _get_live_correct_display_index(
+        q["id"], q.get("orig_map", list(range(len(q["options"])))), q["correct"]
+    )
 
     # 🎨 Build feedback buttons instantly
     labels = ["A", "B", "C", "D"]
@@ -6540,7 +6580,7 @@ async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "Telegram    : @Eucresia\n\n"
                         "TeleQuiz Bot Official links\n"
                         "Channel : https://t.me/Bot_TeleQuiz\n"
-                        "Group    : https://t.me/+pbioRS0BWN4wZjM9\n"
+                        "Group    : https://t.me/+nMVAW7Iif8M3NWU1\n"
                     ),
                 )
                 return
@@ -6552,14 +6592,18 @@ async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
             indexed = list(enumerate(opts))
             random.shuffle(indexed)
             opts = [o for _, o in indexed]
+            orig_map = [old_i for old_i, _ in indexed]
             correct = [i for i, (old_i, _) in enumerate(indexed) if old_i == correct][0]
+        else:
+            orig_map = list(range(len(opts)))
         questions.append({
             "id": qid,
             "text": text,
             "image": image,
             "options": opts,
             "correct": correct,
-            "explanation": explanation
+            "explanation": explanation,
+            "orig_map": orig_map
         })
 
     if shuffle_q:
@@ -6784,7 +6828,9 @@ async def countdown_timer(user_id, context, seconds, play):
             return
 
         q = play["questions"][play["index"]]
-        correct_index = q["correct"]
+        correct_index = _get_live_correct_display_index(
+            q["id"], q.get("orig_map", list(range(len(q["options"])))), q["correct"]
+        )
         labels = ["A", "B", "C", "D"]
 
         # ⏱ SKIPPED CASE — show correct/incorrect marks
@@ -7029,7 +7075,7 @@ def build_group_quiz_text(leaderboard_key, page=0):
 
     if not show_score:
         PADDING = "\u2800" * 32
-        text += f"🏆 *Leaderboard*\n🔒 _Score display is currently hidden by \n      the admin._\n{PADDING}"
+        text += f"🏆 *Leaderboard*\n🔒 _Score display is currently hidden by the admin._\n{PADDING}"
         return text, 0
 
     text += "🏆 *Leaderboard*\n"
