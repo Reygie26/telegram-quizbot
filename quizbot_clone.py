@@ -2971,6 +2971,100 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["qfs_prompt_id"] = msg.message_id
         return
 
+    # ================= QFS: RENAME SUBSCRIBER =================
+    if state == "QFS_RENAME_WAIT_NAME":
+        chat_id     = update.effective_chat.id
+        user_msg_id = update.message.message_id
+        target_id   = context.user_data.get("qfs_rename_id")
+        folder      = context.user_data.get("qfs_rename_folder", "")
+        view_msg_id = context.user_data.get("qfs_rename_view_msg_id")
+        active_uid  = get_active_user_id(context)
+        new_name    = text.strip()
+
+        if not target_id:
+            context.user_data.pop("state", None)
+            return
+
+        if not new_name:
+            err = await update.message.reply_text("❌ Name cannot be empty. Please send a name:")
+            await asyncio.sleep(2)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, user_msg_id),
+                return_exceptions=True
+            )
+            return
+
+        if len(new_name) > MAX_TITLE_LENGTH:
+            err = await update.message.reply_text(
+                f"❌ Name is too long ({len(new_name)} characters).\n"
+                f"Maximum allowed: {MAX_TITLE_LENGTH} characters.\n\nPlease shorten and send again."
+            )
+            await asyncio.sleep(4)
+            await asyncio.gather(
+                context.bot.delete_message(chat_id, err.message_id),
+                context.bot.delete_message(chat_id, user_msg_id),
+                return_exceptions=True
+            )
+            return
+
+        try:
+            async with DB_LOCK:
+                _conn, _cur = get_db()
+                _cur.execute(
+                    """
+                    UPDATE quiz_folder_subscribers
+                    SET name=?
+                    WHERE folder_name=? AND owner_id=? AND user_id=?
+                    """,
+                    (new_name, folder, active_uid, target_id)
+                )
+                _conn.commit()
+                _conn.close()
+        except Exception as e:
+            print("⚠️ QFS rename failed:", e)
+            await flash_message(context.bot, chat_id, "❌ Rename failed.")
+            return
+
+        # 🧹 Cleanup prompt + user's typed message
+        prompt_id = context.user_data.pop("qfs_rename_prompt_id", None)
+        if prompt_id:
+            try:
+                await context.bot.delete_message(chat_id, prompt_id)
+            except:
+                pass
+        try:
+            await context.bot.delete_message(chat_id, user_msg_id)
+        except:
+            pass
+
+        context.user_data.pop("state", None)
+        context.user_data.pop("qfs_rename_id", None)
+        context.user_data.pop("qfs_rename_folder", None)
+        context.user_data.pop("qfs_rename_view_msg_id", None)
+
+        await flash_message(context.bot, chat_id, f"✅ Subscriber renamed to {new_name}.", delay=2)
+
+        # 🔄 Push the updated name into any already-posted group leaderboards
+        # for quizzes in this folder (private quizzes resolve names live via
+        # resolve_leaderboard_name, so the DB update alone is enough — this
+        # just forces already-posted messages to repaint immediately).
+        _conn2, _cur2 = get_db()
+        _cur2.execute(
+            "SELECT quiz_id FROM quizzes WHERE owner_id=? AND folder=?",
+            (active_uid, folder)
+        )
+        quiz_ids = [r[0] for r in _cur2.fetchall()]
+        _conn2.close()
+        for qid in quiz_ids:
+            asyncio.create_task(refresh_all_group_posts_for_quiz(qid, context))
+
+        # 🔁 Redraw the subscriber overview with the updated name
+        if view_msg_id:
+            await _render_qfs_subscriber_view(chat_id, view_msg_id, context, target_id, folder)
+
+        return
+
     # SUB_WAIT_USER_ID
     if state == "SUB_WAIT_USER_ID":
         chat_id = update.effective_chat.id
@@ -3861,12 +3955,12 @@ async def qfs_list_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _show_qfs_list(query.message, context, folder, mode, page)
 
 
-async def qfs_view_subscriber(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    target_id  = int(query.data.split("|", 1)[1])
-    folder     = context.user_data.get("qfs_folder", "")
+async def _render_qfs_subscriber_view(chat_id, message_id, context, target_id, folder):
+    """
+    Builds and edits the subscriber overview screen (name, dates, remaining
+    time, action buttons). Shared by qfs_view_subscriber and the post-rename
+    refresh so both stay perfectly in sync.
+    """
     active_uid = get_active_user_id(context)
     now        = int(time.time())
 
@@ -3883,7 +3977,6 @@ async def qfs_view_subscriber(update: Update, context: ContextTypes.DEFAULT_TYPE
     _conn.close()
 
     if not row:
-        await query.answer("❌ Subscriber not found.", show_alert=True)
         return
 
     name, sub_type, expires_at, subscribed_at = row
@@ -3929,12 +4022,99 @@ async def qfs_view_subscriber(update: Update, context: ContextTypes.DEFAULT_TYPE
     keyboard = InlineKeyboardMarkup([
         [
             action_button,
-            InlineKeyboardButton("🔄 Renew", callback_data=f"QFS_RENEW|{target_id}"),
-            InlineKeyboardButton("⬅️ Back",  callback_data=f"QFS_LIST|{folder}|{mode}"),
-        ]
+            InlineKeyboardButton("🔄 Renew",  callback_data=f"QFS_RENEW|{target_id}"),
+            InlineKeyboardButton("✏️ Rename", callback_data=f"QFS_RENAME|{target_id}"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Back", callback_data=f"QFS_LIST|{folder}|{mode}"),
+        ],
     ])
 
-    await query.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print("⚠️ Failed to render QFS subscriber view:", e)
+
+
+async def qfs_view_subscriber(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    target_id = int(query.data.split("|", 1)[1])
+    folder    = context.user_data.get("qfs_folder", "")
+
+    await _render_qfs_subscriber_view(
+        query.message.chat_id, query.message.message_id, context, target_id, folder
+    )
+
+async def qfs_rename_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    target_id  = int(query.data.split("|", 1)[1])
+    folder     = context.user_data.get("qfs_folder", "")
+    active_uid = get_active_user_id(context)
+
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT name FROM quiz_folder_subscribers WHERE folder_name=? AND owner_id=? AND user_id=?",
+        (folder, active_uid, target_id)
+    )
+    row = _cur.fetchone()
+    _conn.close()
+
+    if not row:
+        await query.answer("❌ Subscriber not found.", show_alert=True)
+        return
+
+    current_name = row[0]
+
+    context.user_data["state"]                 = "QFS_RENAME_WAIT_NAME"
+    context.user_data["qfs_rename_id"]          = target_id
+    context.user_data["qfs_rename_folder"]      = folder
+    context.user_data["qfs_rename_view_msg_id"] = query.message.message_id
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"QFS_RENAME_CANCEL|{target_id}")]
+    ])
+
+    msg = await query.message.reply_text(
+        f"✏️ *Rename Subscriber*\n\n"
+        f"Current name: *{escape_md(current_name)}*\n\n"
+        f"📝 Send the new name:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    context.user_data["qfs_rename_prompt_id"] = msg.message_id
+
+
+async def qfs_rename_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id   = query.message.chat_id
+    target_id = int(query.data.split("|", 1)[1])
+    folder    = context.user_data.get("qfs_rename_folder") or context.user_data.get("qfs_folder", "")
+
+    try:
+        await query.message.delete()
+    except:
+        pass
+
+    context.user_data.pop("state", None)
+    context.user_data.pop("qfs_rename_id", None)
+    context.user_data.pop("qfs_rename_folder", None)
+    context.user_data.pop("qfs_rename_prompt_id", None)
+    view_msg_id = context.user_data.pop("qfs_rename_view_msg_id", None)
+
+    if view_msg_id:
+        await _render_qfs_subscriber_view(chat_id, view_msg_id, context, target_id, folder)
 
 async def qfs_apply_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -15038,6 +15218,8 @@ app.add_handler(CallbackQueryHandler(qfs_list_next,        pattern=r"^QFS_LIST_N
 app.add_handler(CallbackQueryHandler(qfs_view_subscriber,  pattern=r"^QFS_VIEW\|"))
 app.add_handler(CallbackQueryHandler(qfs_apply_duration,   pattern=r"^QFS_DURATION\|"))
 app.add_handler(CallbackQueryHandler(qfs_renew_subscriber, pattern=r"^QFS_RENEW\|"))
+app.add_handler(CallbackQueryHandler(qfs_rename_start,  pattern=r"^QFS_RENAME\|"))
+app.add_handler(CallbackQueryHandler(qfs_rename_cancel, pattern=r"^QFS_RENAME_CANCEL\|"))
 app.add_handler(CallbackQueryHandler(qfs_revoke_subscriber,pattern=r"^QFS_REVOKE\|"))
 app.add_handler(CallbackQueryHandler(qfs_remove_subscriber,pattern=r"^QFS_REMOVE\|"))
 app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^QFS_LIST_NOP$"))
