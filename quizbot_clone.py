@@ -6721,7 +6721,7 @@ async def send_next_question(user_id, context):
     PADDING = "\u2800" * 60
     question_text = (
         f"[{index+1}/{total}] 🧠 {q['text']}\n\n"
-        f"{options_text}\n{PADDING}"
+        f"{options_text}{PADDING}"
     )
 
     keyboard = [[
@@ -6999,7 +6999,7 @@ async def send_quiz_to_group(chat_id, quiz_id, context, token):
         f"Answers: {'ON' if sa else 'OFF'}\n\n"
     )
     PADDING = "\u2800" * 32
-    text += f"🏆 *Leaderboard*\n— No attempts yet —\n{PADDING}"
+    text += f"🏆 *Leaderboard*\n— No attempts yet —{PADDING}"
 
     keyboard = build_group_post_keyboard(quiz_id, token, leaderboard_key)
 
@@ -7059,6 +7059,8 @@ def build_group_quiz_text(leaderboard_key, page=0):
     total_questions = _cur2.fetchone()[0]
     _conn2.close()
 
+    PADDING = "\u2800" * 32
+
     text = f"📘 *{escape_md(title)}*\n"
     if desc:
         text += f"📝 _{escape_md(desc)}_\n"
@@ -7074,7 +7076,10 @@ def build_group_quiz_text(leaderboard_key, page=0):
     show_score = lb_info.get("show_score", 1)
 
     if not show_score:
-        text += f"🏆 *Leaderboard*\n🔒 _Score display is currently hidden._"
+        # 🔧 Padding attached directly to the last visible line (no \n
+        # before it) so it widens the message for the buttons without
+        # creating its own blank-looking row.
+        text += f"🏆 *Leaderboard*\n🔒 _Score display is currently hidden._{PADDING}"
         return text, 0
 
     text += "🏆 *Leaderboard*\n"
@@ -7105,8 +7110,8 @@ def build_group_quiz_text(leaderboard_key, page=0):
         entry["name"] = resolve_leaderboard_name(entry["user_id"], quiz_id, entry["name"])
 
     if not leaderboard:
-        PADDING = "\u2800" * 32
-        text += f"_No attempts yet_\n{PADDING}"
+        # 🔧 Same fix — padding attached to the same line, no new row.
+        text += f"_No attempts yet_{PADDING}"
         return text, 0
 
     leaderboard.sort(key=lambda x: x["score"], reverse=True)
@@ -7120,10 +7125,15 @@ def build_group_quiz_text(leaderboard_key, page=0):
 
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
 
-    PADDING = "\u2800" * 32
     for i, user in enumerate(leaderboard[start:end], start=start + 1):
         prefix = medals.get(i, f"{i}.")
         text += f"{prefix} {user['name']} — {user['score']}\n"
+
+    # 🔧 Strip the trailing newline left by the loop's last entry, then
+    # attach padding directly — extends the last score row's width
+    # instead of creating a new blank row below it.
+    if text.endswith("\n"):
+        text = text[:-1]
     text += PADDING
 
     return text, pages
