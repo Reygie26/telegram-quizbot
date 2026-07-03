@@ -6898,10 +6898,10 @@ async def send_next_question(user_id, context):
         for i, opt in enumerate(q["options"])
     )
 
-    PADDING = "\u2800" * 60
+    PADDING = "\u2800" * 32
     question_text = (
-        f"[{index+1}/{total}] 🧠 {q['text']}\n\n"
-        f"{options_text}{PADDING}"
+        f"[{index+1}/{total}] 🧠 {q['text']}{PADDING}\n"
+        f"{options_text}"
     )
 
     keyboard = [[
