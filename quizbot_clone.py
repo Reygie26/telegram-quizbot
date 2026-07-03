@@ -7079,7 +7079,7 @@ def build_group_quiz_text(leaderboard_key, page=0):
         # 🔧 Padding attached directly to the last visible line (no \n
         # before it) so it widens the message for the buttons without
         # creating its own blank-looking row.
-        text += f"🏆 *Leaderboard*\n🔒 _Score display is currently hidden._{PADDING}"
+        text += f"🏆 *Leaderboard*\n🔒 _Score display is currently hidden._"
         return text, 0
 
     text += "🏆 *Leaderboard*\n"
