@@ -4633,7 +4633,7 @@ async def show_quiz_action_menu(message, context):
     text += f"\n{access_badge}"
     text += "\n\n"
     text += f"📊 Questions: {total_questions}    ⏱ Timer: {timer}s"
-    text += f"\n🔀 Shuffle Q / O : {'ON' if sq else 'OFF'} / {'ON' if sa else 'OFF'}"
+    text += f"\n🔀 Shuffle Questions & Opts: {'ON' if sq else 'OFF'} & {'ON' if sa else 'OFF'}"
 
 
     keyboard = [
@@ -4711,7 +4711,7 @@ async def edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + f"\n{access_badge}"
         + "\n\n"
         + f"📊 Questions: {total_questions}    ⏱ Timer: {timer}s"
-        + f"\n🔀 Shuffle Q / O : {'ON' if sq else 'OFF'} / {'ON' if sa else 'OFF'}"
+        + f"\n🔀 Shuffle Questions & Opts: {'ON' if sq else 'OFF'} & {'ON' if sa else 'OFF'}"
     )
 
     keyboard = [
@@ -7176,7 +7176,7 @@ async def send_quiz_to_group(chat_id, quiz_id, context, token):
     text += f"{access_badge}\n"
     text += "\n"
     text += f"🧠 *{total_questions} Questions* • ⏱ *{timer}s*\n"
-    text += f"🔀 Shuffle Q / O : {'ON' if sq else 'OFF'} / {'ON' if sa else 'OFF'}\n\n"
+    text += f"🔀 Shuffle Questions & Opts: {'ON' if sq else 'OFF'} & {'ON' if sa else 'OFF'}\n\n"
     PADDING = "\u2800" * 32
     text += f"🏆 *Leaderboard*\n— No attempts yet —{PADDING}"
 
@@ -7246,7 +7246,7 @@ def build_group_quiz_text(leaderboard_key, page=0):
     text += f"{access_badge}\n"
     text += "\n"
     text += f"🧠 *{total_questions} Questions* • ⏱ *{timer}s*\n"
-    text += f"🔀 Shuffle Q / O : {'ON' if sq else 'OFF'} / {'ON' if sa else 'OFF'}\n\n"
+    text += f"🔀 Shuffle Questions & Opts: {'ON' if sq else 'OFF'} & {'ON' if sa else 'OFF'}\n\n"
     # Check if leaderboard is hidden by admin
     lb_info = GROUP_LB_MESSAGES.get(leaderboard_key, {})
     show_score = lb_info.get("show_score", 1)
@@ -9953,7 +9953,7 @@ async def show_quiz_action_menu_by_id(chat_id, message_id, context):
     text += f"\n{access_badge}"
     text += "\n\n"
     text += f"📊 Questions: {total_questions}    ⏱ Timer: {timer}s"
-    text += f"\n🔀 Shuffle Q / O : {'ON' if sq else 'OFF'} / {'ON' if sa else 'OFF'}"
+    text += f"\n🔀 Shuffle Questions & Opts: {'ON' if sq else 'OFF'} & {'ON' if sa else 'OFF'}"
 
     keyboard = [
         [
@@ -11992,7 +11992,7 @@ def _build_qa_panel_text(quiz_id: str) -> str:
         text += f"\n📝 _{escape_md(desc)}_"
     text += f"\n{access_badge}"
     text += f"\n\n📊 Questions: {total_questions}    ⏱ Timer: {timer}s"
-    text += f"\n🔀 Shuffle Q / O : {'ON' if sq else 'OFF'} / {'ON' if sa else 'OFF'}"
+    text += f"\n🔀 Shuffle Questions & Opts: {'ON' if sq else 'OFF'} & {'ON' if sa else 'OFF'}"
     return text
 
 def _build_qa_panel_keyboard(leaderboard_key: str, show_score: int) -> InlineKeyboardMarkup:
