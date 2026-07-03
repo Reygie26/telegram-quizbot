@@ -7074,7 +7074,7 @@ def build_group_quiz_text(leaderboard_key, page=0):
     show_score = lb_info.get("show_score", 1)
 
     if not show_score:
-        text += f"🏆 *Leaderboard*\n🔒 _Score display is currently hidden."
+        text += f"🏆 *Leaderboard*\n🔒 _Score display is currently hidden._"
         return text, 0
 
     text += "🏆 *Leaderboard*\n"
@@ -7224,39 +7224,64 @@ async def refresh_all_group_posts_for_quiz(quiz_id: str, context):
 
         keyboard = build_group_post_keyboard(quiz_id, token, leaderboard_key, pages=pages, page=page)
 
-        try:
-            if inline_message_id:
-                await context.bot.edit_message_text(
-                    inline_message_id=inline_message_id,
-                    text=text,
-                    reply_markup=keyboard,
-                    parse_mode="Markdown"
-                )
-            else:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=text,
-                    reply_markup=keyboard,
-                    parse_mode="Markdown"
-                )
-        except Exception as e:
-            error_text = str(e).lower()
-            if "message is not modified" in error_text:
-                pass
-            elif "message to edit not found" in error_text:
-                print(f"🧹 Cleaning deleted post: {leaderboard_key}")
-                async with DB_LOCK:
-                    _conn2, _cur2 = get_db()
-                    _cur2.execute(
-                        "DELETE FROM group_lb_messages WHERE leaderboard_key=?",
-                        (leaderboard_key,)
+        # 🔁 Retry up to 3× on flood control / transient network errors so a
+        # burst of edits (many quizzes refreshed back-to-back via /refresh)
+        # doesn't silently skip posts that happened to get rate-limited.
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if inline_message_id:
+                    await context.bot.edit_message_text(
+                        inline_message_id=inline_message_id,
+                        text=text,
+                        reply_markup=keyboard,
+                        parse_mode="Markdown"
                     )
-                    _conn2.commit()
-                    _conn2.close()
-                GROUP_LB_MESSAGES.pop(leaderboard_key, None)
-            else:
-                print(f"⚠️ Failed to refresh group post {leaderboard_key}:", e)
+                else:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                        reply_markup=keyboard,
+                        parse_mode="Markdown"
+                    )
+                break  # ✅ success — stop retrying this post
+
+            except RetryAfter as e:
+                wait_time = float(getattr(e, "retry_after", 1)) + 0.5
+                print(f"⏳ Flood control on {leaderboard_key}, waiting {wait_time}s "
+                      f"(attempt {attempt}/{max_attempts})")
+                await asyncio.sleep(wait_time)
+                continue
+
+            except (TimedOut, NetworkError) as e:
+                print(f"⚠️ Network error refreshing {leaderboard_key} "
+                      f"(attempt {attempt}/{max_attempts}): {e}")
+                await asyncio.sleep(1.5 * attempt)
+                continue
+
+            except Exception as e:
+                error_text = str(e).lower()
+                if "message is not modified" in error_text:
+                    pass
+                elif "message to edit not found" in error_text:
+                    print(f"🧹 Cleaning deleted post: {leaderboard_key}")
+                    async with DB_LOCK:
+                        _conn2, _cur2 = get_db()
+                        _cur2.execute(
+                            "DELETE FROM group_lb_messages WHERE leaderboard_key=?",
+                            (leaderboard_key,)
+                        )
+                        _conn2.commit()
+                        _conn2.close()
+                    GROUP_LB_MESSAGES.pop(leaderboard_key, None)
+                else:
+                    print(f"⚠️ Failed to refresh group post {leaderboard_key}:", e)
+                break  # ❌ non-retryable error — stop trying this post
+
+        # 🐢 Small pacing delay between edits so a big batch of posts doesn't
+        # trip Telegram's per-chat rate limit in the first place.
+        await asyncio.sleep(0.1)
 
 async def post_quiz_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
