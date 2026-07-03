@@ -7175,10 +7175,10 @@ async def send_quiz_to_group(chat_id, quiz_id, context, token):
         text += f"📝 _{escape_md(desc)}_\n"
     text += f"{access_badge}\n"
     text += "\n"
-    text += f"🧠 *{total_questions} Questions* • ⏱ *{timer}s*\n"
-    text += f"🔀 Shuffle Questions & Opts: {'ON' if sq else 'OFF'} & {'ON' if sa else 'OFF'}\n\n"
     PADDING = "\u2800" * 32
-    text += f"🏆 *Leaderboard*\n— No attempts yet —{PADDING}"
+    text += f"🧠 *{total_questions} Questions* • ⏱ *{timer}s*\n"
+    text += f"🔀 Shuffle Questions & Opts: {'ON' if sq else 'OFF'} & {'ON' if sa else 'OFF'} {PADDING}\n"
+    text += f"🏆 *Leaderboard*\n— No attempts yet —"
 
     keyboard = build_group_post_keyboard(quiz_id, token, leaderboard_key)
 
@@ -7239,14 +7239,13 @@ def build_group_quiz_text(leaderboard_key, page=0):
     _conn2.close()
 
     PADDING = "\u2800" * 32
-
     text = f"📘 *{escape_md(title)}*\n"
     if desc:
         text += f"📝 _{escape_md(desc)}_\n"
     text += f"{access_badge}\n"
     text += "\n"
     text += f"🧠 *{total_questions} Questions* • ⏱ *{timer}s*\n"
-    text += f"🔀 Shuffle Questions & Opts: {'ON' if sq else 'OFF'} & {'ON' if sa else 'OFF'}\n\n"
+    text += f"🔀 Shuffle Questions & Opts: {'ON' if sq else 'OFF'} & {'ON' if sa else 'OFF'} {PADDING}\n\n"
     # Check if leaderboard is hidden by admin
     lb_info = GROUP_LB_MESSAGES.get(leaderboard_key, {})
     show_score = lb_info.get("show_score", 1)
@@ -7286,8 +7285,7 @@ def build_group_quiz_text(leaderboard_key, page=0):
         entry["name"] = resolve_leaderboard_name(entry["user_id"], quiz_id, entry["name"])
 
     if not leaderboard:
-        # 🔧 Same fix — padding attached to the same line, no new row.
-        text += f"_No attempts yet_{PADDING}"
+        text += "_No attempts yet_"
         return text, 0
 
     leaderboard.sort(key=lambda x: x["score"], reverse=True)
@@ -7305,12 +7303,8 @@ def build_group_quiz_text(leaderboard_key, page=0):
         prefix = medals.get(i, f"{i}.")
         text += f"{prefix} {user['name']} — {user['score']}\n"
 
-    # 🔧 Strip the trailing newline left by the loop's last entry, then
-    # attach padding directly — extends the last score row's width
-    # instead of creating a new blank row below it.
     if text.endswith("\n"):
         text = text[:-1]
-    text += PADDING
 
     return text, pages
 
