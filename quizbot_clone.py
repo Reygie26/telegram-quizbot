@@ -582,14 +582,9 @@ ONE_YEAR_SECONDS = 365 * 24 * 3600  # 1-year token validity
 # DATABASE
 # =========================
 def get_db():
-    """
-    Returns a fresh (conn, cur) pair for each call.
-    SQLite allows multiple connections to the same file.
-    Using per-operation connections eliminates shared-cursor
-    data corruption in async code.
-    """
-    connection = sqlite3.connect(DB_FILE, check_same_thread=False)
+    connection = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=10)
     connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA busy_timeout=8000")
     cursor = connection.cursor()
     return connection, cursor
 
@@ -1017,6 +1012,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ❌ Block /start inside groups & channels
     if chat_type in ("group", "supergroup", "channel"):
         return
+
+    # 💾 Salvage score if the person is escaping a frozen/abandoned quiz
+    # (same anti-abuse threshold as the Stop Quiz button — 3+ answered).
+    existing_play = context.user_data.get("play")
+    if existing_play and existing_play.get("index", 0) >= 3 and not existing_play.get("finish_sent"):
+        leaderboard_key = context.user_data.get("leaderboard_key")
+        if leaderboard_key:
+            GROUP_LEADERBOARDS.setdefault(leaderboard_key, {})
+            if user_id not in GROUP_LEADERBOARDS[leaderboard_key]:
+                GROUP_LEADERBOARDS[leaderboard_key][user_id] = {
+                    "name": existing_play["user_name"],
+                    "score": existing_play["score"],
+                }
+                try:
+                    async with DB_LOCK:
+                        _conn, _cur = get_db()
+                        _cur.execute(
+                            "INSERT OR IGNORE INTO group_leaderboard (leaderboard_key, user_id, name, score) VALUES (?, ?, ?, ?)",
+                            (leaderboard_key, user_id, existing_play["user_name"], existing_play["score"])
+                        )
+                        _conn.commit()
+                        _conn.close()
+                    await update_group_leaderboard(leaderboard_key, context)
+                except Exception as e:
+                    print(f"⚠️ Failed to salvage score on /start reset: {e}")
 
     # 🔒 HARD RESET: entering the bot selector must clear old state.
     # Auth checks (owner / subscriber / unauthorized) now happen AFTER
@@ -6586,6 +6606,7 @@ async def play_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 🔒 Lock immediately
     play["locked"] = True
+    play["last_activity"] = time.time()
 
     # 📌 Parse answer
     chosen_index = int(query.data.replace("PLAY_ANSWER_", ""))
@@ -6664,14 +6685,9 @@ async def play_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🔴 HARD ASYNC BOUNDARY
     await asyncio.sleep(0)
 
-    # ✅ Always reset advancing flag before calling advance_quiz
-    # This prevents the quiz from freezing if a previous timer left it stuck True
-    play = context.user_data.get("play")
-    if play:
-        play["advancing"] = False
-
-    # ▶️ Advance quiz safely
-    await advance_quiz(query.from_user.id, context)
+    # ▶️ Advance quiz with error containment (auto-retries once, then
+    # offers a Resume button instead of freezing silently)
+    await _safe_advance(query.from_user.id, context)
 
 async def start_play_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -6869,6 +6885,7 @@ async def send_next_question(user_id, context):
     play = context.user_data.get("play")
     if not play:
         return
+    play["last_activity"] = time.time()
 
     old_task = play.get("timer_task")
     if old_task:
@@ -7069,25 +7086,12 @@ async def countdown_timer(user_id, context, seconds, play):
         if not play or play.get("finished"):
             return
 
-        # ✅ Do NOT hold context_lock while calling advance_quiz —
-        # advance_quiz acquires the same lock and asyncio.Lock is NOT reentrant.
-        # Instead: check advancing, set it, release lock, then call advance_quiz.
-        acquired = False
-        async with play["context_lock"]:
-            if play.get("advancing") or play.get("finished"):
-                return
-            play["advancing"] = True
-            acquired = True
-
-        if not acquired:
-            return
-
+        # advance_quiz/finish_quiz own the "advancing"/"finished" guard
+        # under their own lock now — no need to poke the flag here.
         if play["index"] >= len(play["questions"]) - 1:
-            play["advancing"] = False
-            await finish_quiz(user_id, context)
+            await _safe_advance_finish(user_id, context)
         else:
-            play["advancing"] = False   # ← release BEFORE calling advance_quiz
-            await advance_quiz(user_id, context)
+            await _safe_advance(user_id, context)
 
     except asyncio.CancelledError:
         # Proper cancellation handling
@@ -8222,13 +8226,17 @@ async def finish_quiz(user_id, context):
     if delete_tasks:
         await asyncio.gather(*delete_tasks, return_exceptions=True)
 
-    _conn2, _cur2 = get_db()
-    _cur2.execute(
-        "SELECT title, timer FROM quizzes WHERE quiz_id=?",
-        (quiz_id,)
-    )
-    row = _cur2.fetchone()
-    _conn2.close()
+    try:
+        _conn2, _cur2 = get_db()
+        _cur2.execute(
+            "SELECT title, timer FROM quizzes WHERE quiz_id=?",
+            (quiz_id,)
+        )
+        row = _cur2.fetchone()
+        _conn2.close()
+    except Exception as e:
+        print(f"⚠️ Failed to fetch quiz title/timer in finish_quiz: {e}")
+        row = None
 
     title, timer = row if row else ("Quiz", 0)
 
@@ -8255,6 +8263,69 @@ async def finish_quiz(user_id, context):
     )
 
     context.user_data.pop("play", None)
+
+
+async def _safe_advance(user_id, context, retries=1):
+    """
+    Wraps advance_quiz with error containment. On failure, retries once
+    after a short delay; if it still fails, notifies the player instead
+    of leaving the session silently frozen.
+    """
+    for attempt in range(retries + 1):
+        try:
+            await advance_quiz(user_id, context)
+            return
+        except Exception as e:
+            print(f"⚠️ advance_quiz failed (attempt {attempt + 1}) for {user_id}: {e}")
+            if attempt < retries:
+                await asyncio.sleep(1.5)
+                continue
+            play = context.user_data.get("play")
+            if play:
+                play["locked"] = False
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        "⚠️ We hit a temporary problem loading the next question.\n\n"
+                        "Tap below to continue where you left off."
+                    ),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔁 Resume Quiz", callback_data="RESUME_STUCK_QUIZ")]
+                    ])
+                )
+            except Exception:
+                pass
+
+
+async def _safe_advance_finish(user_id, context, retries=1):
+    """Same containment pattern as _safe_advance, but for finish_quiz."""
+    for attempt in range(retries + 1):
+        try:
+            await finish_quiz(user_id, context)
+            return
+        except Exception as e:
+            print(f"⚠️ finish_quiz failed (attempt {attempt + 1}) for {user_id}: {e}")
+            if attempt < retries:
+                await asyncio.sleep(1.5)
+                continue
+            play = context.user_data.get("play")
+            if play:
+                play["locked"] = False
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        "⚠️ We hit a temporary problem finishing your quiz.\n\n"
+                        "Tap below to try again."
+                    ),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔁 Resume Quiz", callback_data="RESUME_STUCK_QUIZ")]
+                    ])
+                )
+            except Exception:
+                pass
+
 
 async def advance_quiz(user_id, context):
     play = context.user_data.get("play")
@@ -9478,7 +9549,7 @@ async def global_quiz_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ✅ Always allow stop / resume
-    if data in ("FORCE_STOP_QUIZ", "RESUME_QUIZ"):
+    if data in ("FORCE_STOP_QUIZ", "RESUME_QUIZ", "RESUME_STUCK_QUIZ"):
         return
 
     # ✅ If warning already shown → block silently
@@ -9528,6 +9599,22 @@ async def resume_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 🔓 Unlock UI
     play.pop("warning_message_id", None)
+
+
+async def resume_stuck_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    play = context.user_data.get("play")
+    if not play:
+        await query.message.edit_text("This quiz session has ended.")
+        return
+    play["locked"] = False
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    await _safe_advance(query.from_user.id, context)
+
 
 async def shuffle_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -12914,6 +13001,28 @@ async def auto_expire_subscribers(context):
         _conn.commit()
         _conn.close()
 
+async def watchdog_stuck_sessions(context):
+    app_ = context.application
+    now = time.time()
+    for user_id, udata in list(app_.user_data.items()):
+        play = udata.get("play")
+        if not play or play.get("finished") or play.get("ended"):
+            continue
+        last_activity = play.get("last_activity", now)
+        timer_running = play.get("timer_task") and not play["timer_task"].done()
+        if not timer_running and (now - last_activity) > 30:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="⚠️ Your quiz seems to have stalled.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔁 Resume Quiz", callback_data="RESUME_STUCK_QUIZ")]
+                    ])
+                )
+                play["last_activity"] = now
+            except Exception:
+                pass
+
 async def subscriber_agree_notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the subscriber tapping 'I Agree' on the first-access notice."""
     query = update.callback_query
@@ -15011,6 +15120,7 @@ app.add_handler(CommandHandler("keystatus", gemini_key_status))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+app.job_queue.run_repeating(watchdog_stuck_sessions, interval=20, first=20)
 
 # =========================
 # Must Stay on Top of other CallbackQueryHandler
@@ -15182,6 +15292,7 @@ app.add_handler(CallbackQueryHandler(leaderboard_page_nav, pattern="^LB_NEXT\\|"
 app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^LOCKED$"))
 app.add_handler(CallbackQueryHandler(play_start, pattern="^PLAY_START$"))
 app.add_handler(CallbackQueryHandler(play_answer, pattern="^PLAY_ANSWER_"))
+app.add_handler(CallbackQueryHandler(resume_stuck_quiz, pattern="^RESUME_STUCK_QUIZ$"))
 app.add_handler(CallbackQueryHandler(edit_question_explanation_start, pattern="^EDIT_Q_EXPLANATION$"))
 app.add_handler(CallbackQueryHandler(edit_question_explanation_remove, pattern="^EDIT_Q_EXPL_REMOVE$"))
 app.add_handler(CallbackQueryHandler(edit_question_correct_start, pattern="^EDIT_Q_CORRECT$"))
@@ -15251,6 +15362,21 @@ app.add_handler(CallbackQueryHandler(edit_correct_answer, pattern="^EDIT_CORRECT
 
 async def global_error_handler(update, context):
     print("❌ Unhandled error:", context.error)
+    try:
+        if isinstance(update, Update) and update.effective_user:
+            user_id = update.effective_user.id
+            play = context.user_data.get("play") if context.user_data else None
+            if play and not play.get("finished"):
+                play["locked"] = False
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="⚠️ Something went wrong. Tap to resume your quiz.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔁 Resume Quiz", callback_data="RESUME_STUCK_QUIZ")]
+                    ])
+                )
+    except Exception:
+        pass
 
 app.add_error_handler(global_error_handler)
 
