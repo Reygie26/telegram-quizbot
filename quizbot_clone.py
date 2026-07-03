@@ -1035,7 +1035,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     ])
 
-    PADDING = "\u2800" * 8
+    PADDING = "\u2800" * 9
     msg = await update.message.reply_text(
         f"Please Choose a Bot to Use:{PADDING}",
         reply_markup=keyboard
