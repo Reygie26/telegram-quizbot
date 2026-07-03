@@ -7175,9 +7175,9 @@ async def send_quiz_to_group(chat_id, quiz_id, context, token):
         text += f"📝 _{escape_md(desc)}_\n"
     text += f"{access_badge}\n"
     text += "\n"
-    PADDING = "\u2800" * 32
+    PADDING = "\u2800" * 10
     text += f"🧠 *{total_questions} Questions* • ⏱ *{timer}s*\n"
-    text += f"🔀 Shuffle Questions & Opts: {'ON' if sq else 'OFF'} & {'ON' if sa else 'OFF'} {PADDING}\n"
+    text += f"🔀 Shuffle Questions & Opts: {'ON' if sq else 'OFF'} & {'ON' if sa else 'OFF'} {PADDING}"
     text += f"🏆 *Leaderboard*\n— No attempts yet —"
 
     keyboard = build_group_post_keyboard(quiz_id, token, leaderboard_key)
@@ -7238,14 +7238,14 @@ def build_group_quiz_text(leaderboard_key, page=0):
     total_questions = _cur2.fetchone()[0]
     _conn2.close()
 
-    PADDING = "\u2800" * 32
+    PADDING = "\u2800" * 10
     text = f"📘 *{escape_md(title)}*\n"
     if desc:
         text += f"📝 _{escape_md(desc)}_\n"
     text += f"{access_badge}\n"
     text += "\n"
     text += f"🧠 *{total_questions} Questions* • ⏱ *{timer}s*\n"
-    text += f"🔀 Shuffle Questions & Opts: {'ON' if sq else 'OFF'} & {'ON' if sa else 'OFF'} {PADDING}\n\n"
+    text += f"🔀 Shuffle Questions & Opts: {'ON' if sq else 'OFF'} & {'ON' if sa else 'OFF'} {PADDING}"
     # Check if leaderboard is hidden by admin
     lb_info = GROUP_LB_MESSAGES.get(leaderboard_key, {})
     show_score = lb_info.get("show_score", 1)
