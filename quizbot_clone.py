@@ -1030,13 +1030,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("     🧠 TeleQuiz     ", callback_data="SELECT_BOT_TELEQUIZ"),
-            InlineKeyboardButton("     🎬 VideoGen     ", callback_data="SELECT_BOT_VIDEOGEN"),
+            InlineKeyboardButton("🧠 TeleQuiz", callback_data="SELECT_BOT_TELEQUIZ"),
+            InlineKeyboardButton("🎬 VideoGen", callback_data="SELECT_BOT_VIDEOGEN"),
         ]
     ])
 
+    PADDING = "\u2800" * 10
     msg = await update.message.reply_text(
-        f"Please Choose a Bot to Use:",
+        f"Please Choose a Bot to Use:{PADDING}",
         reply_markup=keyboard
     )
 
