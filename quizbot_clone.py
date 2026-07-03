@@ -1028,16 +1028,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         context.user_data["chat_messages"].append(update.message.message_id)
 
+    BTN_PADDING = "\u2800" * 10
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🧠 TeleQuiz", callback_data="SELECT_BOT_TELEQUIZ"),
-            InlineKeyboardButton("🎬 VideoGen", callback_data="SELECT_BOT_VIDEOGEN"),
+            InlineKeyboardButton("🧠 TeleQuiz{BTN_PADDING}", callback_data="SELECT_BOT_TELEQUIZ"),
+            InlineKeyboardButton("🎬 VideoGen{BTN_PADDING}", callback_data="SELECT_BOT_VIDEOGEN"),
         ]
     ])
 
-    PADDING = "\u2800" * 10
     msg = await update.message.reply_text(
-        f"Please Choose a Bot to Use:{PADDING}",
+        f"Please Choose a Bot to Use:",
         reply_markup=keyboard
     )
 
