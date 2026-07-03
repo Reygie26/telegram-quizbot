@@ -1028,16 +1028,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         context.user_data["chat_messages"].append(update.message.message_id)
 
+    PADDING = "\u2800" * 15
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🧠 TeleQuiz", callback_data="SELECT_BOT_TELEQUIZ"),
-            InlineKeyboardButton("🎬 VideoGen", callback_data="SELECT_BOT_VIDEOGEN"),
+            InlineKeyboardButton("🧠 TeleQuiz {PADDING}", callback_data="SELECT_BOT_TELEQUIZ"),
+            InlineKeyboardButton("🎬 VideoGen {PADDING}", callback_data="SELECT_BOT_VIDEOGEN"),
         ]
     ])
 
-    PADDING = "\u2800" * 15
     msg = await update.message.reply_text(
-        f"Please Choose a Bot to Use: {PADDING}",
+        f"Please Choose a Bot to Use:",
         reply_markup=keyboard
     )
 
@@ -5064,10 +5064,10 @@ async def go_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
     ]
 
-    # 👑 Only the owner sees Manage Subscribers
+    # 👑 Only the owner sees Manage Bot Subscribers
     if user_id == OWNER_USER_ID:
         rows.append([
-            InlineKeyboardButton("👥 Manage Subscribers", callback_data="HOME_MANAGE_SUBSCRIBERS"),
+            InlineKeyboardButton("👥 Manage Bot Subscribers", callback_data="HOME_MANAGE_SUBSCRIBERS"),
         ])
 
     await query.message.edit_text(
@@ -5175,7 +5175,7 @@ def build_telequiz_admin_keyboard():
             InlineKeyboardButton("❓ Create a Question", callback_data="HOME_CREATE_QUESTION"),
         ],
         [
-            InlineKeyboardButton("👥 Manage Subscribers", callback_data="HOME_MANAGE_SUBSCRIBERS"),
+            InlineKeyboardButton("👥 Manage Bot Subscribers", callback_data="HOME_MANAGE_SUBSCRIBERS"),
         ]
     ])
 
@@ -12402,7 +12402,7 @@ async def home_manage_subscribers(update, context):
 
     if query.from_user.id != OWNER_USER_ID:
         await flash_message(context.bot, query.message.chat_id,
-            "❌ Only the Bot Creator can manage subscribers."
+            "❌ Only the Bot Creator can manage bot subscribers."
         )
         return
 
@@ -12414,7 +12414,7 @@ async def home_manage_subscribers(update, context):
     ])
 
     await query.message.edit_text(
-        "👥 *Manage Subscribers*",
+        "👥 *Manage Bot Subscribers*",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
@@ -12429,14 +12429,14 @@ async def home_manage_subscribers_from_message(message, context):
 
     try:
         await message.edit_text(
-            "👥 *Manage Subscribers*",
+            "👥 *Manage Bot Subscribers*",
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
     except Exception:
         await context.bot.send_message(
             chat_id=message.chat_id,
-            text="👥 *Manage Subscribers*",
+            text="👥 *Manage Bot Subscribers*",
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
