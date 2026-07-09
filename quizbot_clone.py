@@ -1574,6 +1574,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_msg_id = update.message.message_id
         folder = text.strip()
 
+        # 🔑 Are we creating a ROOT folder (parent_id=None) or a SUBFOLDER?
+        parent_id = context.user_data.get("db_add_subfolder_parent_id")
+
         # ❌ Empty name
         if not folder:
             await update.message.reply_text("❌ Folder name cannot be empty.")
@@ -1616,13 +1619,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Folder already exists.")
             return
 
-        # ✅ Create folder
+        # ✅ Create folder (root-level if parent_id is None, subfolder otherwise)
         try:
             async with DB_LOCK:
                 _conn, _cur = get_db()
                 _cur.execute(
-                    "INSERT INTO question_bank_folders (owner_id, name) VALUES (?, ?)",
-                    (get_active_user_id(context), normalized)
+                    "INSERT INTO question_bank_folders (owner_id, name, parent_id) VALUES (?, ?, ?)",
+                    (get_active_user_id(context), normalized, parent_id)
                 )
                 _conn.commit()
                 _conn.close()
@@ -1633,6 +1636,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 🔑 EXIT DB MODE IMMEDIATELY
         context.user_data.pop("state", None)
+        context.user_data.pop("db_add_subfolder_parent_id", None)
 
         # ✅ Confirmation message
         confirm_msg = await update.message.reply_text(
@@ -1651,7 +1655,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         delete_tasks.append(context.bot.delete_message(chat_id, confirm_msg.message_id))
         await asyncio.gather(*delete_tasks, return_exceptions=True)
 
-        # 🔄 Menu replacement: edit the original database menu message
+        # 🔄 Menu replacement: subfolder → redraw the parent folder's question
+        # list; root folder → redraw the Database home screen (unchanged).
+        subfolder_menu_msg = context.user_data.pop("db_add_subfolder_menu_message", None)
+        if subfolder_menu_msg:
+            await show_db_questions_from_message(subfolder_menu_msg, context)
+            return
+
         db_menu_msg = context.user_data.get("db_menu_message_object")
         if db_menu_msg:
             await show_database_menu(db_menu_msg, context)
@@ -3547,6 +3557,9 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         if folder_name != "Default":
             keyboard.append([
+                InlineKeyboardButton("➕ Add Subfolder", callback_data=f"DB_ADD_SUBFOLDER|{folder_name}")
+            ])
+            keyboard.append([
                 InlineKeyboardButton("✏️ Rename", callback_data=f"DB_RENAME_FOLDER|{folder_name}"),
                 InlineKeyboardButton("📥 Move Questions In", callback_data=f"DB_MOVE_IN|{folder_name}")
             ])
@@ -3583,6 +3596,9 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append(nav)
 
     if folder_name != "Default":
+        keyboard.append([
+            InlineKeyboardButton("➕ Add Subfolder", callback_data=f"DB_ADD_SUBFOLDER|{folder_name}")
+        ])
         keyboard.append([
             InlineKeyboardButton("✏️ Rename", callback_data=f"DB_RENAME_FOLDER|{folder_name}"),
             InlineKeyboardButton("📥 Move Questions In", callback_data=f"DB_MOVE_IN|{folder_name}")
@@ -4685,6 +4701,44 @@ async def database_add_folder_start(update: Update, context: ContextTypes.DEFAUL
     )
 
     # 🔑 Store prompt ID for cleanup
+    context.user_data["db_add_folder_prompt_id"] = msg.message_id
+
+async def db_add_subfolder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    parent_folder_name = query.data.split("|", 1)[1]
+    active_uid = get_active_user_id(context)
+
+    # 🔒 Subfolders cannot be created inside Default (Default stays flat)
+    if parent_folder_name == "Default":
+        await flash_message(context.bot, query.message.chat_id, "❌ Cannot add subfolders inside Default.")
+        return
+
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
+        (active_uid, parent_folder_name)
+    )
+    row = _cur.fetchone()
+    _conn.close()
+
+    if not row:
+        await flash_message(context.bot, query.message.chat_id, "❌ Parent folder not found.")
+        return
+
+    parent_id = row[0]
+
+    # ✅ Enter Database folder creation mode (subfolder variant)
+    context.user_data["state"] = "DB_ADD_FOLDER"
+    context.user_data["db_add_subfolder_parent_id"] = parent_id
+    context.user_data["db_add_subfolder_menu_message"] = query.message
+
+    msg = await query.message.reply_text(
+        f"➕ Send the name of the new subfolder inside 📁 {parent_folder_name}:"
+    )
+
+    # 🔑 Reuses the same cleanup key as the root-level flow
     context.user_data["db_add_folder_prompt_id"] = msg.message_id
 
 async def move_quiz_to_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10304,6 +10358,9 @@ async def show_db_questions_from_message(message, context):
     if not rows:
         if folder_name != "Default":
             keyboard.append([
+                InlineKeyboardButton("➕ Add Subfolder", callback_data=f"DB_ADD_SUBFOLDER|{folder_name}")
+            ])
+            keyboard.append([
                 InlineKeyboardButton("✏️ Rename", callback_data=f"DB_RENAME_FOLDER|{folder_name}"),
                 InlineKeyboardButton("📥 Move Questions In", callback_data=f"DB_MOVE_IN|{folder_name}")
             ])
@@ -10344,6 +10401,9 @@ async def show_db_questions_from_message(message, context):
         keyboard.append(nav)
 
     if folder_name != "Default":
+        keyboard.append([
+            InlineKeyboardButton("➕ Add Subfolder", callback_data=f"DB_ADD_SUBFOLDER|{folder_name}")
+        ])
         keyboard.append([
             InlineKeyboardButton("✏️ Rename", callback_data=f"DB_RENAME_FOLDER|{folder_name}"),
             InlineKeyboardButton("📥 Move Questions In", callback_data=f"DB_MOVE_IN|{folder_name}")
@@ -15387,6 +15447,7 @@ app.add_handler(CallbackQueryHandler(ocr_accept,            pattern="^OCR_ACCEPT
 app.add_handler(CallbackQueryHandler(ocr_retake,            pattern="^OCR_RETAKE$"))
 app.add_handler(CallbackQueryHandler(home_create_question, pattern="^HOME_CREATE_QUESTION$"))
 app.add_handler(CallbackQueryHandler(database_add_folder_start, pattern="^DB_ADD$"))
+app.add_handler(CallbackQueryHandler(db_add_subfolder_start, pattern="^DB_ADD_SUBFOLDER\\|"))
 app.add_handler(CallbackQueryHandler(confirm_delete, pattern="^CONFIRM_DELETE$"))
 app.add_handler(CallbackQueryHandler(cancel_delete, pattern="^CANCEL_DELETE$"))
 app.add_handler(CallbackQueryHandler(copy_question_apply, pattern="^COPY_TO\\|"))
