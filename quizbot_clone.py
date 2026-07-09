@@ -3695,12 +3695,13 @@ async def db_search_preview_question(update: Update, context: ContextTypes.DEFAU
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✏️ Edit",   callback_data="EDIT_Q"),
-            InlineKeyboardButton("⚙️ Manage", callback_data="MANAGE_Q"),
+            InlineKeyboardButton("✏️ Edit",        callback_data="EDIT_Q"),
+            InlineKeyboardButton("➕ Add to Quiz",  callback_data="MANAGE_Q"),
         ],
         [
-            InlineKeyboardButton("🗑 Delete",  callback_data="DELETE_Q_FROM_DB"),
-            InlineKeyboardButton("↩️ Return",  callback_data="RETURN_TO_QUESTIONS"),
+            InlineKeyboardButton("📦 Move",         callback_data="QB_MOVE"),
+            InlineKeyboardButton("🗑 Delete",        callback_data="DELETE_Q_FROM_DB"),
+            InlineKeyboardButton("↩️ Return",       callback_data="RETURN_TO_QUESTIONS"),
         ]
     ])
 
@@ -5907,12 +5908,13 @@ async def preview_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✏️ Edit",   callback_data="EDIT_Q"),
-            InlineKeyboardButton("⚙️ Manage", callback_data="MANAGE_Q"),
+            InlineKeyboardButton("✏️ Edit",        callback_data="EDIT_Q"),
+            InlineKeyboardButton("➕ Add to Quiz",  callback_data="MANAGE_Q"),
         ],
         [
-            InlineKeyboardButton("🗑 Delete",   callback_data=delete_callback),
-            InlineKeyboardButton("↩️ Return",   callback_data="RETURN_TO_QUESTIONS"),
+            InlineKeyboardButton("📦 Move",         callback_data="QB_MOVE"),
+            InlineKeyboardButton("🗑 Delete",        callback_data=delete_callback),
+            InlineKeyboardButton("↩️ Return",       callback_data="RETURN_TO_QUESTIONS"),
         ]
     ])
 
@@ -5983,12 +5985,13 @@ async def rebuild_question_preview(chat_id, context):
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✏️ Edit",   callback_data="EDIT_Q"),
-            InlineKeyboardButton("⚙️ Manage", callback_data="MANAGE_Q"),
+            InlineKeyboardButton("✏️ Edit",        callback_data="EDIT_Q"),
+            InlineKeyboardButton("➕ Add to Quiz",  callback_data="MANAGE_Q"),
         ],
         [
-            InlineKeyboardButton("🗑 Delete",  callback_data=delete_callback),
-            InlineKeyboardButton("↩️ Return",  callback_data="RETURN_TO_QUESTIONS"),
+            InlineKeyboardButton("📦 Move",         callback_data="QB_MOVE"),
+            InlineKeyboardButton("🗑 Delete",        callback_data=delete_callback),
+            InlineKeyboardButton("↩️ Return",       callback_data="RETURN_TO_QUESTIONS"),
         ]
     ])
 
@@ -6075,12 +6078,13 @@ async def show_question_preview_by_id(chat_id, context):
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✏️ Edit", callback_data="EDIT_Q"),
-            InlineKeyboardButton("⚙️ Manage", callback_data="MANAGE_Q"),
+            InlineKeyboardButton("✏️ Edit",        callback_data="EDIT_Q"),
+            InlineKeyboardButton("➕ Add to Quiz",  callback_data="MANAGE_Q"),
         ],
         [
-            InlineKeyboardButton("🗑 Delete", callback_data="DELETE_QUESTION"),
-            InlineKeyboardButton("↩️ Return", callback_data="RETURN_TO_QUESTIONS"),
+            InlineKeyboardButton("📦 Move",         callback_data="QB_MOVE"),
+            InlineKeyboardButton("🗑 Delete",        callback_data="DELETE_QUESTION"),
+            InlineKeyboardButton("↩️ Return",       callback_data="RETURN_TO_QUESTIONS"),
         ]
     ])
 
@@ -8568,10 +8572,11 @@ async def show_qb_move_folders(message, context):
         keyboard.append(nav)
 
     keyboard.append([
-        InlineKeyboardButton("⬅️ Cancel", callback_data="EDIT_QUESTIONS")
+        InlineKeyboardButton("⬅️ Cancel", callback_data="QB_MOVE_CANCEL")
     ])
 
-    await message.edit_text(
+    await safe_edit_message(
+        message,
         "📂 Move Question\n\nSelect destination folder:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -8586,6 +8591,13 @@ async def qb_move_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     folder_id = int(query.data.split("|", 1)[1])
+
+    # 🔎 Get folder name for a clearer confirmation message
+    _conn_f, _cur_f = get_db()
+    _cur_f.execute("SELECT name FROM question_bank_folders WHERE id=?", (folder_id,))
+    frow = _cur_f.fetchone()
+    _conn_f.close()
+    folder_name = frow[0] if frow else "folder"
 
     # 🔐 WRITE SECTION (LOCKED)
     try:
@@ -8603,10 +8615,18 @@ async def qb_move_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await flash_message(context.bot, query.message.chat_id, "❌ Failed to move question.")
         return
 
-    await flash_message(context.bot, query.message.chat_id, "✅ Question moved successfully.")
+    context.user_data.pop("qb_move_page", None)
 
-    # Return to Database view
-    await show_database_menu(query.message, context)
+    await flash_message(context.bot, query.message.chat_id, f"✅ Moved to 📁 {folder_name}")
+
+    # Return to the question preview (works whether opened from Database or a Quiz)
+    await rebuild_question_preview(query.message.chat_id, context)
+
+async def qb_move_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("qb_move_page", None)
+    await rebuild_question_preview(query.message.chat_id, context)
 
 async def qb_open_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -15186,6 +15206,7 @@ app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pat
 app.add_handler(CallbackQueryHandler(reset_score, pattern=r"^RESET_SCORE\|"))
 app.add_handler(CallbackQueryHandler(cancel_create_question, pattern="^CANCEL_CREATE_QUESTION$"))
 app.add_handler(CallbackQueryHandler(qb_move_question, pattern="^QB_MOVE$"))
+app.add_handler(CallbackQueryHandler(qb_move_cancel, pattern="^QB_MOVE_CANCEL$"))
 app.add_handler(CallbackQueryHandler(qb_move_apply, pattern="^QB_MOVE_TO\\|"))
 app.add_handler(CallbackQueryHandler(qb_move_prev, pattern="^QB_MOVE_PREV$"))
 app.add_handler(CallbackQueryHandler(qb_move_next, pattern="^QB_MOVE_NEXT$"))
