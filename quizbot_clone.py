@@ -208,6 +208,7 @@ def ensure_indexes():
     _cur.execute("CREATE INDEX IF NOT EXISTS idx_qb_folder_id ON question_bank(folder_id)")
     _cur.execute("CREATE INDEX IF NOT EXISTS idx_quizzes_owner_folder ON quizzes(owner_id, folder)")
     _cur.execute("CREATE INDEX IF NOT EXISTS idx_leaderboard_quiz_chat ON leaderboard(quiz_id, chat_id)")
+    _cur.execute("CREATE INDEX IF NOT EXISTS idx_qbf_parent ON question_bank_folders(parent_id)")
     _conn.commit()
     _conn.close()
 
@@ -298,6 +299,102 @@ def natural_sort_key(s):
         int(chunk) if chunk.isdigit() else chunk.lower()
         for chunk in re.split(r'(\d+)', s)
     ]
+
+# =========================
+# DATABASE SUBFOLDER HELPERS
+# (Not called anywhere yet — Phase 1 groundwork only)
+# =========================
+
+def get_qb_subfolders(owner_id, parent_id):
+    """
+    Returns [(id, name), ...] for the direct subfolders under parent_id.
+    parent_id=None means "root level" (top of the Database), and
+    intentionally excludes 'Default' since Default stays flat/root-only.
+    """
+    _conn, _cur = get_db()
+    if parent_id is None:
+        _cur.execute(
+            """
+            SELECT id, name FROM question_bank_folders
+            WHERE owner_id=? AND parent_id IS NULL AND name != 'Default'
+            ORDER BY name COLLATE NOCASE
+            """,
+            (owner_id,)
+        )
+    else:
+        _cur.execute(
+            """
+            SELECT id, name FROM question_bank_folders
+            WHERE owner_id=? AND parent_id=?
+            ORDER BY name COLLATE NOCASE
+            """,
+            (owner_id, parent_id)
+        )
+    rows = _cur.fetchall()
+    _conn.close()
+    return rows
+
+def get_qb_folder_by_id(folder_id):
+    """Returns (id, owner_id, name, parent_id) or None."""
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT id, owner_id, name, parent_id FROM question_bank_folders WHERE id=?",
+        (folder_id,)
+    )
+    row = _cur.fetchone()
+    _conn.close()
+    return row
+
+def get_qb_folder_breadcrumb(folder_id):
+    """
+    Returns [(id, name), ...] from the root ancestor down to folder_id
+    itself. Used later to render a "Home > Parent > This Folder" trail.
+    """
+    chain   = []
+    current = folder_id
+    visited = set()
+
+    _conn, _cur = get_db()
+    while current is not None and current not in visited:
+        visited.add(current)
+        _cur.execute(
+            "SELECT id, name, parent_id FROM question_bank_folders WHERE id=?",
+            (current,)
+        )
+        row = _cur.fetchone()
+        if not row:
+            break
+        chain.append((row[0], row[1]))
+        current = row[2]
+    _conn.close()
+
+    chain.reverse()
+    return chain
+
+def get_qb_descendant_folder_ids(folder_id):
+    """
+    Returns a set of ALL descendant folder_ids (children, grandchildren,
+    etc.) of folder_id — NOT including folder_id itself. Used later for
+    cascade-delete so an entire subfolder tree can be handled at once.
+    """
+    _conn, _cur = get_db()
+    _cur.execute("SELECT id, parent_id FROM question_bank_folders")
+    all_rows = _cur.fetchall()
+    _conn.close()
+
+    children_map = {}
+    for fid, pid in all_rows:
+        children_map.setdefault(pid, []).append(fid)
+
+    result = set()
+    stack = list(children_map.get(folder_id, []))
+    while stack:
+        fid = stack.pop()
+        if fid in result:
+            continue
+        result.add(fid)
+        stack.extend(children_map.get(fid, []))
+    return result
 
 # =========================
 # GEMINI IMAGE SCANNER
@@ -658,6 +755,16 @@ CREATE TABLE IF NOT EXISTS question_bank_folders (
     UNIQUE(owner_id, name)
 )
 """)
+    _conn.commit()
+
+    # Safe migration: add parent_id for Database subfolder support.
+    # NULL parent_id = root-level folder (this is what every existing
+    # folder already is, so nothing currently visible changes).
+    try:
+        _cur.execute("ALTER TABLE question_bank_folders ADD COLUMN parent_id INTEGER DEFAULT NULL")
+        _conn.commit()
+    except Exception:
+        pass
 
     _cur.execute("""
 CREATE TABLE IF NOT EXISTS quiz_post_tokens (
