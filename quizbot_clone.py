@@ -3438,7 +3438,7 @@ async def show_database_menu(message, context):
     _cur.execute(
         """
         SELECT id, name FROM question_bank_folders
-        WHERE owner_id=? AND name != 'Default'
+        WHERE owner_id=? AND name != 'Default' AND parent_id IS NULL
         ORDER BY name COLLATE NOCASE
         """,
         (active_uid,)
@@ -3533,7 +3533,7 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     _conn, _cur = get_db()
     _cur.execute(
-        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
+        "SELECT id, parent_id FROM question_bank_folders WHERE owner_id=? AND name=?",
         (active_uid, folder_name)
     )
     row = _cur.fetchone()
@@ -3542,7 +3542,8 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not row:
         await flash_message(context.bot, query.message.chat_id, "❌ Folder not found.")
         return
-    folder_id = row[0]
+    folder_id, parent_id = row
+    context.user_data["db_folder_id"] = folder_id
 
     _conn2, _cur2 = get_db()
     _cur2.execute(
@@ -3552,9 +3553,29 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = _cur2.fetchall()
     _conn2.close()
 
+    # 🔑 Direct subfolders of this folder (Default never has children)
+    subfolders = get_qb_subfolders(active_uid, folder_id) if folder_name != "Default" else []
+
+    # 🔑 Breadcrumb trail + smart Back target
+    breadcrumb = get_qb_folder_breadcrumb(folder_id)
+    if len(breadcrumb) > 1:
+        crumb_text = " › ".join(name for _, name in breadcrumb[:-1])
+        header = f"🗄 {crumb_text}\n\n📁 **{folder_name}**"
+        back_callback = f"DB_OPEN|{breadcrumb[-2][1]}"
+    else:
+        header = f"📁 **{folder_name}**"
+        back_callback = "HOME_DATABASE"
+
     keyboard = []
 
+    # 🔑 Subfolder buttons listed first
+    for sub_id, sub_name in subfolders:
+        keyboard.append([
+            InlineKeyboardButton(f"📁 {sub_name}", callback_data=f"DB_OPEN|{sub_name}")
+        ])
+
     if not rows:
+        empty_label = "_No questions in this folder yet._" if not subfolders else "_No questions directly in this folder._"
         if folder_name != "Default":
             keyboard.append([
                 InlineKeyboardButton("➕ Add Subfolder", callback_data=f"DB_ADD_SUBFOLDER|{folder_name}")
@@ -3565,12 +3586,12 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
             keyboard.append([
                 InlineKeyboardButton("🗑 Delete Folder", callback_data=f"DB_DELETE_FOLDER|{folder_name}"),
-                InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
+                InlineKeyboardButton("⬅️ Back", callback_data=back_callback)
             ])
         else:
-            keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")])
+            keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data=back_callback)])
         await query.message.edit_text(
-            f"📁 **{folder_name}**\n\n_No questions in this folder yet._",
+            f"{header}\n\n{empty_label}",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
@@ -3605,13 +3626,13 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         keyboard.append([
             InlineKeyboardButton("🗑 Delete Folder", callback_data=f"DB_DELETE_FOLDER|{folder_name}"),
-            InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
+            InlineKeyboardButton("⬅️ Back", callback_data=back_callback)
         ])
     else:
-        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")])
+        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data=back_callback)])
 
     await query.message.edit_text(
-        f"📁 **{folder_name}**\n\nSelect a question:",
+        f"{header}\n\nSelect a question:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
@@ -10331,7 +10352,7 @@ async def show_db_questions_from_message(message, context):
 
     _conn, _cur = get_db()
     _cur.execute(
-        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
+        "SELECT id, parent_id FROM question_bank_folders WHERE owner_id=? AND name=?",
         (active_uid, folder_name)
     )
     row = _cur.fetchone()
@@ -10339,7 +10360,8 @@ async def show_db_questions_from_message(message, context):
 
     if not row:
         return
-    folder_id = row[0]
+    folder_id, parent_id = row
+    context.user_data["db_folder_id"] = folder_id
 
     _conn2, _cur2 = get_db()
     _cur2.execute(
@@ -10353,9 +10375,31 @@ async def show_db_questions_from_message(message, context):
     rows = _cur2.fetchall()
     _conn2.close()
 
+    # 🔑 Direct subfolders of this folder (Default never has children)
+    subfolders = get_qb_subfolders(active_uid, folder_id) if folder_name != "Default" else []
+
+    # 🔑 Breadcrumb trail + smart Back target
+    breadcrumb = get_qb_folder_breadcrumb(folder_id)
+    if len(breadcrumb) > 1:
+        crumb_text = " › ".join(name for _, name in breadcrumb[:-1])
+        header_md = f"🗄 {crumb_text}\n\n📁 **{folder_name}**"
+        header_plain = f"🗄 {crumb_text}\n\n📁 {folder_name}"
+        back_callback = f"DB_OPEN|{breadcrumb[-2][1]}"
+    else:
+        header_md = f"📁 **{folder_name}**"
+        header_plain = f"📁 {folder_name}"
+        back_callback = "HOME_DATABASE"
+
     keyboard = []
 
+    # 🔑 Subfolder buttons listed first
+    for sub_id, sub_name in subfolders:
+        keyboard.append([
+            InlineKeyboardButton(f"📁 {sub_name}", callback_data=f"DB_OPEN|{sub_name}")
+        ])
+
     if not rows:
+        empty_label = "_No questions in this folder yet._" if not subfolders else "_No questions directly in this folder._"
         if folder_name != "Default":
             keyboard.append([
                 InlineKeyboardButton("➕ Add Subfolder", callback_data=f"DB_ADD_SUBFOLDER|{folder_name}")
@@ -10366,13 +10410,13 @@ async def show_db_questions_from_message(message, context):
             ])
             keyboard.append([
                 InlineKeyboardButton("🗑 Delete Folder", callback_data=f"DB_DELETE_FOLDER|{folder_name}"),
-                InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
+                InlineKeyboardButton("⬅️ Back", callback_data=back_callback)
             ])
         else:
-            keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")])
+            keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data=back_callback)])
 
         await message.edit_text(
-            f"📁 **{folder_name}**\n\n_No questions in this folder yet._",
+            f"{header_md}\n\n{empty_label}",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
@@ -10410,20 +10454,20 @@ async def show_db_questions_from_message(message, context):
         ])
         keyboard.append([
             InlineKeyboardButton("🗑 Delete Folder", callback_data=f"DB_DELETE_FOLDER|{folder_name}"),
-            InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")
+            InlineKeyboardButton("⬅️ Back", callback_data=back_callback)
         ])
     else:
-        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="HOME_DATABASE")])
+        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data=back_callback)])
 
     try:
         await message.edit_text(
-            f"📁 {folder_name}\n\nSelect a question:",
+            f"{header_plain}\n\nSelect a question:",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
     except Exception:
         try:
             await message.edit_text(
-                f"📁 {folder_name}\n\nSelect a question:",
+                f"{header_plain}\n\nSelect a question:",
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
         except Exception:
