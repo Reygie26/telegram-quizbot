@@ -3577,9 +3577,10 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         empty_label = "_No questions in this folder yet._" if not subfolders else "_No questions directly in this folder._"
         if folder_name != "Default":
-            keyboard.append([
-                InlineKeyboardButton("➕ Add Subfolder", callback_data=f"DB_ADD_SUBFOLDER|{folder_name}")
-            ])
+            if parent_id is None:
+                keyboard.append([
+                    InlineKeyboardButton("➕ Add Subfolder", callback_data=f"DB_ADD_SUBFOLDER|{folder_name}")
+                ])
             keyboard.append([
                 InlineKeyboardButton("✏️ Rename", callback_data=f"DB_RENAME_FOLDER|{folder_name}"),
                 InlineKeyboardButton("📥 Move Questions In", callback_data=f"DB_MOVE_IN|{folder_name}")
@@ -3617,9 +3618,10 @@ async def show_db_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append(nav)
 
     if folder_name != "Default":
-        keyboard.append([
-            InlineKeyboardButton("➕ Add Subfolder", callback_data=f"DB_ADD_SUBFOLDER|{folder_name}")
-        ])
+        if parent_id is None:
+            keyboard.append([
+                InlineKeyboardButton("➕ Add Subfolder", callback_data=f"DB_ADD_SUBFOLDER|{folder_name}")
+            ])
         keyboard.append([
             InlineKeyboardButton("✏️ Rename", callback_data=f"DB_RENAME_FOLDER|{folder_name}"),
             InlineKeyboardButton("📥 Move Questions In", callback_data=f"DB_MOVE_IN|{folder_name}")
@@ -3642,22 +3644,24 @@ async def qb_pick_folder_menu(message, context):
     context.user_data.setdefault("qb_folder_page", 0)
     page = context.user_data["qb_folder_page"]
     PER_PAGE = 5
+    active_uid = get_active_user_id(context)
 
     _conn, _cur = get_db()
     _cur.execute(
-        "SELECT name FROM question_bank_folders WHERE owner_id=?",
-        (get_active_user_id(context),)
+        "SELECT id, name FROM question_bank_folders WHERE owner_id=? AND parent_id IS NULL",
+        (active_uid,)
     )
-    rows = [row[0] for row in _cur.fetchall()]
+    rows = _cur.fetchall()
     _conn.close()
 
-    default_folder = "Default"
-    other_folders = sorted([f for f in rows if f != default_folder], key=str.lower)
-    folders = [default_folder] + other_folders if default_folder in rows else other_folders
+    default_entry  = [(fid, name) for fid, name in rows if name == "Default"]
+    other_folders  = sorted([(fid, name) for fid, name in rows if name != "Default"], key=lambda x: x[1].lower())
+    folders        = default_entry + other_folders
 
     total = len(folders)
     pages = (total - 1) // PER_PAGE + 1 if total else 1
     page = max(0, min(page, pages - 1))
+    context.user_data["qb_folder_page"] = page
 
     start = page * PER_PAGE
     end = start + PER_PAGE
@@ -3665,25 +3669,17 @@ async def qb_pick_folder_menu(message, context):
 
     keyboard = []
 
-    for folder in page_items:
-        _conn2, _cur2 = get_db()
-        _cur2.execute(
-            "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
-            (get_active_user_id(context), folder)
-        )
-        row = _cur2.fetchone()
-        _conn2.close()
-        if not row:
-            continue
-        folder_id = row[0]
-
+    for folder_id, folder in page_items:
         _conn3, _cur3 = get_db()
         _cur3.execute("SELECT COUNT(*) FROM question_bank WHERE folder_id=?", (folder_id,))
         count = _cur3.fetchone()[0]
         _conn3.close()
 
+        has_sub = folder != "Default" and len(get_qb_subfolders(active_uid, folder_id)) > 0
+        callback = f"QB_ROOT_OPEN|{folder}" if has_sub else f"QB_OPEN_FOLDER|{folder}"
+
         keyboard.append([
-            InlineKeyboardButton(f"📁 {folder} ({count})", callback_data=f"QB_OPEN_FOLDER|{folder}")
+            InlineKeyboardButton(f"📁 {folder} ({count})", callback_data=callback)
         ])
 
     if pages > 1:
@@ -3702,6 +3698,96 @@ async def qb_pick_folder_menu(message, context):
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
+
+async def qb_root_open_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    folder_name = query.data.split("|", 1)[1]
+    context.user_data["qb_root_folder_name"] = folder_name
+    context.user_data["qb_sub_page"] = 0
+
+    await show_qb_subfolder_menu(query.message, context)
+
+
+async def show_qb_subfolder_menu(message, context):
+    active_uid = get_active_user_id(context)
+    folder_name = context.user_data.get("qb_root_folder_name")
+    if not folder_name:
+        return
+
+    _conn, _cur = get_db()
+    _cur.execute(
+        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
+        (active_uid, folder_name)
+    )
+    row = _cur.fetchone()
+    _conn.close()
+    if not row:
+        return
+    folder_id = row[0]
+
+    subfolders = get_qb_subfolders(active_uid, folder_id)
+
+    PER_PAGE = 5
+    page = context.user_data.get("qb_sub_page", 0)
+    total = len(subfolders)
+    pages = (total - 1) // PER_PAGE + 1 if total else 1
+    page = max(0, min(page, pages - 1))
+    context.user_data["qb_sub_page"] = page
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+    page_items = subfolders[start:end]
+
+    keyboard = []
+
+    _conn2, _cur2 = get_db()
+    _cur2.execute("SELECT COUNT(*) FROM question_bank WHERE folder_id=?", (folder_id,))
+    main_count = _cur2.fetchone()[0]
+    _conn2.close()
+    keyboard.append([
+        InlineKeyboardButton(f"📂 View Questions in {folder_name} ({main_count})", callback_data=f"QB_OPEN_FOLDER|{folder_name}")
+    ])
+
+    for sub_id, sub_name in page_items:
+        _conn3, _cur3 = get_db()
+        _cur3.execute("SELECT COUNT(*) FROM question_bank WHERE folder_id=?", (sub_id,))
+        count = _cur3.fetchone()[0]
+        _conn3.close()
+        keyboard.append([
+            InlineKeyboardButton(f"📁 {sub_name} ({count})", callback_data=f"QB_OPEN_FOLDER|{sub_name}")
+        ])
+
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data="QB_SUB_PREV"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QB_SUB_NOP"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data="QB_SUB_NEXT"))
+        keyboard.append(nav)
+
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="QB_PICK_FOLDER")])
+
+    await message.edit_text(
+        f"📁 **{folder_name}**\n\nSelect a subfolder, or view questions directly in this folder:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def qb_sub_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["qb_sub_page"] = max(0, context.user_data.get("qb_sub_page", 0) - 1)
+    await show_qb_subfolder_menu(query.message, context)
+
+
+async def qb_sub_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["qb_sub_page"] = context.user_data.get("qb_sub_page", 0) + 1
+    await show_qb_subfolder_menu(query.message, context)
 
 async def db_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -4738,7 +4824,7 @@ async def db_add_subfolder_start(update: Update, context: ContextTypes.DEFAULT_T
 
     _conn, _cur = get_db()
     _cur.execute(
-        "SELECT id FROM question_bank_folders WHERE owner_id=? AND name=?",
+        "SELECT id, parent_id FROM question_bank_folders WHERE owner_id=? AND name=?",
         (active_uid, parent_folder_name)
     )
     row = _cur.fetchone()
@@ -4748,7 +4834,12 @@ async def db_add_subfolder_start(update: Update, context: ContextTypes.DEFAULT_T
         await flash_message(context.bot, query.message.chat_id, "❌ Parent folder not found.")
         return
 
-    parent_id = row[0]
+    parent_id, grandparent_id = row
+
+    # 🔒 Only main (root) folders can contain subfolders — no nesting subfolders
+    if grandparent_id is not None:
+        await flash_message(context.bot, query.message.chat_id, "❌ Subfolders cannot contain their own subfolders.")
+        return
 
     # ✅ Enter Database folder creation mode (subfolder variant)
     context.user_data["state"] = "DB_ADD_FOLDER"
@@ -4759,7 +4850,6 @@ async def db_add_subfolder_start(update: Update, context: ContextTypes.DEFAULT_T
         f"➕ Send the name of the new subfolder inside 📁 {parent_folder_name}:"
     )
 
-    # 🔑 Reuses the same cleanup key as the root-level flow
     context.user_data["db_add_folder_prompt_id"] = msg.message_id
 
 async def move_quiz_to_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8541,6 +8631,8 @@ async def qb_pick_folder_start(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data["qb_selected"] = set()
     context.user_data["qb_q_page"] = 0
     context.user_data.pop("qb_folder_name", None)
+    context.user_data.pop("qb_root_folder_name", None)
+    context.user_data.pop("qb_sub_page", None)
 
     await qb_pick_folder_menu(query.message, context)
 
@@ -8713,15 +8805,16 @@ async def qb_move_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_qb_move_folders(message, context):
     page = context.user_data.get("qb_move_page", 0)
     PER_PAGE = 5
+    active_uid = get_active_user_id(context)
 
     _conn, _cur = get_db()
     _cur.execute(
         """
         SELECT id, name FROM question_bank_folders
-        WHERE owner_id=?
+        WHERE owner_id=? AND parent_id IS NULL
         ORDER BY name COLLATE NOCASE
         """,
-        (get_active_user_id(context),)
+        (active_uid,)
     )
     folders = _cur.fetchall()
     _conn.close()
@@ -8729,6 +8822,7 @@ async def show_qb_move_folders(message, context):
     total = len(folders)
     pages = (total - 1) // PER_PAGE + 1 if total else 1
     page = max(0, min(page, pages - 1))
+    context.user_data["qb_move_page"] = page
 
     start = page * PER_PAGE
     end = start + PER_PAGE
@@ -8737,11 +8831,10 @@ async def show_qb_move_folders(message, context):
     keyboard = []
 
     for folder_id, name in page_items:
+        has_sub = name != "Default" and len(get_qb_subfolders(active_uid, folder_id)) > 0
+        callback = f"QB_MOVE_OPEN|{folder_id}" if has_sub else f"QB_MOVE_TO|{folder_id}"
         keyboard.append([
-            InlineKeyboardButton(
-                f"📁 {name}",
-                callback_data=f"QB_MOVE_TO|{folder_id}"
-            )
+            InlineKeyboardButton(f"📁 {name}", callback_data=callback)
         ])
 
     if pages > 1:
@@ -8762,6 +8855,84 @@ async def show_qb_move_folders(message, context):
         "📂 Move Question\n\nSelect destination folder:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
+
+async def qb_move_open_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    folder_id = int(query.data.split("|", 1)[1])
+    context.user_data["qb_move_parent_id"] = folder_id
+    context.user_data["qb_move_sub_page"] = 0
+
+    await show_qb_move_subfolders(query.message, context)
+
+
+async def show_qb_move_subfolders(message, context):
+    active_uid = get_active_user_id(context)
+    parent_id = context.user_data.get("qb_move_parent_id")
+    if not parent_id:
+        return
+
+    folder_row = get_qb_folder_by_id(parent_id)
+    folder_name = folder_row[2] if folder_row else "Folder"
+
+    subfolders = get_qb_subfolders(active_uid, parent_id)
+
+    PER_PAGE = 5
+    page = context.user_data.get("qb_move_sub_page", 0)
+    total = len(subfolders)
+    pages = (total - 1) // PER_PAGE + 1 if total else 1
+    page = max(0, min(page, pages - 1))
+    context.user_data["qb_move_sub_page"] = page
+    start = page * PER_PAGE
+    end = start + PER_PAGE
+    page_items = subfolders[start:end]
+
+    keyboard = [
+        [InlineKeyboardButton(f"📦 Move to 📁 {folder_name} (Main Folder)", callback_data=f"QB_MOVE_TO|{parent_id}")]
+    ]
+
+    for sub_id, sub_name in page_items:
+        keyboard.append([
+            InlineKeyboardButton(f"📁 {sub_name}", callback_data=f"QB_MOVE_TO|{sub_id}")
+        ])
+
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data="QB_MOVE_SUB_PREV"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="QB_MOVE_SUB_NOP"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data="QB_MOVE_SUB_NEXT"))
+        keyboard.append(nav)
+
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="QB_MOVE_BACK")])
+
+    await safe_edit_message(
+        message,
+        f"📂 Move Question\n\n📁 *{folder_name}*\n\nSelect a subfolder, or move to the main folder above:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def qb_move_back_to_root(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("qb_move_parent_id", None)
+    context.user_data.pop("qb_move_sub_page", None)
+    await show_qb_move_folders(query.message, context)
+
+async def qb_move_sub_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["qb_move_sub_page"] = max(0, context.user_data.get("qb_move_sub_page", 0) - 1)
+    await show_qb_move_subfolders(query.message, context)
+
+async def qb_move_sub_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["qb_move_sub_page"] = context.user_data.get("qb_move_sub_page", 0) + 1
+    await show_qb_move_subfolders(query.message, context)
 
 async def qb_move_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -8798,6 +8969,8 @@ async def qb_move_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data.pop("qb_move_page", None)
+    context.user_data.pop("qb_move_parent_id", None)
+    context.user_data.pop("qb_move_sub_page", None)
 
     await flash_message(context.bot, query.message.chat_id, f"✅ Moved to 📁 {folder_name}")
 
@@ -8808,6 +8981,8 @@ async def qb_move_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data.pop("qb_move_page", None)
+    context.user_data.pop("qb_move_parent_id", None)
+    context.user_data.pop("qb_move_sub_page", None)
     await rebuild_question_preview(query.message.chat_id, context)
 
 async def qb_open_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10401,9 +10576,10 @@ async def show_db_questions_from_message(message, context):
     if not rows:
         empty_label = "_No questions in this folder yet._" if not subfolders else "_No questions directly in this folder._"
         if folder_name != "Default":
-            keyboard.append([
-                InlineKeyboardButton("➕ Add Subfolder", callback_data=f"DB_ADD_SUBFOLDER|{folder_name}")
-            ])
+            if parent_id is None:
+                keyboard.append([
+                    InlineKeyboardButton("➕ Add Subfolder", callback_data=f"DB_ADD_SUBFOLDER|{folder_name}")
+                ])
             keyboard.append([
                 InlineKeyboardButton("✏️ Rename", callback_data=f"DB_RENAME_FOLDER|{folder_name}"),
                 InlineKeyboardButton("📥 Move Questions In", callback_data=f"DB_MOVE_IN|{folder_name}")
@@ -10445,9 +10621,10 @@ async def show_db_questions_from_message(message, context):
         keyboard.append(nav)
 
     if folder_name != "Default":
-        keyboard.append([
-            InlineKeyboardButton("➕ Add Subfolder", callback_data=f"DB_ADD_SUBFOLDER|{folder_name}")
-        ])
+        if parent_id is None:
+            keyboard.append([
+                InlineKeyboardButton("➕ Add Subfolder", callback_data=f"DB_ADD_SUBFOLDER|{folder_name}")
+            ])
         keyboard.append([
             InlineKeyboardButton("✏️ Rename", callback_data=f"DB_RENAME_FOLDER|{folder_name}"),
             InlineKeyboardButton("📥 Move Questions In", callback_data=f"DB_MOVE_IN|{folder_name}")
@@ -15421,6 +15598,16 @@ app.add_handler(CallbackQueryHandler(qb_move_cancel, pattern="^QB_MOVE_CANCEL$")
 app.add_handler(CallbackQueryHandler(qb_move_apply, pattern="^QB_MOVE_TO\\|"))
 app.add_handler(CallbackQueryHandler(qb_move_prev, pattern="^QB_MOVE_PREV$"))
 app.add_handler(CallbackQueryHandler(qb_move_next, pattern="^QB_MOVE_NEXT$"))
+app.add_handler(CallbackQueryHandler(qb_move_open_main,   pattern="^QB_MOVE_OPEN\\|"))
+app.add_handler(CallbackQueryHandler(qb_move_back_to_root, pattern="^QB_MOVE_BACK$"))
+app.add_handler(CallbackQueryHandler(qb_move_sub_prev,     pattern="^QB_MOVE_SUB_PREV$"))
+app.add_handler(CallbackQueryHandler(qb_move_sub_next,     pattern="^QB_MOVE_SUB_NEXT$"))
+app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^QB_MOVE_SUB_NOP$"))
+app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^QB_MOVE_NOP$"))
+app.add_handler(CallbackQueryHandler(qb_root_open_folder, pattern="^QB_ROOT_OPEN\\|"))
+app.add_handler(CallbackQueryHandler(qb_sub_prev,          pattern="^QB_SUB_PREV$"))
+app.add_handler(CallbackQueryHandler(qb_sub_next,          pattern="^QB_SUB_NEXT$"))
+app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^QB_SUB_NOP$"))
 app.add_handler(CallbackQueryHandler(quiz_folder_prev, pattern="^QUIZ_FOLDER_PREV$"))
 app.add_handler(CallbackQueryHandler(quiz_folder_next, pattern="^QUIZ_FOLDER_NEXT$"))
 app.add_handler(CallbackQueryHandler(qb_open_folder, pattern="^QB_OPEN_FOLDER\\|"))
