@@ -11773,6 +11773,8 @@ async def db_move_in_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["db_move_folder_page"] = 0
     context.user_data.pop("db_move_source_folder", None)
     context.user_data.pop("db_move_page", None)
+    context.user_data.pop("db_move_source_parent_id", None)
+    context.user_data.pop("db_move_source_sub_page", None)
 
     await show_db_move_folder_list(query.message, context)
 
@@ -11809,14 +11811,16 @@ async def show_db_move_folder_list(message, context):
     page          = context.user_data.get("db_move_folder_page", 0)
     PER_PAGE      = 5
 
+    active_uid = get_active_user_id(context)
+
     _conn, _cur = get_db()
     _cur.execute(
         """
         SELECT id, name FROM question_bank_folders
-        WHERE owner_id=?
+        WHERE owner_id=? AND parent_id IS NULL
         ORDER BY name COLLATE NOCASE
         """,
-        (get_active_user_id(context),)
+        (active_uid,)
     )
     all_folders = _cur.fetchall()
     _conn.close()
@@ -11845,10 +11849,13 @@ async def show_db_move_folder_list(message, context):
         count = _cur2.fetchone()[0]
         _conn2.close()
 
+        has_sub  = folder_name != "Default" and len(get_qb_subfolders(active_uid, folder_id)) > 0
+        callback = f"DB_MOVE_OPEN_MAIN|{folder_id}" if has_sub else f"DB_MOVE_FROM|{folder_name}"
+
         keyboard.append([
             InlineKeyboardButton(
                 f"📁 {folder_name} ({count})",
-                callback_data=f"DB_MOVE_FROM|{folder_name}"
+                callback_data=callback
             )
         ])
 
@@ -11871,6 +11878,83 @@ async def show_db_move_folder_list(message, context):
         parse_mode="Markdown"
     )
 
+async def db_move_open_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    folder_id = int(query.data.split("|", 1)[1])
+    context.user_data["db_move_source_parent_id"] = folder_id
+    context.user_data["db_move_source_sub_page"]  = 0
+
+    await show_db_move_source_subfolders(query.message, context)
+
+async def show_db_move_source_subfolders(message, context):
+    active_uid     = get_active_user_id(context)
+    parent_id      = context.user_data.get("db_move_source_parent_id")
+    target_folder  = context.user_data.get("db_move_target_folder")
+    if not parent_id:
+        return
+
+    folder_row  = get_qb_folder_by_id(parent_id)
+    folder_name = folder_row[2] if folder_row else "Folder"
+
+    subfolders = get_qb_subfolders(active_uid, parent_id)
+
+    PER_PAGE = 5
+    page  = context.user_data.get("db_move_source_sub_page", 0)
+    total = len(subfolders)
+    pages = (total - 1) // PER_PAGE + 1 if total else 1
+    page  = max(0, min(page, pages - 1))
+    context.user_data["db_move_source_sub_page"] = page
+    start = page * PER_PAGE
+    end   = start + PER_PAGE
+    page_items = subfolders[start:end]
+
+    keyboard = [
+        [InlineKeyboardButton(f"📂 Move From 📁 {folder_name} (Main Folder)", callback_data=f"DB_MOVE_FROM|{folder_name}")]
+    ]
+
+    for sub_id, sub_name in page_items:
+        keyboard.append([
+            InlineKeyboardButton(f"📁 {sub_name}", callback_data=f"DB_MOVE_FROM|{sub_name}")
+        ])
+
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data="DB_MOVE_SOURCE_SUB_PREV"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="DB_MOVE_SOURCE_SUB_NOP"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data="DB_MOVE_SOURCE_SUB_NEXT"))
+        keyboard.append(nav)
+
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="DB_MOVE_SOURCE_BACK")])
+
+    await message.edit_text(
+        f"📥 Move Questions Into 📁 **{target_folder}**\n\n📁 *{folder_name}*\n\nSelect a subfolder, or move from the main folder above:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def db_move_source_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("db_move_source_parent_id", None)
+    context.user_data.pop("db_move_source_sub_page", None)
+    await show_db_move_folder_list(query.message, context)
+
+async def db_move_source_sub_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["db_move_source_sub_page"] = max(0, context.user_data.get("db_move_source_sub_page", 0) - 1)
+    await show_db_move_source_subfolders(query.message, context)
+
+async def db_move_source_sub_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["db_move_source_sub_page"] = context.user_data.get("db_move_source_sub_page", 0) + 1
+    await show_db_move_source_subfolders(query.message, context)
+
 async def db_move_folder_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -11878,7 +11962,6 @@ async def db_move_folder_prev(update: Update, context: ContextTypes.DEFAULT_TYPE
         0, context.user_data.get("db_move_folder_page", 0) - 1
     )
     await show_db_move_folder_list(query.message, context)
-
 
 async def db_move_folder_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -12187,6 +12270,8 @@ async def db_move_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("db_move_target_folder", None)
     context.user_data.pop("db_move_source_folder", None)
     context.user_data.pop("db_move_folder_page", None)
+    context.user_data.pop("db_move_source_parent_id", None)
+    context.user_data.pop("db_move_source_sub_page", None)
 
     await flash_message(
         context.bot,
@@ -15622,6 +15707,11 @@ app.add_handler(CallbackQueryHandler(db_move_folder_prev, pattern="^DB_MOVE_FOLD
 app.add_handler(CallbackQueryHandler(db_move_folder_next, pattern="^DB_MOVE_FOLDER_NEXT$"))
 app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^DB_MOVE_FOLDER_NOP$"))
 app.add_handler(CallbackQueryHandler(db_move_from_folder_open, pattern="^DB_MOVE_FROM\\|"))
+app.add_handler(CallbackQueryHandler(db_move_open_main, pattern="^DB_MOVE_OPEN_MAIN\\|"))
+app.add_handler(CallbackQueryHandler(db_move_source_back, pattern="^DB_MOVE_SOURCE_BACK$"))
+app.add_handler(CallbackQueryHandler(db_move_source_sub_prev, pattern="^DB_MOVE_SOURCE_SUB_PREV$"))
+app.add_handler(CallbackQueryHandler(db_move_source_sub_next, pattern="^DB_MOVE_SOURCE_SUB_NEXT$"))
+app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^DB_MOVE_SOURCE_SUB_NOP$"))
 app.add_handler(CallbackQueryHandler(db_move_add_this_page, pattern="^DB_MOVE_ADD_PAGE$"))
 app.add_handler(CallbackQueryHandler(db_move_auto_add, pattern="^DB_MOVE_AUTO_ADD\\|"))
 app.add_handler(CallbackQueryHandler(db_move_in_start, pattern="^DB_MOVE_IN\\|"))
