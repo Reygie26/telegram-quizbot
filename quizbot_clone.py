@@ -15872,6 +15872,27 @@ async def global_error_handler(update, context):
 
 app.add_error_handler(global_error_handler)
 
+async def _clear_webhook_on_startup(application):
+    """
+    Safety net: if a webhook is ever accidentally set on this bot token
+    (e.g. from a test script, another deploy, or a stray setWebhook call),
+    polling will fail forever with 'Conflict: can't use getUpdates method
+    while webhook is active'. Clearing it on every startup makes that
+    class of outage impossible to hit silently again.
+    """
+    try:
+        info = await application.bot.get_webhook_info()
+        if info.url:
+            print(f"⚠️ Webhook was set to '{info.url}' — clearing it now.")
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            print("✅ Webhook cleared. Polling can proceed safely.")
+        else:
+            print("✅ No webhook set — safe to poll.")
+    except Exception as e:
+        print(f"⚠️ Failed to check/clear webhook on startup: {e}")
+
+app.post_init = _clear_webhook_on_startup
+
 print("✅ TeleQuiz is running...")
 app.run_polling(
     poll_interval=1.0,
